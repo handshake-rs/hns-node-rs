@@ -29,7 +29,7 @@ use blake2::{
 };
 use serde::{Deserialize, Serialize};
 use sha3::{Keccak256, Sha3_256};
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 pub const HEADER_SIZE: usize = 236;
 pub const NONCE_SIZE: usize = 24;
@@ -796,7 +796,7 @@ impl Block {
 #[derive(Debug)]
 pub struct BlockTransactionIds<'a> {
     block: &'a Block,
-    ids: Vec<Txid>,
+    ids: Cow<'a, [Txid]>,
 }
 
 impl<'a> BlockTransactionIds<'a> {
@@ -804,7 +804,7 @@ impl<'a> BlockTransactionIds<'a> {
     pub fn new(block: &'a Block) -> Self {
         Self {
             block,
-            ids: block.transactions.iter().map(Transaction::txid).collect(),
+            ids: Cow::Owned(block.transactions.iter().map(Transaction::txid).collect()),
         }
     }
 
@@ -831,6 +831,59 @@ impl<'a> BlockTransactionIds<'a> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+}
+
+/// Owned transaction identities prepared on a worker and subsequently bound
+/// to the exact immutable block on the canonical thread.
+///
+/// Construction performs all transaction hashing. Binding rechecks the cheap
+/// block-header identity and transaction count, then lends the already hashed
+/// IDs without cloning or hashing the transactions again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedBlockTransactionIds {
+    block_hash: BlockHash,
+    transactions_address: usize,
+    ids: Vec<Txid>,
+}
+
+impl PreparedBlockTransactionIds {
+    #[must_use]
+    pub fn new(block: &Block) -> Self {
+        Self {
+            block_hash: block.hash(),
+            transactions_address: block.transactions.as_ptr() as usize,
+            ids: block.transactions.iter().map(Transaction::txid).collect(),
+        }
+    }
+
+    pub fn bind<'a>(&'a self, block: &'a Block) -> Result<BlockTransactionIds<'a>, PrimitiveError> {
+        if self.block_hash != block.hash()
+            || self.transactions_address != block.transactions.as_ptr() as usize
+        {
+            return Err(PrimitiveError::PreparedTransactionIdsMismatch);
+        }
+        if self.ids.len() != block.transactions.len() {
+            return Err(PrimitiveError::InvalidLength {
+                context: "prepared transaction IDs",
+                expected: block.transactions.len(),
+                actual: self.ids.len(),
+            });
+        }
+        Ok(BlockTransactionIds {
+            block,
+            ids: Cow::Borrowed(&self.ids),
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[Txid] {
+        &self.ids
+    }
+
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
     }
 }
 
@@ -1999,6 +2052,8 @@ pub enum PrimitiveError {
     InvalidResource(&'static str),
     #[error("invalid handshake name")]
     InvalidName,
+    #[error("prepared transaction IDs belong to a different block")]
+    PreparedTransactionIdsMismatch,
 }
 
 #[cfg(test)]
@@ -2210,6 +2265,30 @@ mod tests {
 
         assert_eq!(decoded, block);
         assert_eq!(decoded.encode(), raw);
+    }
+
+    #[test]
+    fn prepared_transaction_ids_bind_only_to_the_original_block_body() {
+        let block = Block {
+            header: Header::default(),
+            transactions: vec![Transaction {
+                version: 1,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                locktime: 7,
+            }],
+        };
+        let prepared = PreparedBlockTransactionIds::new(&block);
+        let bound = prepared.bind(&block).expect("bind original immutable body");
+        assert_eq!(bound.as_slice(), prepared.as_slice());
+
+        // A clone can carry the same header hash and transaction count. It is
+        // nevertheless not the immutable body whose IDs the worker hashed.
+        let clone = block.clone();
+        assert!(matches!(
+            prepared.bind(&clone),
+            Err(PrimitiveError::PreparedTransactionIdsMismatch)
+        ));
     }
 
     #[test]

@@ -102,10 +102,10 @@ use hns_chain::MAX_RESIDENT_ALTERNATE_HEADERS;
 use hns_chain::{
     delete_canonical_height_from_batch, delete_tx_index_for_block_from_batch, read_canonical_hash,
     write_block_index_to_batch, write_canonical_height_to_batch, write_raw_block_to_batch,
-    write_record_to_batch, write_tx_index_for_block_to_batch, BlockIndexCacheUpdate,
-    BlockIndexRecord, BlockStatus, ChainError, ChainTip, FailedHeaderPlan, HeaderImport,
-    HeaderIndex, HeaderIndexCacheUpdate, HeaderRecord, RawBlockRecord, RawBlockSource, ReorgPlan,
-    ReorgPlanLimits, StoredBlockIndex, StoredHeaderIndex, TxIndexEntry,
+    write_record_to_batch, write_tx_index_for_block_to_batch, write_tx_index_to_batch,
+    BlockIndexCacheUpdate, BlockIndexRecord, BlockStatus, ChainError, ChainTip, FailedHeaderPlan,
+    HeaderImport, HeaderIndex, HeaderIndexCacheUpdate, HeaderRecord, RawBlockRecord,
+    RawBlockSource, ReorgPlan, ReorgPlanLimits, StoredBlockIndex, StoredHeaderIndex, TxIndexEntry,
 };
 use hns_consensus::{
     advance_threshold_state, expected_next_bits, validate_block_finality, validate_coinbase_height,
@@ -143,30 +143,33 @@ use hns_state::{
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
     maximum_name_page_validation_records, name_page_root_key, name_tree_snapshot_pin_key,
     pack_name_page_records_consuming, pack_reachable_name_page_records_consuming_with_limit,
-    prefetch_replay_utxos, prepare_block_utxos_with_transaction_ids,
-    retained_name_tree_roots_bounded, stage_remove_name_tree_snapshot_pin,
-    stream_name_page_tree_delta_with_limits_and_progress,
+    prefetch_replay_utxos, prepare_block_utxos_with_state_effects,
+    prepare_block_utxos_with_transaction_ids, retained_name_tree_roots_bounded,
+    stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
-    ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePathCacheUpdate,
-    NamePagePhysicalStreamPhase, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
-    NamePageState, NamePageStreamLimits, NamePageTreeReader, NamePageValidationLimits,
-    NameTreeAccumulatorSession, NameTreeCompactionSummary, NameTreeMaterializationLimits,
-    NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
-    StateError, StateServices, StoredStateEngine, TreeRoot,
-    NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
-    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePathCacheUpdate, NamePageRootLocator,
+    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits, NamePageTreeReader,
+    NamePageValidationLimits, NameTreeAccumulatorSession, NameTreeCompactionSummary,
+    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
+    PageTreeError, PreparedBlockStateEffects, RetainedNameTreeRootLimits, StateError,
+    StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT,
+    NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
     load_name_tree_snapshot_pins, pack_name_page_records, verify_stored_name_tree_root,
+    NamePagePhysicalStreamPhase,
 };
+#[cfg(test)]
+use hns_store::NamePageError;
 use hns_store::{
     decode_u64, encode_u64, filesystem_available_bytes, mark_unclean_start, open_store,
     truncate_name_pages_to_committed_tail, was_clean_shutdown, AtomicWriteEffectBudget,
-    CheckpointWriteBatch, ColumnFamily, DurabilityPolicy, MetaKey, NamePageAppender, NamePageError,
+    CheckpointWriteBatch, ColumnFamily, DurabilityPolicy, MetaKey, NamePageAppender,
     PrefixScanBudget, ReadSnapshot, ScanEntry, SegmentArchiveScrubLimits,
     SegmentCompactionExecutionLimits, SegmentCompactionLimits, StagingOverlay, Store, StoreBackend,
     StoreConfig, StoreError, StoreHandle, StoreHandleBatch, StoreHandleSnapshot, WriteBatch,
@@ -177,10 +180,11 @@ use hns_store::{
 use hns_wallet_index::{
     decode_index_profile, encode_index_profile, index_profile_is_current, index_profile_version,
     register_tracked_contract, retire_completed_tracked_contract,
-    retire_never_confirmed_tracked_contract, stage_connect_with_transaction_ids_and_prepared_utxos,
+    retire_never_confirmed_tracked_contract, stage_connect_with_prepared_effects,
+    stage_connect_with_transaction_ids_and_prepared_utxos,
     stage_disconnect as stage_wallet_index_disconnect, stage_prune_incoming_transfer_undo,
     validate_completed_tracked_contract_retirements, validate_tracked_contract_registry,
-    INDEX_PROFILE_MODE_KEY,
+    PreparedWalletIndexEffects, INDEX_PROFILE_MODE_KEY,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -725,6 +729,7 @@ pub struct NamePageCompactionReport {
     pub reclaimed_bytes: u64,
 }
 
+#[cfg(test)]
 type StagedNamePageCompaction = (
     NamePageState,
     NamePageAppender,
@@ -733,6 +738,24 @@ type StagedNamePageCompaction = (
     BTreeMap<TreeRoot, hns_store::NamePageAddress>,
     u64,
 );
+
+/// An immutable name-page generation assembled without holding the canonical
+/// writer. It is deliberately unpublished: RocksDB continues to point at
+/// `source_generation` until the writer catches this image up to its current
+/// root and atomically installs the replacement locators and state record.
+#[derive(Debug)]
+pub(crate) struct PreparedNamePageGeneration {
+    source_generation: u64,
+    generation: u64,
+    directory: PathBuf,
+    file_path: PathBuf,
+    appender: NamePageAppender,
+    manifest: hns_store::SegmentManifest,
+    known: HashMap<TreeRoot, hns_store::NamePageAddress>,
+    records_written: u64,
+    pages_written: u64,
+    bytes_before: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NamePageRootTarget {
@@ -3185,6 +3208,64 @@ impl NodeReadHandle {
         }))
     }
 
+    pub(crate) fn prepare_name_page_generation(
+        &self,
+        due: &NamePageCompactionDue,
+    ) -> Result<Option<PreparedNamePageGeneration>> {
+        self.ensure_storage_operational()?;
+        let Some(data_dir) = &self.config.data_dir else {
+            return Ok(None);
+        };
+        let directory = data_dir.join("name-pages");
+        let generation = due.generation.saturating_add(1);
+        let result = NamePageStorage::prepare_generation_in_background(
+            directory.clone(),
+            &self.store,
+            self.config.network,
+            due.generation,
+            production_name_page_compaction_filesystem_limits(),
+            production_name_page_compaction_cleanup_limits(),
+        );
+        if result.is_err() {
+            // Publication has not been attempted in this phase, so removal is
+            // always safe. Preserve the original error if cleanup also fails.
+            if let Err(cleanup_error) = remove_name_page_generation(
+                &directory,
+                generation,
+                production_name_page_compaction_cleanup_limits(),
+            ) {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    generation,
+                    "failed to discard an unpublished background name-page generation"
+                );
+            }
+        }
+        self.ensure_storage_operational()?;
+        match result {
+            Err(error) if name_page_error_contains_deadline(&error) => {
+                Err(anyhow::Error::new(NamePageCompactionDeferred {
+                    detail: format!("{error:#}"),
+                }))
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn cleanup_superseded_name_page_generations(
+        &self,
+        authoritative_generation: u64,
+    ) -> Result<()> {
+        let Some(data_dir) = &self.config.data_dir else {
+            return Ok(());
+        };
+        remove_name_page_generations_except(
+            &data_dir.join("name-pages"),
+            authoritative_generation,
+            production_name_page_compaction_cleanup_limits(),
+        )
+    }
+
     /// Reserve one configured template slot before capturing the mempool. The
     /// permit must be held through capture and construction so admitted
     /// snapshots remain inside the aggregate memory envelope.
@@ -4040,26 +4121,11 @@ impl NodeService {
                         config.native_sync.connect_active_state,
                     ),
                 )?;
-                let name_page_segment_threshold = if config.native_sync.connect_active_state {
-                    NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
-                } else {
-                    NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD
-                };
-                if let Some(report) =
-                    state.compact_pruned_name_pages_if_due_at(name_page_segment_threshold)?
-                {
-                    tracing::info!(
-                        previous_generation = report.previous_generation,
-                        generation = report.generation,
-                        retained_roots = report.retained_roots,
-                        records_written = report.records_written,
-                        pages_written = report.pages_written,
-                        bytes_before = report.bytes_before,
-                        bytes_after = report.bytes_after,
-                        reclaimed_bytes = report.reclaimed_bytes,
-                        "startup pruned name-page compaction completed"
-                    );
-                }
+                // Name-page generations are compacted by native supervision:
+                // immutable rebuilding happens on a blocking worker while the
+                // canonical writer continues, followed by a brief catch-up and
+                // atomic pointer swap. Never put the old full rewrite on the
+                // startup/canonical path.
             }
         }
 
@@ -4601,12 +4667,15 @@ impl NodeService {
         request: NodeBlockImport,
         prepared: PreparedNativeActivation,
     ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
-        let stateless = prepared
+        let (stateless, state_effects, wallet_effects) = prepared
             .into_single_for(&request)
             .map_err(ChainActivationFailure::Internal)?;
-        let mutation = self
-            .state
-            .commit_prepared_stored_direct_extension(request, stateless)?;
+        let mutation = self.state.commit_prepared_stored_direct_extension(
+            request,
+            stateless,
+            state_effects.as_ref(),
+            wallet_effects.as_ref(),
+        )?;
         Ok(NodeReorgMutation {
             summary: NodeReorgSummary {
                 disconnected: Vec::new(),
@@ -6518,7 +6587,16 @@ impl StatelessBodyValidation {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PreparedNativeActivation {
     stateless: Vec<StatelessBodyValidation>,
+    state_effects: Vec<PreparedBlockStateEffects>,
+    wallet_effects: Vec<PreparedWalletIndexEffects>,
 }
+
+type PreparedActivationEffects = (
+    StatelessBodyValidation,
+    Option<PreparedBlockStateEffects>,
+    Option<PreparedWalletIndexEffects>,
+);
+type PreparedActivationEffectsByIdentity = HashMap<(BlockHash, Height), PreparedActivationEffects>;
 
 impl PreparedNativeActivation {
     pub(crate) fn new(stateless: Vec<StatelessBodyValidation>) -> Result<Self> {
@@ -6532,7 +6610,43 @@ impl PreparedNativeActivation {
                 );
             }
         }
-        Ok(Self { stateless })
+        Ok(Self {
+            stateless,
+            state_effects: Vec::new(),
+            wallet_effects: Vec::new(),
+        })
+    }
+
+    pub(crate) fn with_state_effects(
+        stateless: Vec<StatelessBodyValidation>,
+        state_effects: Vec<PreparedBlockStateEffects>,
+        wallet_effects: Vec<PreparedWalletIndexEffects>,
+    ) -> Result<Self> {
+        let prepared = Self::new(stateless)?;
+        if prepared.stateless.len() != state_effects.len()
+            || prepared.stateless.len() != wallet_effects.len()
+        {
+            anyhow::bail!(
+                "prepared native activation has {} proofs, {} state-effect batches and {} wallet-effect batches",
+                prepared.stateless.len(),
+                state_effects.len(),
+                wallet_effects.len()
+            );
+        }
+        for (proof, effects) in prepared.stateless.iter().zip(&state_effects) {
+            if proof.hash != effects.block_hash() || proof.height != effects.height() {
+                anyhow::bail!(
+                    "prepared state effects do not match proof {} at height {}",
+                    proof.hash.to_hex(),
+                    proof.height
+                );
+            }
+        }
+        Ok(Self {
+            stateless: prepared.stateless,
+            state_effects,
+            wallet_effects,
+        })
     }
 
     fn authenticate(&self, request: &NodeReorg) -> Result<()> {
@@ -6546,6 +6660,14 @@ impl PreparedNativeActivation {
         for (proof, connect) in self.stateless.iter().zip(&request.connect) {
             proof.verify(connect)?;
         }
+        if !self.state_effects.is_empty() {
+            for (effects, connect) in self.state_effects.iter().zip(&request.connect) {
+                effects
+                    .bind_transaction_ids(&connect.block, connect.height)
+                    .map_err(anyhow::Error::new)
+                    .context("prepared state-effect identity mismatch")?;
+            }
+        }
         Ok(())
     }
 
@@ -6555,7 +6677,14 @@ impl PreparedNativeActivation {
     /// reorganization boundary. When native replay has backed off to one
     /// block, it uses the ordinary direct-extension commit boundary instead;
     /// preserve the same process-private hash-and-height binding there.
-    fn into_single_for(mut self, request: &NodeBlockImport) -> Result<StatelessBodyValidation> {
+    fn into_single_for(
+        mut self,
+        request: &NodeBlockImport,
+    ) -> Result<(
+        StatelessBodyValidation,
+        Option<PreparedBlockStateEffects>,
+        Option<PreparedWalletIndexEffects>,
+    )> {
         if self.stateless.len() != 1 {
             anyhow::bail!(
                 "prepared direct extension has {} proofs instead of one",
@@ -6567,13 +6696,48 @@ impl PreparedNativeActivation {
             .pop()
             .expect("single prepared direct-extension proof checked above");
         proof.verify(request)?;
-        Ok(proof)
+        let effects = if self.state_effects.is_empty() {
+            None
+        } else {
+            Some(self.state_effects.pop().ok_or_else(|| {
+                anyhow::anyhow!("prepared direct extension is missing state effects")
+            })?)
+        };
+        let wallet = if self.wallet_effects.is_empty() {
+            None
+        } else {
+            Some(self.wallet_effects.pop().ok_or_else(|| {
+                anyhow::anyhow!("prepared direct extension is missing wallet effects")
+            })?)
+        };
+        Ok((proof, effects, wallet))
     }
 
-    fn into_by_identity(self) -> HashMap<(BlockHash, Height), StatelessBodyValidation> {
+    fn into_by_identity(self) -> PreparedActivationEffectsByIdentity {
+        let mut effects = self
+            .state_effects
+            .into_iter()
+            .map(|effects| ((effects.block_hash(), effects.height()), effects))
+            .collect::<HashMap<_, _>>();
+        let mut wallet = self
+            .wallet_effects
+            .into_iter()
+            .zip(
+                self.stateless
+                    .iter()
+                    .map(|proof| (proof.hash, proof.height)),
+            )
+            .map(|(wallet, identity)| (identity, wallet))
+            .collect::<HashMap<_, _>>();
         self.stateless
             .into_iter()
-            .map(|proof| ((proof.hash, proof.height), proof))
+            .map(|proof| {
+                let identity = (proof.hash, proof.height);
+                (
+                    identity,
+                    (proof, effects.remove(&identity), wallet.remove(&identity)),
+                )
+            })
             .collect()
     }
 }
@@ -7276,6 +7440,7 @@ impl NamePageStorage {
         Ok((reader, legacy_missing))
     }
 
+    #[cfg(test)]
     fn compact_generation(&mut self, store: &StoreHandle) -> Result<NamePageCompactionReport> {
         self.compact_generation_with_limits(
             store,
@@ -7284,6 +7449,366 @@ impl NamePageStorage {
         )
     }
 
+    /// Build the expensive, immutable portion of the next generation without
+    /// canonical-writer ownership. The returned files are not authoritative
+    /// until `publish_prepared_generation` installs their manifest and root
+    /// locators in one RocksDB batch.
+    fn prepare_generation_in_background(
+        directory: PathBuf,
+        store: &StoreHandle,
+        network: Network,
+        expected_generation: u64,
+        filesystem_limits: NamePageFilesystemLimits,
+        cleanup_limits: NamePageFilesystemLimits,
+    ) -> Result<Option<PreparedNamePageGeneration>> {
+        let snapshot = store.snapshot()?;
+        let Some(raw_state) = snapshot.get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)? else {
+            return Ok(None);
+        };
+        let source_state = NamePageState::decode(&raw_state)
+            .map_err(anyhow::Error::new)
+            .context("failed to decode name-page state for background compaction")?;
+        if source_state.manifest.generation != expected_generation {
+            return Ok(None);
+        }
+        let generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page generation number exhausted"))?;
+        let file_path = name_page_file_path(&directory, generation, 0);
+        remove_name_page_generation(&directory, generation, cleanup_limits)?;
+        let bytes_before =
+            name_page_generation_bytes(&directory, expected_generation, filesystem_limits)?;
+        let retained_limits = RetainedNameTreeRootLimits {
+            deadline: filesystem_limits.deadline,
+            ..RetainedNameTreeRootLimits::default()
+        };
+        let retained_roots = retained_name_tree_roots_bounded(&snapshot, retained_limits)
+            .map_err(anyhow::Error::new)
+            .context("failed to select retained name roots for background compaction")?
+            .roots;
+        if !retained_roots.contains(&source_state.root) {
+            anyhow::bail!("retained name roots omit the background generation base root");
+        }
+
+        ensure_name_page_filesystem_deadline(
+            filesystem_limits,
+            "background name-page generation output",
+        )?;
+        ensure_name_page_output_capacity(
+            &directory,
+            if source_state.root == TreeRoot::ZERO {
+                0
+            } else {
+                hns_store::NAME_PAGE_BYTES as u64
+            },
+            "background name-page generation output",
+        )?;
+        let mut appender =
+            NamePageAppender::create_new(&file_path, generation, 0).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to create background name-page generation {}: {error}",
+                    file_path.display()
+                )
+            })?;
+        sync_directory(&directory)?;
+
+        // This read-only view owns no appender and cannot publish. Its state
+        // and the RocksDB snapshot identify one fully committed source image;
+        // concurrent canonical appends only add immutable bytes after it.
+        let source = NamePageStorage {
+            network,
+            directory: directory.clone(),
+            file_path: name_page_file_path(
+                &directory,
+                source_state.manifest.generation,
+                source_state.manifest.active_segment,
+            ),
+            state: source_state.clone(),
+            appender: None,
+            reopen_required: false,
+            committed_generation_bytes: bytes_before,
+            generation_bytes: bytes_before,
+            path_cache: NamePagePathCache::default(),
+            pending_path_cache_update: None,
+        };
+        let start = Instant::now();
+        let (source_reader, _) = source.reader_for_roots(&snapshot, std::iter::empty(), false)?;
+        let (base, mut known) = source_reader
+            .stream_physical_tree_indexed_with_limits_and_progress(
+                source_state.root,
+                &mut appender,
+                production_name_page_stream_limits(filesystem_limits.deadline),
+                NAME_PAGE_COMPACTION_PROGRESS_INTERVAL,
+                move |progress| {
+                    tracing::info!(
+                        phase = "background-base",
+                        previous_generation = expected_generation,
+                        generation,
+                        source_records_discovered = progress.source_records_discovered,
+                        source_pages_discovered = progress.source_pages_discovered,
+                        source_pages_rewritten = progress.source_pages_rewritten,
+                        records_written = progress.records_written,
+                        pages_written = progress.pages_written,
+                        elapsed_seconds = start.elapsed().as_secs(),
+                        "building unpublished name-page generation"
+                    );
+                },
+            )
+            .map_err(anyhow::Error::new)
+            .context("failed to stream background name-page base")?;
+        let mut manifest = base.manifest;
+        let mut records_written = base.record_count;
+        let mut pages_written = base.page_count;
+
+        let (source_reader, legacy_fallback) =
+            source.reader_for_roots(&snapshot, retained_roots.iter().copied(), true)?;
+        let source_snapshot = if legacy_fallback {
+            NamePageSnapshot::with_legacy_fallback(&snapshot, &source_reader)
+        } else {
+            NamePageSnapshot::new(&snapshot, &source_reader)
+        };
+        for root in retained_roots
+            .iter()
+            .copied()
+            .filter(|root| *root != TreeRoot::ZERO && *root != source_state.root)
+        {
+            let mut limits = production_name_page_stream_limits(filesystem_limits.deadline);
+            limits.max_records = limits.max_records.checked_sub(records_written).ok_or(
+                PageTreeError::ResourceLimit {
+                    context: "background compacted name-page records",
+                    limit: MAX_NAME_PAGE_COMPACTION_RECORDS,
+                    actual: records_written,
+                },
+            )?;
+            limits.max_pages = limits.max_pages.checked_sub(pages_written).ok_or(
+                PageTreeError::ResourceLimit {
+                    context: "background compacted name-page pages",
+                    limit: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
+                    actual: pages_written,
+                },
+            )?;
+            let delta = stream_name_page_tree_delta_with_limits_and_progress(
+                &source_snapshot,
+                root,
+                &mut appender,
+                &mut known,
+                limits,
+                NAME_PAGE_COMPACTION_PROGRESS_INTERVAL,
+                |_| {},
+            )
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("failed to stream retained name root {root:?}"))?;
+            manifest = delta.manifest;
+            records_written = records_written
+                .checked_add(delta.record_count)
+                .ok_or_else(|| anyhow::anyhow!("background name record count overflow"))?;
+            pages_written = pages_written
+                .checked_add(delta.page_count)
+                .ok_or_else(|| anyhow::anyhow!("background name page count overflow"))?;
+        }
+
+        Ok(Some(PreparedNamePageGeneration {
+            source_generation: expected_generation,
+            generation,
+            directory,
+            file_path,
+            appender,
+            manifest,
+            known,
+            records_written,
+            pages_written,
+            bytes_before,
+        }))
+    }
+
+    /// Catch a background image up to the current committed root, then make
+    /// it authoritative with one bounded RocksDB publication. Only this
+    /// method needs canonical-writer ownership.
+    fn publish_prepared_generation(
+        &mut self,
+        store: &StoreHandle,
+        mut prepared: PreparedNamePageGeneration,
+        filesystem_limits: NamePageFilesystemLimits,
+    ) -> Result<Option<NamePageCompactionReport>> {
+        self.ensure_open()?;
+        if self.state.manifest.generation != prepared.source_generation {
+            // A different maintenance operation won the generation race.
+            return Ok(None);
+        }
+        if prepared.generation != prepared.source_generation.saturating_add(1)
+            || prepared.directory != self.directory
+            || prepared.file_path != name_page_file_path(&self.directory, prepared.generation, 0)
+        {
+            anyhow::bail!("prepared name-page generation identity is invalid");
+        }
+
+        let snapshot = store.snapshot()?;
+        let retained_limits = RetainedNameTreeRootLimits {
+            deadline: filesystem_limits.deadline,
+            ..RetainedNameTreeRootLimits::default()
+        };
+        let retained_roots = retained_name_tree_roots_bounded(&snapshot, retained_limits)
+            .map_err(anyhow::Error::new)
+            .context("failed to select current retained name roots")?
+            .roots;
+        if !retained_roots.contains(&self.state.root) {
+            anyhow::bail!("current retained name roots omit the committed page root");
+        }
+        let old_records = collect_name_page_root_locators(
+            &snapshot,
+            production_name_page_root_locator_scan_limits(filesystem_limits.deadline),
+        )?;
+        let pin_heights =
+            startup_pin_minimum_root_heights(&snapshot, self.network, &retained_roots)?;
+        let (source_reader, legacy_fallback) =
+            self.reader_for_roots(&snapshot, retained_roots.iter().copied(), true)?;
+        let source_snapshot = if legacy_fallback {
+            NamePageSnapshot::with_legacy_fallback(&snapshot, &source_reader)
+        } else {
+            NamePageSnapshot::new(&snapshot, &source_reader)
+        };
+
+        // Include the latest root first. Usually this is only the small delta
+        // accumulated while the background rewrite was running.
+        let catch_up_roots = std::iter::once(self.state.root)
+            .chain(retained_roots.iter().copied())
+            .filter(|root| *root != TreeRoot::ZERO)
+            .collect::<BTreeSet<_>>();
+        for root in catch_up_roots {
+            let mut limits = production_name_page_stream_limits(filesystem_limits.deadline);
+            limits.max_records = limits
+                .max_records
+                .checked_sub(prepared.records_written)
+                .ok_or(PageTreeError::ResourceLimit {
+                    context: "caught-up compacted name-page records",
+                    limit: MAX_NAME_PAGE_COMPACTION_RECORDS,
+                    actual: prepared.records_written,
+                })?;
+            limits.max_pages = limits.max_pages.checked_sub(prepared.pages_written).ok_or(
+                PageTreeError::ResourceLimit {
+                    context: "caught-up compacted name-page pages",
+                    limit: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
+                    actual: prepared.pages_written,
+                },
+            )?;
+            let delta = stream_name_page_tree_delta_with_limits_and_progress(
+                &source_snapshot,
+                root,
+                &mut prepared.appender,
+                &mut prepared.known,
+                limits,
+                NAME_PAGE_COMPACTION_PROGRESS_INTERVAL,
+                |_| {},
+            )
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("failed to catch up retained name root {root:?}"))?;
+            prepared.manifest = delta.manifest;
+            prepared.records_written = prepared
+                .records_written
+                .checked_add(delta.record_count)
+                .ok_or_else(|| anyhow::anyhow!("caught-up name record count overflow"))?;
+            prepared.pages_written = prepared
+                .pages_written
+                .checked_add(delta.page_count)
+                .ok_or_else(|| anyhow::anyhow!("caught-up name page count overflow"))?;
+        }
+
+        let root_address = if self.state.root == TreeRoot::ZERO {
+            None
+        } else {
+            Some(
+                prepared
+                    .known
+                    .get(&self.state.root)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("caught-up committed root has no address"))?,
+            )
+        };
+        let next = NamePageState {
+            manifest: prepared.manifest,
+            root: self.state.root,
+            root_address,
+            committed_height: self.state.committed_height,
+            last_sealed_height: self.state.last_sealed_height,
+        };
+        let encoded_state = next.encode().map_err(anyhow::Error::new)?;
+        let published_root_count = retained_roots
+            .iter()
+            .filter(|root| **root != TreeRoot::ZERO)
+            .count();
+        preflight_name_page_publication(&old_records, published_root_count, encoded_state.len())?;
+
+        let mut batch = store.batch();
+        for root in old_records.keys().copied() {
+            batch.delete(ColumnFamily::Snapshots, &name_page_root_key(root))?;
+        }
+        let fallback_height = self.state.committed_height.unwrap_or(0);
+        let mut published = 0usize;
+        for root in retained_roots
+            .iter()
+            .copied()
+            .filter(|root| *root != TreeRoot::ZERO)
+        {
+            let address = prepared.known.get(&root).copied().ok_or_else(|| {
+                anyhow::anyhow!("caught-up retained root {root:?} has no address")
+            })?;
+            let record = NamePageRootRecord {
+                root,
+                locator: NamePageRootLocator::new(prepared.generation, address),
+                height: old_records
+                    .get(&root)
+                    .map(|record| record.height)
+                    .unwrap_or(fallback_height)
+                    .min(pin_heights.get(&root).copied().unwrap_or(fallback_height)),
+            };
+            batch.put(
+                ColumnFamily::Snapshots,
+                &name_page_root_key(root),
+                &record.encode(),
+            )?;
+            published = published.saturating_add(1);
+        }
+        batch.put(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY, &encoded_state)?;
+
+        // Every page referenced by the atomic database batch is durable first.
+        let durable_manifest = prepared
+            .appender
+            .sync_data()
+            .map_err(|error| anyhow::anyhow!("failed to sync caught-up name pages: {error}"))?;
+        if durable_manifest != next.manifest {
+            anyhow::bail!("caught-up name-page manifest changed before publication");
+        }
+        let commit = store.commit(batch);
+        if let Err(error) = commit {
+            self.fence_after_commit_attempt();
+            return Err(anyhow::anyhow!(
+                "name-page generation publication outcome is uncertain: {error}"
+            ));
+        }
+
+        self.appender.take();
+        self.file_path = prepared.file_path;
+        self.state = next;
+        self.path_cache = NamePagePathCache::default();
+        self.pending_path_cache_update = None;
+        self.appender = Some(prepared.appender);
+        let bytes_after =
+            name_page_generation_bytes(&self.directory, prepared.generation, filesystem_limits)?;
+        self.committed_generation_bytes = bytes_after;
+        self.generation_bytes = bytes_after;
+        Ok(Some(NamePageCompactionReport {
+            previous_generation: prepared.source_generation,
+            generation: prepared.generation,
+            retained_roots: published,
+            records_written: prepared.records_written,
+            pages_written: prepared.pages_written,
+            bytes_before: prepared.bytes_before,
+            bytes_after,
+            reclaimed_bytes: prepared.bytes_before.saturating_sub(bytes_after),
+        }))
+    }
+
+    #[cfg(test)]
     fn compact_generation_with_limits(
         &mut self,
         store: &StoreHandle,
@@ -8571,6 +9096,7 @@ fn production_fence_from_store_error(
     })
 }
 
+#[cfg(test)]
 fn production_fence_from_name_page_error(
     kind: ProductionSafetyFenceKind,
     error: &anyhow::Error,
@@ -9435,10 +9961,20 @@ impl NodeState {
         } else {
             (None, None)
         };
-        // The fresh RocksDB store persists the authenticated name-tree mutations
-        // in the same atomic block transaction. Fresh nodes never bootstrap,
-        // migrate, or consult the former external name-page generations.
-        let name_pages = None;
+        // Keep the general indexes and mutable name state in RocksDB, but keep
+        // immutable, content-addressed Urkel nodes in generation-scoped page
+        // files. A fresh node bootstraps generation zero directly; subsequent
+        // compaction rewrites only retained roots into a new generation and
+        // atomically publishes its manifest/root locators. This avoids issuing
+        // millions of per-node RocksDB tombstones at pruning boundaries.
+        let name_pages = match &config.data_dir {
+            Some(data_dir) => Some(NamePageStorage::open_or_bootstrap(
+                data_dir.join("name-pages"),
+                &store,
+                config.network,
+            )?),
+            None => None,
+        };
         let (mut state, audit) = Self::from_store_for_network_with_startup_audit(
             store,
             config.network,
@@ -11519,9 +12055,26 @@ impl NodeState {
         validated: ValidatedImport,
         persist_raw_body: bool,
     ) -> Result<NodeBlockMutation> {
+        self.commit_staged_block_prepared(request, validated, persist_raw_body, None, None)
+    }
+
+    fn commit_staged_block_prepared(
+        &mut self,
+        request: NodeBlockImport,
+        validated: ValidatedImport,
+        persist_raw_body: bool,
+        state_effects: Option<&PreparedBlockStateEffects>,
+        wallet_effects: Option<&PreparedWalletIndexEffects>,
+    ) -> Result<NodeBlockMutation> {
         self.ensure_storage_operational()?;
         if self.name_pages.is_some() {
-            return self.commit_staged_block_with_name_pages(request, validated, persist_raw_body);
+            return self.commit_staged_block_with_name_pages(
+                request,
+                validated,
+                persist_raw_body,
+                state_effects,
+                wallet_effects,
+            );
         }
         let snapshot = self.store.snapshot()?;
         let generation = next_mining_generation(&snapshot)?;
@@ -11529,8 +12082,15 @@ impl NodeState {
         let previous = load_block_index_record(&snapshot, &request.block.hash())?;
         let mut batch = self.store.batch();
         let block_staging_started = Instant::now();
-        let staged_connect =
-            self.stage_connect(&snapshot, &mut batch, &request, validated, persist_raw_body)?;
+        let staged_connect = self.stage_connect_prepared(
+            &snapshot,
+            &mut batch,
+            &request,
+            validated,
+            persist_raw_body,
+            state_effects,
+            wallet_effects,
+        )?;
         let timings = NodeReorgTimings {
             block_staging_micros: u64::try_from(block_staging_started.elapsed().as_micros())
                 .unwrap_or(u64::MAX),
@@ -11574,6 +12134,8 @@ impl NodeState {
         request: NodeBlockImport,
         validated: ValidatedImport,
         persist_raw_body: bool,
+        state_effects: Option<&PreparedBlockStateEffects>,
+        wallet_effects: Option<&PreparedWalletIndexEffects>,
     ) -> Result<NodeBlockMutation> {
         let store = self.store.clone();
         let raw = store.snapshot()?;
@@ -11591,8 +12153,15 @@ impl NodeState {
         let previous = load_block_index_record(&staged, &request.block.hash())?;
         let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
         let block_staging_started = Instant::now();
-        let staged_connect =
-            self.stage_connect(&staged, &mut batch, &request, validated, persist_raw_body)?;
+        let staged_connect = self.stage_connect_prepared(
+            &staged,
+            &mut batch,
+            &request,
+            validated,
+            persist_raw_body,
+            state_effects,
+            wallet_effects,
+        )?;
         let mut timings = NodeReorgTimings {
             block_staging_micros: u64::try_from(block_staging_started.elapsed().as_micros())
                 .unwrap_or(u64::MAX),
@@ -11696,6 +12265,8 @@ impl NodeState {
         &mut self,
         request: NodeBlockImport,
         stateless: StatelessBodyValidation,
+        state_effects: Option<&PreparedBlockStateEffects>,
+        wallet_effects: Option<&PreparedWalletIndexEffects>,
     ) -> std::result::Result<NodeBlockMutation, ChainActivationFailure> {
         self.ensure_storage_operational()
             .map_err(ChainActivationFailure::Internal)?;
@@ -11724,7 +12295,13 @@ impl NodeState {
             .map_err(ChainActivationFailure::Internal)?
         };
         let failure_request = request.clone();
-        match self.commit_staged_block(request, validated, false) {
+        match self.commit_staged_block_prepared(
+            request,
+            validated,
+            false,
+            state_effects,
+            wallet_effects,
+        ) {
             Ok(mutation) => Ok(mutation),
             Err(error)
                 if error
@@ -11746,6 +12323,7 @@ impl NodeState {
         }
     }
 
+    #[cfg(test)]
     fn stage_connect<T: ReadSnapshot, B: WriteBatch>(
         &self,
         snapshot: &T,
@@ -11754,6 +12332,28 @@ impl NodeState {
         validated: ValidatedImport,
         persist_raw_body: bool,
     ) -> Result<StagedConnect> {
+        self.stage_connect_prepared(
+            snapshot,
+            batch,
+            request,
+            validated,
+            persist_raw_body,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_connect_prepared<T: ReadSnapshot, B: WriteBatch>(
+        &self,
+        snapshot: &T,
+        batch: &mut B,
+        request: &NodeBlockImport,
+        validated: ValidatedImport,
+        persist_raw_body: bool,
+        state_effects: Option<&PreparedBlockStateEffects>,
+        wallet_effects: Option<&PreparedWalletIndexEffects>,
+    ) -> Result<StagedConnect> {
         self.stage_connect_with_accumulator(
             snapshot,
             batch,
@@ -11761,9 +12361,12 @@ impl NodeState {
             validated,
             persist_raw_body,
             None,
+            state_effects,
+            wallet_effects,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stage_connect_with_accumulator<T: ReadSnapshot, B: WriteBatch>(
         &self,
         snapshot: &T,
@@ -11772,11 +12375,12 @@ impl NodeState {
         validated: ValidatedImport,
         persist_raw_body: bool,
         accumulator: Option<&mut NameTreeAccumulatorSession>,
+        state_effects: Option<&PreparedBlockStateEffects>,
+        wallet_effects: Option<&PreparedWalletIndexEffects>,
     ) -> Result<StagedConnect> {
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
-        let transaction_ids = BlockTransactionIds::new(&request.block);
         let historical_validation = validated.historical_validation;
         let mut status = validated.status;
 
@@ -11809,18 +12413,45 @@ impl NodeState {
         // Stage index writes first so the live overlay cannot hide inputs that
         // the state connector is about to spend. A later validation failure
         // discards the shared batch, so no derivative write is published alone.
-        let prepared_utxos =
-            prepare_block_utxos_with_transaction_ids(snapshot, &transaction_ids, request.height)
+        let (transaction_ids, prepared_utxos) = match state_effects {
+            Some(effects) => prepare_block_utxos_with_state_effects(
+                snapshot,
+                &request.block,
+                request.height,
+                effects,
+            )
+            .map_err(StateConnectError)?,
+            None => {
+                let transaction_ids = BlockTransactionIds::new(&request.block);
+                let prepared = prepare_block_utxos_with_transaction_ids(
+                    snapshot,
+                    &transaction_ids,
+                    request.height,
+                )
                 .map_err(StateConnectError)?;
+                (transaction_ids, prepared)
+            }
+        };
         let wallet_index_started = Instant::now();
-        stage_connect_with_transaction_ids_and_prepared_utxos(
-            snapshot,
-            batch,
-            &transaction_ids,
-            request.height,
-            self.wallet_index_profile,
-            &prepared_utxos,
-        )
+        match wallet_effects {
+            Some(effects) => stage_connect_with_prepared_effects(
+                snapshot,
+                batch,
+                &transaction_ids,
+                request.height,
+                self.wallet_index_profile,
+                &prepared_utxos,
+                effects,
+            ),
+            None => stage_connect_with_transaction_ids_and_prepared_utxos(
+                snapshot,
+                batch,
+                &transaction_ids,
+                request.height,
+                self.wallet_index_profile,
+                &prepared_utxos,
+            ),
+        }
         .map_err(anyhow::Error::new)
         .context("failed to stage wallet indexes")?;
         let wallet_index_micros =
@@ -11902,9 +12533,17 @@ impl NodeState {
                 .context("failed to stage raw block")?;
         }
         if self.transaction_index {
-            write_tx_index_for_block_to_batch(batch, &request.block, request.height)
-                .map_err(anyhow::Error::new)
-                .context("failed to stage tx index")?;
+            if let Some(effects) = state_effects {
+                for entry in effects.tx_index_entries() {
+                    write_tx_index_to_batch(batch, entry)
+                        .map_err(anyhow::Error::new)
+                        .context("failed to stage prepared tx index")?;
+                }
+            } else {
+                write_tx_index_for_block_to_batch(batch, &request.block, request.height)
+                    .map_err(anyhow::Error::new)
+                    .context("failed to stage tx index")?;
+            }
         }
         write_canonical_height_to_batch(batch, request.height, block_hash)
             .map_err(anyhow::Error::new)
@@ -12376,21 +13015,36 @@ impl NodeState {
         }
 
         let utxo_prefetch_started = Instant::now();
-        let utxos_prefetched = prefetch_replay_utxos(
-            &staged,
-            request.connect.iter().map(|connect| &connect.block),
-        )
-        .map_err(anyhow::Error::new)
-        .context("failed to prefetch active-state replay UTXOs")
-        .map_err(ChainActivationFailure::Internal)?;
+        let prepared_lookup_count = prepared.as_ref().and_then(|prepared| {
+            prepared
+                .values()
+                .try_fold(0usize, |total, (_proof, effects, _wallet)| {
+                    effects
+                        .as_ref()
+                        .and_then(|effects| total.checked_add(effects.input_outpoints().len()))
+                })
+        });
+        let utxos_prefetched = match prepared_lookup_count {
+            Some(grouped) => grouped,
+            None => prefetch_replay_utxos(
+                &staged,
+                request.connect.iter().map(|connect| &connect.block),
+            )
+            .map_err(anyhow::Error::new)
+            .context("failed to prefetch active-state replay UTXOs")
+            .map_err(ChainActivationFailure::Internal)?,
+        };
         let utxo_prefetch_micros =
             u64::try_from(utxo_prefetch_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut name_accumulator = NameTreeAccumulatorSession::default();
         for connect in request.connect {
             let hash = connect.block.hash();
-            let stateless = prepared
+            let (stateless, state_effects, wallet_effects) = prepared
                 .as_mut()
-                .and_then(|proofs| proofs.remove(&(hash, connect.height)));
+                .and_then(|proofs| proofs.remove(&(hash, connect.height)))
+                .map_or((None, None, None), |(proof, state, wallet)| {
+                    (Some(proof), state, wallet)
+                });
             // Strict stored bodies are fully revalidated here because durable
             // status and bytes are both forgeable under the local-DB threat
             // model. Fixture imports retain their explicit test-only policy.
@@ -12453,6 +13107,8 @@ impl NodeState {
                 validated,
                 persist_raw_body,
                 Some(&mut name_accumulator),
+                state_effects.as_ref(),
+                wallet_effects.as_ref(),
             ) {
                 Ok(record) => record,
                 Err(error)
@@ -13082,10 +13738,27 @@ impl NodeState {
         Ok(Some(report))
     }
 
+    #[cfg(test)]
     fn compact_pruned_name_pages_if_due(&mut self) -> Result<Option<NamePageCompactionReport>> {
         self.compact_pruned_name_pages_if_due_at(NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD)
     }
 
+    fn publish_prepared_name_page_generation(
+        &mut self,
+        prepared: PreparedNamePageGeneration,
+    ) -> Result<Option<NamePageCompactionReport>> {
+        self.ensure_storage_operational()?;
+        let Some(name_pages) = self.name_pages.as_mut() else {
+            return Ok(None);
+        };
+        name_pages.publish_prepared_generation(
+            &self.store,
+            prepared,
+            production_name_page_compaction_filesystem_limits(),
+        )
+    }
+
+    #[cfg(test)]
     fn compact_pruned_name_pages_if_due_at(
         &mut self,
         segment_threshold: u32,
@@ -16002,6 +16675,80 @@ mod tests {
         drop(state);
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn background_name_page_generation_catches_up_before_atomic_publication() {
+        let mut fixture = build_test_node_page_generation(512);
+        let pages = fixture
+            .live_state
+            .name_pages
+            .as_ref()
+            .expect("fixture pages");
+        let source_generation = pages.state.manifest.generation;
+        let source_root = pages.state.root;
+        let source_committed_height = pages.state.committed_height;
+
+        let prepared = NamePageStorage::prepare_generation_in_background(
+            fixture.directory.clone(),
+            &fixture.store,
+            Network::Regtest,
+            source_generation,
+            production_name_page_compaction_filesystem_limits(),
+            production_name_page_compaction_cleanup_limits(),
+        )
+        .expect("prepare generation outside writer")
+        .expect("source generation remains current");
+
+        // Model canonical progress after the immutable build completed. The
+        // publication must accept this newer durable metadata instead of
+        // demanding that the chain remain frozen at its original epoch.
+        let advanced_height = NAME_PAGE_SEGMENT_BLOCKS.saturating_mul(2);
+        commit_test_name_page_seal(&mut fixture.live_state, advanced_height)
+            .expect("advance canonical page generation while compaction is prepared");
+        let active_segment_before = fixture
+            .live_state
+            .name_pages
+            .as_ref()
+            .expect("advanced pages")
+            .state
+            .manifest
+            .active_segment;
+        assert_eq!(active_segment_before, 2);
+
+        let report = fixture
+            .live_state
+            .publish_prepared_name_page_generation(prepared)
+            .expect("publish caught-up generation")
+            .expect("generation publication");
+        assert_eq!(report.previous_generation, source_generation);
+        assert_eq!(report.generation, source_generation + 1);
+
+        let pages = fixture
+            .live_state
+            .name_pages
+            .as_ref()
+            .expect("published pages");
+        assert_eq!(pages.state.root, source_root);
+        assert_eq!(pages.state.committed_height, source_committed_height);
+        assert_eq!(pages.state.last_sealed_height, Some(advanced_height));
+        assert_eq!(pages.state.manifest.generation, report.generation);
+        assert_eq!(pages.state.manifest.active_segment, 0);
+
+        drop(fixture.live_state);
+        let reopened = NamePageStorage::open_or_bootstrap(
+            fixture.directory.clone(),
+            &fixture.store,
+            Network::Regtest,
+        )
+        .expect("reopen atomically published generation");
+        assert_eq!(reopened.state.root, source_root);
+        assert_eq!(reopened.state.manifest.generation, report.generation);
+        assert_eq!(reopened.state.committed_height, source_committed_height);
+
+        drop(reopened);
+        drop(fixture.store);
+        std::fs::remove_dir_all(fixture.directory).expect("remove test directory");
     }
 
     #[test]
@@ -21782,7 +22529,11 @@ mod tests {
             let last_height =
                 Height::try_from(connected + outcome.connected - 1).expect("fixture height");
             if first_height != 0 && first_height.is_multiple_of(tree_interval) {
-                assert_eq!(outcome.connected, 1, "boundary must be isolated");
+                assert!(
+                    (first_height.saturating_add(1)..=last_height)
+                        .all(|height| !height.is_multiple_of(tree_interval)),
+                    "a slice beginning at a boundary must stop before the next boundary"
+                );
             } else if let Some(boundary) = (first_height..=last_height)
                 .find(|height| *height != 0 && height.is_multiple_of(tree_interval))
             {

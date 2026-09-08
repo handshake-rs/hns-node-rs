@@ -2765,6 +2765,59 @@ pub fn tx_index_entries_for_block(
     Ok(entries)
 }
 
+/// Build transaction-index rows from worker-prepared identities and canonical
+/// transaction record lengths without re-encoding or re-hashing transactions
+/// on the canonical writer.
+pub fn tx_index_entries_for_prepared_block(
+    block: &Block,
+    height: Height,
+    transaction_ids: &[Txid],
+    transaction_record_lengths: &[usize],
+) -> Result<Vec<TxIndexEntry>, ChainError> {
+    if transaction_ids.len() != block.transactions.len()
+        || transaction_record_lengths.len() != block.transactions.len()
+    {
+        return Err(ChainError::Codec(
+            "prepared transaction-index input count mismatch".to_owned(),
+        ));
+    }
+    let block_hash = block.hash();
+    let tx_count = u64::try_from(block.transactions.len()).map_err(|_| {
+        ChainError::Codec("prepared block transaction count exceeds u64".to_owned())
+    })?;
+    let mut offset = checked_usize_to_u32(
+        HEADER_SIZE
+            .checked_add(varint_size(tx_count))
+            .ok_or(ChainError::Codec("transaction offset overflow".to_owned()))?,
+        "transaction offset",
+    )?;
+    let mut entries = Vec::with_capacity(block.transactions.len());
+    for (((transaction, txid), encoded_len), position) in block
+        .transactions
+        .iter()
+        .zip(transaction_ids.iter().copied())
+        .zip(transaction_record_lengths.iter().copied())
+        .zip(0_usize..)
+    {
+        let tx_len = checked_usize_to_u32(encoded_len, "transaction length")?;
+        let output_count = u32::try_from(transaction.outputs.len()).map_err(|_| {
+            ChainError::Codec(format!("transaction {position} output count exceeds u32"))
+        })?;
+        entries.push(TxIndexEntry {
+            txid,
+            block_hash,
+            height,
+            tx_offset: offset,
+            tx_len,
+            output_count,
+        });
+        offset = offset
+            .checked_add(tx_len)
+            .ok_or(ChainError::Codec("transaction offset overflow".to_owned()))?;
+    }
+    Ok(entries)
+}
+
 fn tx_index_entry(
     transaction: &Transaction,
     block_hash: BlockHash,
@@ -4844,5 +4897,31 @@ mod tests {
         assert_eq!(first.tx_len, block.transactions[0].encode().len() as u32);
         assert_eq!(first.output_count, 1);
         assert_eq!(second.tx_offset, first.tx_offset + first.tx_len);
+    }
+
+    #[test]
+    fn prepared_transaction_index_rows_match_serial_rows() {
+        let block = Block {
+            header: header(BlockHash::ZERO, 29),
+            transactions: vec![
+                transaction(7, vec![output(10), output(11)]),
+                transaction(8, vec![output(20)]),
+            ],
+        };
+        let ids = block
+            .transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        let lengths = block
+            .transactions
+            .iter()
+            .map(|transaction| transaction.encode().len())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tx_index_entries_for_prepared_block(&block, 71, &ids, &lengths)
+                .expect("prepared transaction-index rows"),
+            tx_index_entries_for_block(&block, 71).expect("serial transaction-index rows")
+        );
     }
 }

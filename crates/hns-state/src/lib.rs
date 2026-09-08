@@ -27,7 +27,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hns_chain::{read_canonical_hash, HeaderRecord};
+use hns_chain::{
+    read_canonical_hash, tx_index_entries_for_prepared_block, HeaderRecord, TxIndexEntry,
+};
 use hns_consensus::{
     is_reserved, maybe_expire_name, name_lifecycle, transaction_sigops, verify_airdrop_output,
     verify_and_apply_name_covenant, verify_claim_output, verify_sequence_locks,
@@ -40,10 +42,10 @@ use hns_consensus::{
 use hns_primitives::{
     blake2b_256, Address, AirdropKey, AirdropProof, AirdropSignatureVerifier, Amount, Block,
     BlockHash, BlockTransactionIds, Coin, Covenant, CovenantKind, DnssecVerifier, Height, NameHash,
-    NameLifecycleState, NameState, Outpoint, OwnershipProof, PrimitiveError, Reader, Transaction,
-    UnavailableAirdropSignatureVerifier, Writer, AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE,
-    MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_SCRIPT_STACK, MAX_TX_SIZE,
-    MIN_ADDRESS_HASH_SIZE,
+    NameLifecycleState, NameState, Outpoint, OwnershipProof, PreparedBlockTransactionIds,
+    PrimitiveError, Reader, Transaction, UnavailableAirdropSignatureVerifier, Writer,
+    AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE,
+    MAX_SCRIPT_STACK, MAX_TX_SIZE, MIN_ADDRESS_HASH_SIZE,
 };
 use hns_store::{
     decode_u32, encode_u32, ColumnFamily, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
@@ -215,13 +217,200 @@ pub struct ConnectBlock<'a> {
 /// outpoint keys, cloning the same snapshot values, decoding the same coins,
 /// and building two independent hash tables immediately before one atomic
 /// block connection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedCoinWrite {
+    pub outpoint: Outpoint,
+    pub key: Arc<[u8]>,
+    pub value: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedNameAction {
+    pub transaction_position: u32,
+    pub output_position: u32,
+    pub kind: CovenantKind,
+    pub name_hash: Option<NameHash>,
+}
+
+/// Immutable, context-independent state effects built by native-sync workers.
+///
+/// The object contains the expensive hashes, canonical encodings and lookup
+/// keys needed by the contextual connector. It deliberately does not contain
+/// snapshot values or a claimed state transition: those remain bound to the
+/// canonical pre-connect view and are checked by the writer.
+#[derive(Clone, Debug)]
+pub struct PreparedBlockStateEffects {
+    block_hash: BlockHash,
+    height: Height,
+    transaction_ids: PreparedBlockTransactionIds,
+    transaction_records: Vec<Arc<[u8]>>,
+    input_outpoints: Vec<Outpoint>,
+    input_keys: Vec<Arc<[u8]>>,
+    created_coins: Arc<HashMap<Outpoint, Coin>>,
+    created_coin_writes: Arc<HashMap<Outpoint, PreparedCoinWrite>>,
+    name_actions: Arc<[PreparedNameAction]>,
+    tx_index_entries: Vec<TxIndexEntry>,
+}
+
+impl PreparedBlockStateEffects {
+    pub fn prepare(block: &Block, height: Height) -> Result<Self, StateError> {
+        let transaction_ids = PreparedBlockTransactionIds::new(block);
+        let bound = transaction_ids.bind(block)?;
+        let created_coins = block_created_coins_with_transaction_ids(&bound, height)?;
+        let created_coin_writes = created_coins
+            .iter()
+            .map(|(outpoint, coin)| {
+                (
+                    outpoint.clone(),
+                    PreparedCoinWrite {
+                        outpoint: outpoint.clone(),
+                        key: Arc::from(encode_outpoint_key(outpoint)),
+                        value: Arc::from(encode_coin(coin)),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut unique_inputs = HashSet::new();
+        let mut input_outpoints = Vec::new();
+        let saturated = extend_block_utxo_outpoints_with_transaction_ids(
+            &bound,
+            &mut unique_inputs,
+            &mut input_outpoints,
+            usize::MAX,
+        )?;
+        debug_assert!(!saturated);
+        let input_keys = input_outpoints
+            .iter()
+            .map(|outpoint| Arc::from(encode_outpoint_key(outpoint)))
+            .collect();
+
+        let mut name_actions = Vec::new();
+        for (transaction_position, transaction) in block.transactions.iter().enumerate() {
+            let transaction_position = u32::try_from(transaction_position)
+                .map_err(|_| StateError::Codec("transaction position exceeds u32".to_owned()))?;
+            for (output_position, output) in transaction.outputs.iter().enumerate() {
+                if !output.covenant.kind.is_name() {
+                    continue;
+                }
+                let output_position = u32::try_from(output_position)
+                    .map_err(|_| StateError::Codec("output position exceeds u32".to_owned()))?;
+                let name_hash = output
+                    .covenant
+                    .item(0)
+                    .and_then(|item| <[u8; 32]>::try_from(item).ok())
+                    .map(NameHash::new);
+                name_actions.push(PreparedNameAction {
+                    transaction_position,
+                    output_position,
+                    kind: output.covenant.kind,
+                    name_hash,
+                });
+            }
+        }
+
+        let transaction_records = block
+            .transactions
+            .iter()
+            .map(|transaction| Arc::<[u8]>::from(transaction.encode()))
+            .collect::<Vec<_>>();
+        let tx_index_entries = tx_index_entries_for_prepared_block(
+            block,
+            height,
+            transaction_ids.as_slice(),
+            &transaction_records
+                .iter()
+                .map(|record| record.len())
+                .collect::<Vec<_>>(),
+        )?;
+
+        Ok(Self {
+            block_hash: block.hash(),
+            height,
+            transaction_ids,
+            transaction_records,
+            input_outpoints,
+            input_keys,
+            created_coins: Arc::new(created_coins),
+            created_coin_writes: Arc::new(created_coin_writes),
+            name_actions: Arc::from(name_actions),
+            tx_index_entries,
+        })
+    }
+
+    pub fn bind_transaction_ids<'a>(
+        &'a self,
+        block: &'a Block,
+        height: Height,
+    ) -> Result<BlockTransactionIds<'a>, StateError> {
+        if self.block_hash != block.hash() || self.height != height {
+            return Err(StateError::Codec(
+                "prepared state effects belong to a different block or height".to_owned(),
+            ));
+        }
+        self.transaction_ids.bind(block).map_err(StateError::from)
+    }
+
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> Height {
+        self.height
+    }
+
+    #[must_use]
+    pub fn transaction_records(&self) -> &[Arc<[u8]>] {
+        &self.transaction_records
+    }
+
+    #[must_use]
+    pub fn input_outpoints(&self) -> &[Outpoint] {
+        &self.input_outpoints
+    }
+
+    #[must_use]
+    pub fn input_keys(&self) -> &[Arc<[u8]>] {
+        &self.input_keys
+    }
+
+    #[must_use]
+    pub fn name_actions(&self) -> &[PreparedNameAction] {
+        &self.name_actions
+    }
+
+    #[must_use]
+    pub fn tx_index_entries(&self) -> &[TxIndexEntry] {
+        &self.tx_index_entries
+    }
+
+    #[must_use]
+    pub fn created_coin_write(&self, outpoint: &Outpoint) -> Option<&PreparedCoinWrite> {
+        self.created_coin_writes.get(outpoint)
+    }
+
+    #[must_use]
+    pub fn created_coin(&self, outpoint: &Outpoint) -> Option<&Coin> {
+        self.created_coins.get(outpoint)
+    }
+
+    #[must_use]
+    pub fn transaction_ids(&self) -> &[hns_primitives::Txid] {
+        self.transaction_ids.as_slice()
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedBlockUtxos {
     block_hash: BlockHash,
     height: Height,
     transaction_ids: Vec<hns_primitives::Txid>,
     coins: HashMap<Outpoint, Option<Coin>>,
-    created_coins: HashMap<Outpoint, Coin>,
+    created_coin_writes: Option<Arc<HashMap<Outpoint, PreparedCoinWrite>>>,
+    name_actions: Option<Arc<[PreparedNameAction]>>,
+    created_coins: Arc<HashMap<Outpoint, Coin>>,
 }
 
 impl PreparedBlockUtxos {
@@ -248,6 +437,29 @@ impl PreparedBlockUtxos {
     #[must_use]
     pub fn created_coin(&self, outpoint: &Outpoint) -> Option<&Coin> {
         self.created_coins.get(outpoint)
+    }
+
+    #[must_use]
+    pub fn created_coin_write(&self, outpoint: &Outpoint) -> Option<&PreparedCoinWrite> {
+        self.created_coin_writes
+            .as_ref()
+            .and_then(|writes| writes.get(outpoint))
+    }
+
+    fn name_action(
+        &self,
+        transaction_position: usize,
+        output_position: usize,
+    ) -> Option<&PreparedNameAction> {
+        let transaction_position = u32::try_from(transaction_position).ok()?;
+        let output_position = u32::try_from(output_position).ok()?;
+        let actions = self.name_actions.as_ref()?;
+        actions
+            .binary_search_by_key(&(transaction_position, output_position), |action| {
+                (action.transaction_position, action.output_position)
+            })
+            .ok()
+            .map(|index| &actions[index])
     }
 }
 
@@ -2598,14 +2810,16 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 Some(input_value - output_value)
             };
 
-            apply_transaction_name_covenants(
+            apply_transaction_name_covenants_prepared(
                 snapshot,
                 transaction,
+                transaction_index,
                 request.height,
                 services,
                 &chain_context,
                 &mut name_state_changes,
                 false,
+                prepared_utxos,
             )?;
 
             stage_transaction_spends(batch, &mut pending_created, &mut spent_coins, resolved)?;
@@ -2615,14 +2829,16 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                     .ok_or(StateError::FeeValueOverflow)?;
             }
         } else {
-            apply_transaction_name_covenants(
+            apply_transaction_name_covenants_prepared(
                 snapshot,
                 transaction,
+                transaction_index,
                 request.height,
                 services,
                 &chain_context,
                 &mut name_state_changes,
                 true,
+                prepared_utxos,
             )?;
         }
 
@@ -2650,11 +2866,17 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
             let coin = prepared_created_coins.get(&outpoint).ok_or_else(|| {
                 StateError::Codec("prepared output coin is missing from its block view".to_owned())
             })?;
-            batch.put(
-                ColumnFamily::Utxo,
-                &encode_outpoint_key(&outpoint),
-                &encode_coin(coin),
-            )?;
+            if let Some(write) =
+                prepared_utxos.and_then(|prepared| prepared.created_coin_write(&outpoint))
+            {
+                batch.put(ColumnFamily::Utxo, &write.key, &write.value)?;
+            } else {
+                batch.put(
+                    ColumnFamily::Utxo,
+                    &encode_outpoint_key(&outpoint),
+                    &encode_coin(coin),
+                )?;
+            }
             pending_created.insert(outpoint.clone(), coin.clone());
             created_coins.push(outpoint);
         }
@@ -2978,8 +3200,64 @@ pub fn prepare_block_utxos_with_transaction_ids<T: ReadSnapshot>(
         height,
         transaction_ids: transaction_ids.as_slice().to_vec(),
         coins: prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?,
-        created_coins: block_created_coins_with_transaction_ids(transaction_ids, height)?,
+        created_coin_writes: None,
+        name_actions: None,
+        created_coins: Arc::new(block_created_coins_with_transaction_ids(
+            transaction_ids,
+            height,
+        )?),
     })
+}
+
+/// Resolve snapshot-dependent coins using worker-prepared lookup keys and
+/// immutable output encodings. This is the contextual half of preparation and
+/// therefore remains on the canonical snapshot, but it performs no transaction
+/// hashing, outpoint-key construction, output cloning or coin encoding.
+pub fn prepare_block_utxos_with_state_effects<'a, T: ReadSnapshot>(
+    snapshot: &T,
+    block: &'a Block,
+    height: Height,
+    effects: &'a PreparedBlockStateEffects,
+) -> Result<(BlockTransactionIds<'a>, PreparedBlockUtxos), StateError> {
+    let transaction_ids = effects.bind_transaction_ids(block, height)?;
+    let key_refs = effects
+        .input_keys()
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<&[u8]>>();
+    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    if values.len() != effects.input_outpoints().len() {
+        return Err(StateError::Codec(format!(
+            "prepared UTXO multi-get returned {} values for {} lookup groups",
+            values.len(),
+            effects.input_outpoints().len()
+        )));
+    }
+    let coins = effects
+        .input_outpoints()
+        .iter()
+        .cloned()
+        .zip(values)
+        .map(|(outpoint, raw)| {
+            let coin = raw.map(|raw| decode_coin(&raw)).transpose()?;
+            if coin.as_ref().is_some_and(|coin| coin.outpoint != outpoint) {
+                return Err(StateError::Codec(
+                    "coin payload does not match its prepared UTXO key".to_owned(),
+                ));
+            }
+            Ok((outpoint, coin))
+        })
+        .collect::<Result<HashMap<_, _>, StateError>>()?;
+    let prepared = PreparedBlockUtxos {
+        block_hash: effects.block_hash,
+        height,
+        transaction_ids: transaction_ids.as_slice().to_vec(),
+        coins,
+        created_coin_writes: Some(Arc::clone(&effects.created_coin_writes)),
+        name_actions: Some(Arc::clone(&effects.name_actions)),
+        created_coins: Arc::clone(&effects.created_coins),
+    };
+    Ok((transaction_ids, prepared))
 }
 
 fn block_created_coins_with_transaction_ids(
@@ -3458,6 +3736,31 @@ fn apply_transaction_name_covenants<T: ReadSnapshot>(
     changes: &mut NameStateChanges,
     allow_verified_claims: bool,
 ) -> Result<(), StateError> {
+    apply_transaction_name_covenants_prepared(
+        snapshot,
+        transaction,
+        0,
+        height,
+        services,
+        context,
+        changes,
+        allow_verified_claims,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_transaction_name_covenants_prepared<T: ReadSnapshot>(
+    snapshot: &T,
+    transaction: &Transaction,
+    transaction_position: usize,
+    height: Height,
+    services: StateServices<'_>,
+    context: &SnapshotChainContext<'_, T>,
+    changes: &mut NameStateChanges,
+    allow_verified_claims: bool,
+    prepared: Option<&PreparedBlockUtxos>,
+) -> Result<(), StateError> {
     for (output_index, output) in transaction.outputs.iter().enumerate() {
         if !output.covenant.kind.is_name() {
             continue;
@@ -3479,12 +3782,25 @@ fn apply_transaction_name_covenants<T: ReadSnapshot>(
         {
             continue;
         }
-        let bytes = output
-            .covenant
-            .item(0)
-            .and_then(|item| <[u8; 32]>::try_from(item).ok())
-            .ok_or_else(|| StateError::ContextualCovenant("invalid name hash".to_owned()))?;
-        let name_hash = NameHash::new(bytes);
+        let name_hash = if let Some(action) =
+            prepared.and_then(|effects| effects.name_action(transaction_position, output_index))
+        {
+            if action.kind != output.covenant.kind {
+                return Err(StateError::Codec(
+                    "prepared name action disagrees with its covenant".to_owned(),
+                ));
+            }
+            action.name_hash.ok_or_else(|| {
+                StateError::ContextualCovenant("invalid prepared name hash".to_owned())
+            })?
+        } else {
+            let bytes = output
+                .covenant
+                .item(0)
+                .and_then(|item| <[u8; 32]>::try_from(item).ok())
+                .ok_or_else(|| StateError::ContextualCovenant("invalid name hash".to_owned()))?;
+            NameHash::new(bytes)
+        };
 
         if let std::collections::hash_map::Entry::Vacant(entry) = changes.current.entry(name_hash) {
             let loaded = load_name_state(snapshot, &name_hash)?;

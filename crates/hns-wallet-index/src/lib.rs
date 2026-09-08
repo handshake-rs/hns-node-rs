@@ -12,13 +12,19 @@
     reason = "the public index boundary uses explicit domain names"
 )]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+};
 
 use hns_primitives::{
     blake2b_256, Address, Block, BlockHash, BlockTransactionIds, Coin, Height, Outpoint,
     Transaction, Txid, Writer,
 };
-use hns_state::{decode_coin, encode_coin, encode_outpoint_key, BlockUndo, PreparedBlockUtxos};
+use hns_state::{
+    decode_coin, encode_coin, encode_outpoint_key, BlockUndo, PreparedBlockStateEffects,
+    PreparedBlockUtxos,
+};
 use hns_store::{
     ColumnFamily, PrefixScanBudget, ReadSnapshot, StoreError, WriteBatch, PREFIX_SCAN_MAX_ENTRIES,
 };
@@ -382,6 +388,127 @@ impl SpendingTransaction {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PreparedWalletOutput {
+    script: ScriptId,
+    outpoint: Outpoint,
+    transaction_position: u32,
+    utxo_key: Arc<[u8]>,
+    utxo_value: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedWalletSpend {
+    previous_output: Outpoint,
+    transaction_position: u32,
+    input_position: u32,
+    txid: Txid,
+    key: Arc<[u8]>,
+    value: Arc<[u8]>,
+}
+
+/// Context-independent wallet-index candidate rows produced by native-sync
+/// workers. Input-script history still binds to the canonical coin snapshot;
+/// output rows and spender rows arrive with their final keys/values encoded.
+#[derive(Clone, Debug)]
+pub struct PreparedWalletIndexEffects {
+    block_hash: BlockHash,
+    height: Height,
+    transaction_ids: Vec<Txid>,
+    outputs: HashMap<Outpoint, PreparedWalletOutput>,
+    spends: HashMap<(u32, u32), PreparedWalletSpend>,
+}
+
+impl PreparedWalletIndexEffects {
+    pub fn prepare(
+        block: &Block,
+        height: Height,
+        state: &PreparedBlockStateEffects,
+    ) -> Result<Self, IndexError> {
+        let transaction_ids = state.transaction_ids();
+        if state.block_hash() != block.hash()
+            || state.height() != height
+            || transaction_ids.len() != block.transactions.len()
+        {
+            return Err(IndexError::Corrupt(
+                "prepared wallet effects do not match state effects",
+            ));
+        }
+        let block_hash = block.hash();
+        let mut outputs = HashMap::new();
+        let mut spends = HashMap::new();
+        for (transaction_position, (transaction, txid)) in block
+            .transactions
+            .iter()
+            .zip(transaction_ids.iter().copied())
+            .enumerate()
+        {
+            let transaction_position =
+                u32::try_from(transaction_position).map_err(|_| IndexError::PositionOverflow)?;
+            for (output_position, output) in transaction.outputs.iter().enumerate() {
+                if output.is_unspendable() {
+                    continue;
+                }
+                let output_position =
+                    u32::try_from(output_position).map_err(|_| IndexError::PositionOverflow)?;
+                let outpoint = Outpoint {
+                    txid,
+                    index: output_position,
+                };
+                let coin = state.created_coin(&outpoint).ok_or(IndexError::Corrupt(
+                    "prepared wallet output coin is missing",
+                ))?;
+                let script = ScriptId::from_address(&coin.address);
+                outputs.insert(
+                    outpoint.clone(),
+                    PreparedWalletOutput {
+                        script,
+                        outpoint: outpoint.clone(),
+                        transaction_position,
+                        utxo_key: Arc::from(utxo_key(script, &outpoint)),
+                        utxo_value: Arc::from(encode_utxo_value(script, coin)),
+                    },
+                );
+            }
+            for (input_position, input) in transaction.inputs.iter().enumerate() {
+                if input.previous_output.is_null() {
+                    continue;
+                }
+                let input_position =
+                    u32::try_from(input_position).map_err(|_| IndexError::PositionOverflow)?;
+                let spending = SpendingTransaction {
+                    txid,
+                    input_position,
+                    block_hash,
+                    height,
+                };
+                spends.insert(
+                    (transaction_position, input_position),
+                    PreparedWalletSpend {
+                        previous_output: input.previous_output.clone(),
+                        transaction_position,
+                        input_position,
+                        txid,
+                        key: Arc::from(spender_key(&input.previous_output)),
+                        value: Arc::from(spending.encode(&input.previous_output)),
+                    },
+                );
+            }
+        }
+        Ok(Self {
+            block_hash,
+            height,
+            transaction_ids: transaction_ids.to_vec(),
+            outputs,
+            spends,
+        })
+    }
+
+    fn matches(&self, block: &Block, height: Height, ids: &[Txid]) -> bool {
+        self.block_hash == block.hash() && self.height == height && self.transaction_ids == ids
+    }
+}
+
 /// One indexed unspent coin for a script.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptUtxo {
@@ -586,6 +713,7 @@ pub fn stage_connect_with_transaction_ids<B: WriteBatch, S: ReadSnapshot>(
         height,
         profile,
         &plan,
+        None,
     )
 }
 
@@ -610,6 +738,38 @@ pub fn stage_connect_with_transaction_ids_and_prepared_utxos<B: WriteBatch, S: R
         height,
         profile,
         &plan,
+        None,
+    )
+}
+
+/// Stage enabled wallet indexes while consuming worker-prepared immutable
+/// candidate rows and the canonical snapshot-dependent UTXO resolution.
+pub fn stage_connect_with_prepared_effects<B: WriteBatch, S: ReadSnapshot>(
+    snapshot: &S,
+    batch: &mut B,
+    transaction_ids: &BlockTransactionIds<'_>,
+    height: Height,
+    profile: WalletIndexProfile,
+    prepared_utxos: &PreparedBlockUtxos,
+    effects: &PreparedWalletIndexEffects,
+) -> Result<(), IndexError> {
+    if !profile.enabled() {
+        return Ok(());
+    }
+    if !effects.matches(transaction_ids.block(), height, transaction_ids.as_slice()) {
+        return Err(IndexError::Corrupt(
+            "prepared wallet candidate rows belong to another block",
+        ));
+    }
+    let plan = BlockConnectPlan::from_prepared(transaction_ids, height, prepared_utxos)?;
+    stage_connect_with_plan(
+        snapshot,
+        batch,
+        transaction_ids.block(),
+        height,
+        profile,
+        &plan,
+        Some(effects),
     )
 }
 
@@ -620,6 +780,7 @@ fn stage_connect_with_plan<B: WriteBatch, S: ReadSnapshot>(
     height: Height,
     profile: WalletIndexProfile,
     plan: &BlockConnectPlan<'_>,
+    prepared: Option<&PreparedWalletIndexEffects>,
 ) -> Result<(), IndexError> {
     let mut history = BTreeMap::<(ScriptId, Txid), ScriptHistoryEntry>::new();
 
@@ -632,17 +793,27 @@ fn stage_connect_with_plan<B: WriteBatch, S: ReadSnapshot>(
         let transaction_position =
             u32::try_from(transaction_position).map_err(|_| IndexError::PositionOverflow)?;
         if profile.histories() || profile.utxos() {
-            stage_created_outputs(
-                batch,
-                transaction,
-                txid,
-                plan.block_hash,
-                height,
-                transaction_position,
-                profile,
-                plan,
-                &mut history,
-            )?;
+            match prepared {
+                Some(prepared) => stage_prepared_created_outputs(
+                    batch,
+                    transaction,
+                    txid,
+                    profile,
+                    prepared,
+                    &mut history,
+                )?,
+                None => stage_created_outputs(
+                    batch,
+                    transaction,
+                    txid,
+                    plan.block_hash,
+                    height,
+                    transaction_position,
+                    profile,
+                    plan,
+                    &mut history,
+                )?,
+            }
         }
         for (input_position, input) in transaction.inputs.iter().enumerate() {
             if input.previous_output.is_null() {
@@ -671,17 +842,32 @@ fn stage_connect_with_plan<B: WriteBatch, S: ReadSnapshot>(
                 );
             }
             if profile.spenders() {
-                batch.put(
-                    ColumnFamily::WalletState,
-                    &spender_key(&input.previous_output),
-                    &SpendingTransaction {
-                        txid,
-                        input_position,
-                        block_hash: plan.block_hash,
-                        height,
+                if let Some(spend) = prepared.and_then(|prepared| {
+                    prepared.spends.get(&(transaction_position, input_position))
+                }) {
+                    if spend.previous_output != input.previous_output
+                        || spend.txid != txid
+                        || spend.transaction_position != transaction_position
+                        || spend.input_position != input_position
+                    {
+                        return Err(IndexError::Corrupt(
+                            "prepared wallet spender row identity mismatch",
+                        ));
                     }
-                    .encode(&input.previous_output),
-                )?;
+                    batch.put(ColumnFamily::WalletState, &spend.key, &spend.value)?;
+                } else {
+                    batch.put(
+                        ColumnFamily::WalletState,
+                        &spender_key(&input.previous_output),
+                        &SpendingTransaction {
+                            txid,
+                            input_position,
+                            block_hash: plan.block_hash,
+                            height,
+                        }
+                        .encode(&input.previous_output),
+                    )?;
+                }
             }
             if profile.utxos() {
                 batch.delete(
@@ -1011,6 +1197,57 @@ fn stage_created_outputs<B: WriteBatch>(
                 ColumnFamily::WalletState,
                 &utxo_key(script, &outpoint),
                 &encode_utxo_value(script, coin),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn stage_prepared_created_outputs<B: WriteBatch>(
+    batch: &mut B,
+    transaction: &Transaction,
+    txid: Txid,
+    profile: WalletIndexProfile,
+    prepared: &PreparedWalletIndexEffects,
+    history: &mut BTreeMap<(ScriptId, Txid), ScriptHistoryEntry>,
+) -> Result<(), IndexError> {
+    for (output_position, output) in transaction.outputs.iter().enumerate() {
+        if output.is_unspendable() {
+            continue;
+        }
+        let output_position =
+            u32::try_from(output_position).map_err(|_| IndexError::PositionOverflow)?;
+        let outpoint = Outpoint {
+            txid,
+            index: output_position,
+        };
+        let candidate = prepared.outputs.get(&outpoint).ok_or(IndexError::Corrupt(
+            "prepared wallet output candidate is missing",
+        ))?;
+        if candidate.outpoint != outpoint {
+            return Err(IndexError::Corrupt(
+                "prepared wallet output candidate identity mismatch",
+            ));
+        }
+        if profile.histories() {
+            record_history(
+                history,
+                candidate.script,
+                txid,
+                prepared.block_hash,
+                prepared.height,
+                candidate.transaction_position,
+                ScriptHistoryDirection {
+                    received: true,
+                    spent: false,
+                },
+            );
+        }
+        if profile.utxos() {
+            batch.put(
+                ColumnFamily::WalletState,
+                &candidate.utxo_key,
+                &candidate.utxo_value,
             )?;
         }
     }
@@ -1401,6 +1638,88 @@ mod tests {
             decode_index_profile(&future),
             Err(IndexError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn prepared_wallet_rows_match_serial_staging_exactly() {
+        let block = block(vec![Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output(9, 42), output(7, 11)],
+            locktime: 0,
+        }]);
+        let profile = WalletIndexProfile {
+            script_history: true,
+            spender: true,
+            wallet: true,
+        };
+
+        let serial_store = MemoryStore::new();
+        let serial_snapshot = serial_store.snapshot().expect("serial snapshot");
+        let serial_ids = BlockTransactionIds::new(&block);
+        let serial_utxos =
+            hns_state::prepare_block_utxos_with_transaction_ids(&serial_snapshot, &serial_ids, 9)
+                .expect("serial UTXO preparation");
+        let mut serial_batch = serial_store.batch();
+        stage_connect_with_transaction_ids_and_prepared_utxos(
+            &serial_snapshot,
+            &mut serial_batch,
+            &serial_ids,
+            9,
+            profile,
+            &serial_utxos,
+        )
+        .expect("serial wallet staging");
+        drop(serial_snapshot);
+        serial_store
+            .commit(serial_batch)
+            .expect("commit serial wallet rows");
+
+        let prepared_store = MemoryStore::new();
+        let prepared_snapshot = prepared_store.snapshot().expect("prepared snapshot");
+        let state_effects =
+            hns_state::PreparedBlockStateEffects::prepare(&block, 9).expect("worker state effects");
+        let (prepared_ids, prepared_utxos) = hns_state::prepare_block_utxos_with_state_effects(
+            &prepared_snapshot,
+            &block,
+            9,
+            &state_effects,
+        )
+        .expect("contextual UTXO resolution");
+        let wallet_effects = PreparedWalletIndexEffects::prepare(&block, 9, &state_effects)
+            .expect("worker wallet rows");
+        let mut prepared_batch = prepared_store.batch();
+        stage_connect_with_prepared_effects(
+            &prepared_snapshot,
+            &mut prepared_batch,
+            &prepared_ids,
+            9,
+            profile,
+            &prepared_utxos,
+            &wallet_effects,
+        )
+        .expect("prepared wallet staging");
+        drop(prepared_snapshot);
+        prepared_store
+            .commit(prepared_batch)
+            .expect("commit prepared wallet rows");
+
+        assert_eq!(
+            serial_store
+                .snapshot()
+                .expect("serial image snapshot")
+                .scan_prefix(ColumnFamily::WalletState, b"")
+                .expect("serial wallet image"),
+            prepared_store
+                .snapshot()
+                .expect("prepared image snapshot")
+                .scan_prefix(ColumnFamily::WalletState, b"")
+                .expect("prepared wallet image")
+        );
     }
 
     #[test]

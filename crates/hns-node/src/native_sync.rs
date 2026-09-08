@@ -81,11 +81,12 @@ use super::{
     CanonicalWriterError, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
     FailedBlockStage, HeaderSummary, NamePageCompactionReport, NativeRuntimeExtension,
     NodeBlockImport, NodeReadHandle, NodeReorg, NodeReorgLimits, NodeRuntime, NodeService,
-    PreparedNativeActivation, ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits,
-    RpcReadContext, RpcRuntimeLimits, ShutdownSignal, StatelessBodyValidation,
-    HSRD_DIAGNOSTIC_API_VERSION, MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
-    MAX_REORG_STAGED_EFFECT_BYTES, NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD,
-    NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD, PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES,
+    PreparedBlockStateEffects, PreparedNativeActivation, PreparedWalletIndexEffects,
+    ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits, RpcReadContext, RpcRuntimeLimits,
+    ShutdownSignal, StatelessBodyValidation, HSRD_DIAGNOSTIC_API_VERSION,
+    MAX_CANONICAL_WRITER_QUEUE_CAPACITY, MAX_REORG_STAGED_EFFECT_BYTES,
+    NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD, NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+    PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES,
 };
 use super::{wallet_rpc, WalletBackend};
 use crate::peer_bans::{
@@ -182,6 +183,8 @@ const MAX_NATIVE_SYNC_ORPHAN_BLOCKS: usize = 8_192;
 const MAX_NATIVE_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 288;
+const ACTIVE_STATE_PREPARATION_WINDOW_BLOCKS: usize = 36;
+const ACTIVE_STATE_PREPARATION_BUFFERS: usize = 2;
 const MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_NATIVE_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_NATIVE_SYNC_CONTENTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -1141,10 +1144,10 @@ pub struct NativeSyncDiagnostics {
     /// Contextual consensus/UTXO/name-state construction within the last activation.
     #[serde(default)]
     pub active_state_last_consensus_state_micros: u64,
-    /// Whole-slice immutable-base UTXO cache warmup inside block staging.
+    /// Contextual grouped UTXO resolution inside block staging.
     #[serde(default)]
     pub active_state_last_utxo_prefetch_micros: u64,
-    /// Distinct input/output outpoints included in the bounded warmup.
+    /// Distinct input/output outpoints included in prepared lookup groups.
     #[serde(default)]
     pub active_state_last_utxos_prefetched: usize,
     /// Authenticated name-page packing and append preparation in that activation.
@@ -1297,8 +1300,18 @@ fn isolate_direct_name_tree_commit(mut activation: NodeReorg, tree_interval: Hei
     if !activation.disconnect.is_empty() || activation.connect.len() <= 1 || tree_interval == 0 {
         return activation;
     }
-    let mut boundaries = activation
-        .connect
+    activation.connect.truncate(direct_name_tree_commit_len(
+        &activation.connect,
+        tree_interval,
+    ));
+    activation
+}
+
+fn direct_name_tree_commit_len(connect: &[NodeBlockImport], tree_interval: Height) -> usize {
+    if connect.len() <= 1 || tree_interval == 0 {
+        return connect.len();
+    }
+    let mut boundaries = connect
         .iter()
         .enumerate()
         .filter_map(|(position, request)| {
@@ -1311,11 +1324,39 @@ fn isolate_direct_name_tree_commit(mut activation: NodeReorg, tree_interval: Hei
         } else {
             Some(first_boundary)
         };
-        if let Some(truncate_at) = truncate_at {
-            activation.connect.truncate(truncate_at.max(1));
-        }
+        return truncate_at
+            .unwrap_or(connect.len())
+            .max(1)
+            .min(connect.len());
     }
-    activation
+    connect.len()
+}
+
+fn split_direct_name_tree_commit_buffers(
+    mut activation: NodeReorg,
+    tree_interval: Height,
+) -> (NodeReorg, Option<NodeReorg>) {
+    if !activation.disconnect.is_empty() || activation.connect.len() <= 1 {
+        return (
+            isolate_direct_name_tree_commit(activation, tree_interval),
+            None,
+        );
+    }
+    let first_len = direct_name_tree_commit_len(&activation.connect, tree_interval)
+        .clamp(1, ACTIVE_STATE_PREPARATION_WINDOW_BLOCKS);
+    let tail = activation.connect.split_off(first_len);
+    let second = (!tail.is_empty()).then(|| {
+        let mut tail = tail;
+        tail.truncate(ACTIVE_STATE_PREPARATION_WINDOW_BLOCKS);
+        isolate_direct_name_tree_commit(
+            NodeReorg {
+                disconnect: Vec::new(),
+                connect: tail,
+            },
+            tree_interval,
+        )
+    });
+    (activation, second)
 }
 
 #[derive(Debug)]
@@ -1324,9 +1365,11 @@ struct NativeActiveStatePreparationInput {
     import: NodeBlockImport,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct NativeActiveStatePreparationOutput {
     proof: StatelessBodyValidation,
+    state_effects: PreparedBlockStateEffects,
+    wallet_effects: PreparedWalletIndexEffects,
     worker_micros: u64,
     workload: ActiveStateWorkload,
 }
@@ -1426,15 +1469,78 @@ fn schedule_name_page_compaction_if_due(
     );
 
     let writer = writer.clone();
+    let node = node.clone();
 
     *task = Some(tokio::spawn(async move {
-        writer
-            .execute_at_chain(
-                due.epoch,
-                "compact pruned name-page generation",
-                move |service| service.state.compact_pruned_name_pages_if_due(),
+        let prepare_node = node.clone();
+        let prepare_due = due.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_node.prepare_name_page_generation(&prepare_due)
+        })
+        .await
+        .context("background name-page generation worker failed")?;
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error)
+                if error
+                    .downcast_ref::<super::NamePageCompactionDeferred>()
+                    .is_some() =>
+            {
+                tracing::warn!(
+                    error = %error,
+                    generation = due.generation,
+                    "deferred background name-page generation before publication"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+
+        // Chain advancement is expected during the background build. The
+        // writer validates the source generation and catches the prepared
+        // image up to its latest committed name root before publication.
+        let mut report = writer
+            .execute(
+                None,
+                "publish prepared name-page generation",
+                move |service| {
+                    service
+                        .state
+                        .publish_prepared_name_page_generation(prepared)
+                },
             )
-            .await
+            .await?;
+        if let Some(report) = &mut report {
+            let cleanup_node = node.clone();
+            let authoritative_generation = report.generation;
+            let cleanup = tokio::task::spawn_blocking(move || {
+                cleanup_node.cleanup_superseded_name_page_generations(authoritative_generation)
+            })
+            .await;
+            match cleanup {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    report.reclaimed_bytes = 0;
+                    tracing::warn!(
+                        %error,
+                        authoritative_generation,
+                        "deferred physical cleanup of a superseded name-page generation"
+                    );
+                }
+                Err(error) => {
+                    report.reclaimed_bytes = 0;
+                    tracing::warn!(
+                        %error,
+                        authoritative_generation,
+                        "name-page old-generation cleanup worker failed"
+                    );
+                }
+            }
+        }
+        Ok(report)
     }));
 
     Ok(true)
@@ -3282,7 +3388,6 @@ impl NodeService {
                 _ = active_state_poll.tick(),
                     if native_sync_config.connect_active_state
                         && active_state_task.is_none()
-                        && name_page_compaction_task.is_none()
                         && payload_segment_compaction_task.is_none()
                         && (active_state_completion.is_some()
                             || active_state_work_ready(&scheduler)) =>
@@ -3487,7 +3592,7 @@ impl NodeService {
                         {
                             tracing::debug!(
                                 %error,
-                                "online name-page compaction lost its canonical epoch; it will be reconsidered"
+                                "online name-page generation publication encountered canonical-writer contention; it will be reconsidered"
                             );
 
                             reset_native_supervisor_poll(
@@ -4884,18 +4989,15 @@ impl NodeService {
         let mut selected = Vec::new();
         let mut selected_indexes = HashSet::new();
 
-        loop {
-            let Some((index, (request, _, proof, _))) =
-                candidates.iter().enumerate().find(|(index, candidate)| {
-                    !selected_indexes.contains(index)
-                        && candidate.3
-                        && candidate.0.height == next_height
-                        && candidate.0.block.header.prev_block == previous
-                        && candidate.0.height <= checkpoint_height
-                })
-            else {
-                break;
-            };
+        while let Some((index, (request, _, proof, _))) =
+            candidates.iter().enumerate().find(|(index, candidate)| {
+                !selected_indexes.contains(index)
+                    && candidate.3
+                    && candidate.0.height == next_height
+                    && candidate.0.block.header.prev_block == previous
+                    && candidate.0.height <= checkpoint_height
+            })
+        {
             selected_indexes.insert(index);
             previous = request.block.hash();
             next_height = next_height.saturating_add(1);
@@ -5363,6 +5465,12 @@ impl NodeReadHandle {
                 "active-state connector batch {maximum_connect} is outside 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}"
             );
         }
+        let tree_interval = self.network().params().names.tree_interval;
+        let lookahead_limit = usize::try_from(tree_interval)
+            .unwrap_or(ACTIVE_STATE_PREPARATION_WINDOW_BLOCKS)
+            .clamp(1, ACTIVE_STATE_PREPARATION_WINDOW_BLOCKS)
+            .saturating_mul(ACTIVE_STATE_PREPARATION_BUFFERS)
+            .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         let (epoch, activation) = self.with_stable_chain_read(|snapshot, headers| {
             let stored_tip = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
                 snapshot,
@@ -5377,7 +5485,7 @@ impl NodeReadHandle {
                 return Ok(None);
             }
 
-            let direct_connect_limit = maximum_connect.min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+            let direct_connect_limit = maximum_connect.min(lookahead_limit);
             let candidate_hash = match active_tip.as_ref() {
                 None => {
                     let connect_count = direct_connect_limit.min(stored_tip.height as usize + 1);
@@ -5424,10 +5532,9 @@ impl NodeReadHandle {
                 NodeReorgLimits::with_maximum_connect(maximum_connect),
             )
         })?;
-        let tree_interval = self.network().params().names.tree_interval;
         Ok(activation.map(|activation| NativeActiveStatePlan {
             epoch,
-            activation: isolate_direct_name_tree_commit(activation, tree_interval),
+            activation,
             maximum_connect,
             planning_micros: u64::try_from(planning_started.elapsed().as_micros())
                 .unwrap_or(u64::MAX),
@@ -8633,12 +8740,23 @@ async fn prepare_native_active_state_plan_with_validator(
                 ActiveStateWorkerPermit::acquire(Arc::clone(&in_flight), &maximum_in_flight);
             let worker_started = StdInstant::now();
             validate(input.import.block(), input.import.height())?;
+            let state_effects =
+                PreparedBlockStateEffects::prepare(input.import.block(), input.import.height())
+                    .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
+            let wallet_effects = PreparedWalletIndexEffects::prepare(
+                input.import.block(),
+                input.import.height(),
+                &state_effects,
+            )
+            .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
             Ok::<_, ValidationRejection>(NativeActiveStatePreparationOutput {
                 proof: StatelessBodyValidation::for_block(
                     input.import.block(),
                     input.import.height(),
                     network,
                 ),
+                state_effects,
+                wallet_effects,
                 worker_micros: u64::try_from(worker_started.elapsed().as_micros())
                     .unwrap_or(u64::MAX),
                 workload: ActiveStateWorkload::for_block(input.import.block()),
@@ -8667,6 +8785,8 @@ async fn prepare_native_active_state_plan_with_validator(
 
     let mut prepared_connect = Vec::with_capacity(block_count);
     let mut proofs = Vec::with_capacity(block_count);
+    let mut state_effects = Vec::with_capacity(block_count);
+    let mut wallet_effects = Vec::with_capacity(block_count);
     let mut aggregate_worker_micros = 0u64;
     let mut workload = ActiveStateWorkload::default();
     for ordinal in 0..block_count {
@@ -8706,6 +8826,8 @@ async fn prepare_native_active_state_plan_with_validator(
                 workload = workload.saturating_add(success.output.workload);
                 prepared_connect.push(input.import);
                 proofs.push(success.output.proof);
+                state_effects.push(success.output.state_effects);
+                wallet_effects.push(success.output.wallet_effects);
             }
             Err(failure) => {
                 cancellation.cancel();
@@ -8745,7 +8867,11 @@ async fn prepare_native_active_state_plan_with_validator(
             disconnect,
             connect: prepared_connect,
         },
-        prepared: PreparedNativeActivation::new(proofs)?,
+        prepared: PreparedNativeActivation::with_state_effects(
+            proofs,
+            state_effects,
+            wallet_effects,
+        )?,
         maximum_connect,
         planning_micros,
         preparation: ActiveStatePreparationMetrics {
@@ -8779,6 +8905,69 @@ async fn execute_native_active_state_slice(
         Arc::new(move |block: &Block, height: Height| validator.validate(block, height)),
     )
     .await
+}
+
+fn same_active_state_activation(left: &NodeReorg, right: &NodeReorg) -> bool {
+    left.disconnect == right.disconnect
+        && left.connect.len() == right.connect.len()
+        && left
+            .connect
+            .iter()
+            .zip(&right.connect)
+            .all(|(left, right)| {
+                left.height() == right.height() && left.block().hash() == right.block().hash()
+            })
+}
+
+fn merge_active_state_outcomes(
+    mut first: ActiveStateConnectOutcome,
+    second: ActiveStateConnectOutcome,
+) -> ActiveStateConnectOutcome {
+    first.connected = first.connected.saturating_add(second.connected);
+    first.disconnected = first.disconnected.saturating_add(second.disconnected);
+    first.budget_limited_connect = second
+        .budget_limited_connect
+        .or(first.budget_limited_connect);
+    first.contextual_failure = second.contextual_failure.or(first.contextual_failure);
+    first.planning_micros = first.planning_micros.saturating_add(second.planning_micros);
+    first.state_commit_micros = first
+        .state_commit_micros
+        .saturating_add(second.state_commit_micros);
+    first.block_staging_micros = first
+        .block_staging_micros
+        .saturating_add(second.block_staging_micros);
+    first.wallet_index_micros = first
+        .wallet_index_micros
+        .saturating_add(second.wallet_index_micros);
+    first.consensus_state_micros = first
+        .consensus_state_micros
+        .saturating_add(second.consensus_state_micros);
+    first.utxo_prefetch_micros = first
+        .utxo_prefetch_micros
+        .saturating_add(second.utxo_prefetch_micros);
+    first.utxos_prefetched = first
+        .utxos_prefetched
+        .saturating_add(second.utxos_prefetched);
+    first.name_page_prepare_micros = first
+        .name_page_prepare_micros
+        .saturating_add(second.name_page_prepare_micros);
+    first.name_page_path_pages_read = first
+        .name_page_path_pages_read
+        .saturating_add(second.name_page_path_pages_read);
+    first.name_page_path_records_read = first
+        .name_page_path_records_read
+        .saturating_add(second.name_page_path_records_read);
+    first.name_page_path_cache_hits = first
+        .name_page_path_cache_hits
+        .saturating_add(second.name_page_path_cache_hits);
+    first.store_publication_micros = first
+        .store_publication_micros
+        .saturating_add(second.store_publication_micros);
+    first.post_commit_micros = first
+        .post_commit_micros
+        .saturating_add(second.post_commit_micros);
+    first.workload = first.workload.saturating_add(second.workload);
+    first
 }
 
 async fn execute_native_active_state_slice_with_validator(
@@ -8818,8 +9007,30 @@ async fn execute_native_active_state_slice_with_validator(
                 next_connect_limit: attempt_limit,
             });
         };
+        let NativeActiveStatePlan {
+            epoch,
+            activation,
+            maximum_connect,
+            planning_micros,
+        } = plan;
+        let (first_activation, second_activation) = split_direct_name_tree_commit_buffers(
+            activation,
+            node.network().params().names.tree_interval,
+        );
+        let first_plan = NativeActiveStatePlan {
+            epoch: epoch.clone(),
+            activation: first_activation,
+            maximum_connect,
+            planning_micros,
+        };
+        let second_plan = second_activation.map(|activation| NativeActiveStatePlan {
+            epoch,
+            activation,
+            maximum_connect,
+            planning_micros: 0,
+        });
         let prepared = prepare_native_active_state_plan_with_validator(
-            plan,
+            first_plan,
             node.network(),
             workers,
             queue_capacity,
@@ -8830,6 +9041,19 @@ async fn execute_native_active_state_slice_with_validator(
             "local stored-body preparation failed; canonical state was not mutated and no peer is attributable",
         )?;
         let attempt_preparation = prepared.preparation;
+        // Buffer B begins only after buffer A is fully prepared. Its immutable
+        // hashing/encoding work then overlaps A's contextual staging, name-page
+        // fdatasync and RocksDB WAL commit. B is never admitted to the writer
+        // until it has been rebound to the exact post-A chain epoch below.
+        let mut second_task = second_plan.map(|plan| {
+            tokio::spawn(prepare_native_active_state_plan_with_validator(
+                plan,
+                node.network(),
+                workers,
+                queue_capacity,
+                Arc::clone(&validate),
+            ))
+        });
         let expected = prepared.epoch.clone();
         let result = writer
             .execute_at_chain(
@@ -8840,7 +9064,87 @@ async fn execute_native_active_state_slice_with_validator(
             .await;
         accumulate_active_state_preparation(&mut preparation, attempt_preparation);
         match result {
-            Ok(std::ops::ControlFlow::Continue(outcome)) => {
+            Ok(std::ops::ControlFlow::Continue(mut outcome)) => {
+                if outcome.contextual_failure.is_none() && outcome.budget_limited_connect.is_none()
+                {
+                    if let Some(task) = second_task.take() {
+                        let mut buffered = task
+                            .await
+                            .context("second active-state preparation buffer panicked")??;
+                        let buffered_preparation = buffered.preparation;
+                        accumulate_active_state_preparation(&mut preparation, buffered_preparation);
+                        let replanned = node.native_sync_plan_stored_state_with_hint(
+                            attempt_limit,
+                            stored_tip_hint.as_ref(),
+                        )?;
+                        if let Some(replanned) = replanned {
+                            let (replanned_activation, _) = split_direct_name_tree_commit_buffers(
+                                replanned.activation,
+                                node.network().params().names.tree_interval,
+                            );
+                            if same_active_state_activation(
+                                &buffered.activation,
+                                &replanned_activation,
+                            ) {
+                                buffered.epoch = replanned.epoch;
+                                buffered.planning_micros = buffered
+                                    .planning_micros
+                                    .saturating_add(replanned.planning_micros);
+                                let expected = buffered.epoch.clone();
+                                let buffered_result = writer
+                                    .execute_at_chain(
+                                        expected,
+                                        "commit double-buffered native-sync active-state slice",
+                                        move |service| {
+                                            service
+                                                .native_sync_apply_prepared_active_state(buffered)
+                                        },
+                                    )
+                                    .await;
+                                match buffered_result {
+                                    Ok(std::ops::ControlFlow::Continue(second)) => {
+                                        outcome = merge_active_state_outcomes(outcome, second);
+                                    }
+                                    Ok(std::ops::ControlFlow::Break(DirectStagedEffectLimit {
+                                        retry_connect,
+                                        limit,
+                                        actual,
+                                    })) => {
+                                        tracing::warn!(
+                                            retry_connect,
+                                            limit,
+                                            actual,
+                                            "second active-state buffer exceeded its staged-effect budget; retaining the committed first buffer"
+                                        );
+                                        preparation.stale_retries = stale_retries;
+                                        return Ok(NativeActiveStateSliceResult {
+                                            outcome,
+                                            preparation,
+                                            wall_millis: u64::try_from(
+                                                slice_started.elapsed().as_millis(),
+                                            )
+                                            .unwrap_or(u64::MAX),
+                                            next_connect_limit: retry_connect.max(1),
+                                        });
+                                    }
+                                    Err(error) if canonical_writer_contention(&error) => {
+                                        // Buffer A is already durable. Report it and
+                                        // let the next supervisor slice replan B.
+                                        stale_retries = stale_retries.saturating_add(1);
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "discarding speculative active-state buffer after canonical lookahead changed"
+                                );
+                            }
+                        }
+                    }
+                } else if let Some(task) = second_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
                 preparation.stale_retries = stale_retries;
                 let next_connect_limit = outcome.budget_limited_connect.unwrap_or(attempt_limit);
                 return Ok(NativeActiveStateSliceResult {
@@ -8856,6 +9160,10 @@ async fn execute_native_active_state_slice_with_validator(
                 limit,
                 actual,
             })) => {
+                if let Some(task) = second_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
                 if retry_connect == 0 || retry_connect >= attempt_limit {
                     anyhow::bail!(
                         "direct active-state retry limit {retry_connect} does not reduce attempted limit {attempt_limit}"
@@ -8873,10 +9181,20 @@ async fn execute_native_active_state_slice_with_validator(
                 if canonical_writer_contention(&error)
                     && stale_retries + 1 < MAX_CANONICAL_STALE_RETRIES =>
             {
+                if let Some(task) = second_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
                 stale_retries = stale_retries.saturating_add(1);
                 tokio::time::sleep(active_state_contention_retry_interval(stale_retries)).await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if let Some(task) = second_task.take() {
+                    task.abort();
+                    let _ = task.await;
+                }
+                return Err(error);
+            }
         }
     }
 }
@@ -11490,6 +11808,19 @@ mod tests {
 
         let disabled = isolate_direct_name_tree_commit(activation(35, 10), 0);
         assert_eq!(heights(&disabled), (35..45).collect::<Vec<_>>());
+
+        let (first, second) = split_direct_name_tree_commit_buffers(activation(36, 72), 36);
+        assert_eq!(heights(&first), (36..72).collect::<Vec<_>>());
+        assert_eq!(
+            heights(&second.expect("second preparation buffer")),
+            (72..108).collect::<Vec<_>>()
+        );
+        let (first, second) = split_direct_name_tree_commit_buffers(activation(35, 72), 36);
+        assert_eq!(heights(&first), vec![35]);
+        assert_eq!(
+            heights(&second.expect("boundary preparation buffer")),
+            (36..72).collect::<Vec<_>>()
+        );
     }
 
     #[test]
