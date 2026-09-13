@@ -6827,6 +6827,13 @@ async fn handle_peer_event(
                         "rejected malformed Shakescape name-market message"
                     );
                 }
+                Err(ShakescapeRelayHandleError::Uncorrelated(reason)) => {
+                    tracing::debug!(
+                        peer = ?provenance.peer,
+                        %reason,
+                        "ignored Shakescape name-market message whose volatile correlation is unavailable"
+                    );
+                }
                 Err(error) => return Err(anyhow::anyhow!(error)),
             }
         }
@@ -6862,6 +6869,13 @@ async fn handle_peer_event(
                         peer = ?provenance.peer,
                         %reason,
                         "rejected malformed or uncorrelated Shakescape cross-chain message"
+                    );
+                }
+                Err(ShakescapeRelayHandleError::Uncorrelated(reason)) => {
+                    tracing::debug!(
+                        peer = ?provenance.peer,
+                        %reason,
+                        "ignored Shakescape cross-chain message whose volatile correlation is unavailable"
                     );
                 }
                 Err(ShakescapeRelayHandleError::RoleDisabled(role)) => {

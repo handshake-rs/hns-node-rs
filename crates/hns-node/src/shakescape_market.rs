@@ -6,11 +6,11 @@ use std::{
 };
 
 use hns_marketplace_protocol::{
-    sign_shakescape_publication_acceptance, CrossChainMessage, DirectOffer, DirectOfferTake,
-    NameMarketHello, NameMarketMessage, ShakescapePublicationAcceptanceExpectation,
-    ShakescapePublicationAcceptancePolicy, ShakescapePublicationMessageKind,
-    ShakescapeRegistryVersion, SwapSessionHello, MAX_NAME_OFFERS_PER_MESSAGE,
-    MAX_SHAKESCAPE_MARKET_PAYLOAD,
+    sign_shakescape_publication_acceptance, CrossChainMessage, DirectOffer,
+    DirectOfferCancellation, DirectOfferTake, NameMarketHello, NameMarketMessage,
+    ShakescapePublicationAcceptanceExpectation, ShakescapePublicationAcceptancePolicy,
+    ShakescapePublicationMessageKind, ShakescapeRegistryVersion, SwapSessionHello,
+    MAX_NAME_OFFERS_PER_MESSAGE, MAX_SHAKESCAPE_MARKET_PAYLOAD,
 };
 use hns_p2p::PeerId;
 use hns_primitives::blake2b_256;
@@ -39,6 +39,9 @@ const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS: usize = 4_096;
 const MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS: usize = 1_024;
 const MAX_SHAKESCAPE_CROSS_CHAIN_PENDING_REQUESTS: usize = 4_096;
+const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS: usize = 4_096;
+const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_OFFER: usize = 4;
+const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_PEER: usize = 64;
 const SHAKESCAPE_CROSS_CHAIN_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const LOCAL_WALLET_RELAY_PEER: [u8; 32] = [0x57; 32];
 const NAME_MARKET_IDENTITY_DOMAIN: &[u8] = b"hns-node/shakescape-name-market-identity/v1";
@@ -299,6 +302,12 @@ struct CrossChainOfferRecord {
 }
 
 #[derive(Clone, Debug)]
+struct PendingCrossChainCancellation {
+    cancellation: DirectOfferCancellation,
+    source: PeerId,
+}
+
+#[derive(Clone, Debug)]
 struct CrossChainSessionRoute {
     offer_id: [u8; 32],
     maker: PeerId,
@@ -312,6 +321,10 @@ struct ShakescapeCrossChainState {
     network_magic: u32,
     network_genesis: [u8; 32],
     offers: BTreeMap<[u8; 32], CrossChainOfferRecord>,
+    /// Signed cancellation tombstones whose offer may have been forgotten by
+    /// a relay restart or removed locally. They are authoritative only after
+    /// `verify_for_offer` succeeds against the exact offer.
+    cancellations: BTreeMap<[u8; 32], Vec<PendingCrossChainCancellation>>,
     sessions: BTreeMap<[u8; 32], CrossChainSessionRoute>,
     peers: BTreeSet<PeerId>,
     pending: HashMap<(PeerId, u64), ([u8; 32], u64)>,
@@ -324,6 +337,7 @@ impl ShakescapeCrossChainState {
             network_magic,
             network_genesis,
             offers: BTreeMap::new(),
+            cancellations: BTreeMap::new(),
             sessions: BTreeMap::new(),
             peers: BTreeSet::new(),
             pending: HashMap::new(),
@@ -341,6 +355,10 @@ impl ShakescapeCrossChainState {
         self.pending.retain(|_, (_, expires_at)| *expires_at > now);
         self.offers
             .retain(|_, record| record.offer.header.expires_at > now);
+        self.cancellations.retain(|_, candidates| {
+            candidates.retain(|candidate| candidate.cancellation.header.expires_at > now);
+            !candidates.is_empty()
+        });
         self.sessions.retain(|_, route| {
             self.offers.contains_key(&route.offer_id) && route.take.header.expires_at > now
         });
@@ -387,6 +405,11 @@ pub enum ShakescapeRelayHandleError {
     /// Typed HNS/BTC board routing or bilateral correlation rejected a message.
     #[error("Shakescape cross-chain message rejected: {0}")]
     CrossChain(&'static str),
+    /// A validly framed message references volatile state this relay does not
+    /// currently hold. Restarts, reconnect ordering, and missed packets can
+    /// all cause this; it is not evidence of peer abuse.
+    #[error("Shakescape message could not be correlated: {0}")]
+    Uncorrelated(&'static str),
     /// The message is valid for a relay role this node did not enable. This is
     /// local policy, not peer misbehavior, and must never affect peer score.
     #[error("Shakescape relay role is disabled: {0:?}")]
@@ -874,6 +897,34 @@ impl ShakescapeRelayHandle {
                     ));
                 }
                 let offer_id = offer.offer_id;
+                if let Some(candidates) = state.cancellations.remove(&offer_id) {
+                    if let Some(tombstone) = candidates.into_iter().find(|candidate| {
+                        candidate
+                            .cancellation
+                            .verify_for_offer(&offer, offer.header.network, now)
+                            .is_ok()
+                    }) {
+                        // The relay may learn a signed cancellation before the
+                        // exact offer after a restart. Never resurrect that
+                        // stale offer; now that the binding is proven, forward
+                        // the tombstone to every other board peer.
+                        for target in state.peers.iter().copied().filter(|target| *target != peer) {
+                            dispatch.sends.push(ShakescapeCrossChainSend {
+                                peer: target,
+                                request_id,
+                                message: CrossChainMessage::CancelDirectOffer(
+                                    tombstone.cancellation.clone(),
+                                ),
+                            });
+                        }
+                        remember_cross_chain_cancellation(
+                            state,
+                            tombstone.cancellation,
+                            tombstone.source,
+                        );
+                        return Ok(dispatch);
+                    }
+                }
                 state.offers.insert(
                     offer_id,
                     CrossChainOfferRecord {
@@ -890,9 +941,15 @@ impl ShakescapeRelayHandle {
                 }
             }
             CrossChainMessage::CancelDirectOffer(cancellation) => {
-                let record = state.offers.get(&cancellation.offer_id).ok_or(
-                    ShakescapeRelayHandleError::CrossChain("unknown direct offer cancellation"),
-                )?;
+                validate_cross_chain_cancellation(state, &cancellation, now)?;
+                let Some(record) = state.offers.get(&cancellation.offer_id) else {
+                    // A wallet deliberately replays retained tombstones so a
+                    // restarted or newly joined relay converges. Preserve the
+                    // independently signed, bounded candidate until the exact
+                    // offer is available for full binding verification.
+                    remember_cross_chain_cancellation(state, cancellation, peer);
+                    return Ok(dispatch);
+                };
                 if record.owner != Some(peer) {
                     return Err(ShakescapeRelayHandleError::CrossChain(
                         "direct offer cancellation came from a non-owner peer",
@@ -907,6 +964,7 @@ impl ShakescapeRelayHandle {
                 state
                     .sessions
                     .retain(|_, route| route.offer_id != cancellation.offer_id);
+                remember_cross_chain_cancellation(state, cancellation.clone(), peer);
                 for target in state.peers.iter().copied().filter(|target| *target != peer) {
                     dispatch.sends.push(ShakescapeCrossChainSend {
                         peer: target,
@@ -917,11 +975,15 @@ impl ShakescapeRelayHandle {
             }
             CrossChainMessage::TakeDirectOffer(take) => {
                 let record = state.offers.get(&take.offer_id).ok_or(
-                    ShakescapeRelayHandleError::CrossChain("take targets an unknown direct offer"),
+                    ShakescapeRelayHandleError::Uncorrelated(
+                        "take targets an unavailable direct offer",
+                    ),
                 )?;
-                let maker = record.owner.ok_or(ShakescapeRelayHandleError::CrossChain(
-                    "direct offer owner is currently unavailable",
-                ))?;
+                let maker = record
+                    .owner
+                    .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+                        "direct offer owner is currently unavailable",
+                    ))?;
                 if maker == peer {
                     return Err(ShakescapeRelayHandleError::CrossChain(
                         "direct offer owner cannot take its own offer",
@@ -963,7 +1025,9 @@ impl ShakescapeRelayHandle {
             CrossChainMessage::SwapSessionProposal(proposal) => {
                 let session_id = proposal.terms().swap_session_id;
                 let route = state.sessions.get(&session_id).cloned().ok_or(
-                    ShakescapeRelayHandleError::CrossChain("unknown swap proposal session"),
+                    ShakescapeRelayHandleError::Uncorrelated(
+                        "swap proposal session is unavailable",
+                    ),
                 )?;
                 if peer != route.maker {
                     return Err(ShakescapeRelayHandleError::CrossChain(
@@ -973,7 +1037,7 @@ impl ShakescapeRelayHandle {
                 let offer = &state
                     .offers
                     .get(&route.offer_id)
-                    .ok_or(ShakescapeRelayHandleError::CrossChain(
+                    .ok_or(ShakescapeRelayHandleError::Uncorrelated(
                         "swap proposal offer is unavailable",
                     ))?
                     .offer;
@@ -988,7 +1052,7 @@ impl ShakescapeRelayHandle {
             }
             CrossChainMessage::SwapSessionHello(hello) => {
                 let route = state.sessions.get(&hello.swap_session_id).cloned().ok_or(
-                    ShakescapeRelayHandleError::CrossChain("unknown swap hello session"),
+                    ShakescapeRelayHandleError::Uncorrelated("swap hello session is unavailable"),
                 )?;
                 if peer != route.taker {
                     return Err(ShakescapeRelayHandleError::CrossChain(
@@ -998,7 +1062,7 @@ impl ShakescapeRelayHandle {
                 let offer = &state
                     .offers
                     .get(&route.offer_id)
-                    .ok_or(ShakescapeRelayHandleError::CrossChain(
+                    .ok_or(ShakescapeRelayHandleError::Uncorrelated(
                         "swap hello offer is unavailable",
                     ))?
                     .offer;
@@ -1255,6 +1319,70 @@ fn cross_chain_inventory(state: &ShakescapeCrossChainState, now: u64) -> Vec<[u8
         .collect()
 }
 
+fn validate_cross_chain_cancellation(
+    state: &ShakescapeCrossChainState,
+    cancellation: &DirectOfferCancellation,
+    now: u64,
+) -> Result<(), ShakescapeRelayHandleError> {
+    if cancellation.header.network.hns_magic != state.network_magic
+        || cancellation.header.network.hns_genesis.as_bytes() != &state.network_genesis
+        || cancellation.header.sequence <= cancellation.offer_sequence
+    {
+        return Err(ShakescapeRelayHandleError::CrossChain(
+            "direct offer cancellation has an invalid network or sequence",
+        ));
+    }
+    cancellation
+        .header
+        .validate_at(cancellation.header.network, now)
+        .and_then(|_| cancellation.encode().map(|_| ()))
+        .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid direct offer cancellation"))
+}
+
+fn remember_cross_chain_cancellation(
+    state: &mut ShakescapeCrossChainState,
+    cancellation: DirectOfferCancellation,
+    source: PeerId,
+) {
+    let already_retained =
+        state
+            .cancellations
+            .get(&cancellation.offer_id)
+            .is_some_and(|candidates| {
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.cancellation == cancellation)
+            });
+    if already_retained {
+        return;
+    }
+    let retained_total = state.cancellations.values().map(Vec::len).sum::<usize>();
+    let retained_for_source = state
+        .cancellations
+        .values()
+        .flatten()
+        .filter(|candidate| candidate.source == source)
+        .count();
+    let retained_for_offer = state
+        .cancellations
+        .get(&cancellation.offer_id)
+        .map_or(0, Vec::len);
+    if retained_total >= MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS
+        || retained_for_source >= MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_PEER
+        || retained_for_offer >= MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_OFFER
+    {
+        return;
+    }
+    state
+        .cancellations
+        .entry(cancellation.offer_id)
+        .or_default()
+        .push(PendingCrossChainCancellation {
+            cancellation,
+            source,
+        });
+}
+
 fn validate_cross_chain_offer(
     state: &ShakescapeCrossChainState,
     offer: &DirectOffer,
@@ -1284,8 +1412,8 @@ where
     let route = state
         .sessions
         .get(&session_id)
-        .ok_or(ShakescapeRelayHandleError::CrossChain(
-            "unknown cross-chain status session",
+        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+            "cross-chain status session is unavailable",
         ))?;
     let target = if peer == route.maker {
         route.taker
@@ -1299,7 +1427,7 @@ where
     let hello = route
         .hello
         .as_ref()
-        .ok_or(ShakescapeRelayHandleError::CrossChain(
+        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
             "cross-chain status preceded the signed hello",
         ))?;
     verify(hello)
@@ -1566,7 +1694,7 @@ fn admit_cancellation(
         .name_market
         .listing_index
         .get(&cancellation.listing_hash)
-        .ok_or(ShakescapeRelayHandleError::NameMarket(
+        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
             "cancellation target listing is unavailable",
         ))?;
     let existing = service.name_market.records.get(&identity).ok_or(
@@ -1724,8 +1852,8 @@ fn append_event(
 #[cfg(test)]
 mod cross_chain_tests {
     use hns_marketplace_protocol::{
-        AssetAmount, AssetId, ChainId, DirectOffer, DirectOfferTake, MarketPair, NetworkBinding,
-        SignedObjectHeader, MARKETPLACE_PROTOCOL_VERSION,
+        AssetAmount, AssetId, ChainId, DirectOffer, DirectOfferCancellation, DirectOfferTake,
+        MarketPair, NetworkBinding, SignedObjectHeader, MARKETPLACE_PROTOCOL_VERSION,
     };
     use hns_protocol_primitives::BlockHash;
 
@@ -1793,6 +1921,17 @@ mod cross_chain_tests {
         };
         take.sign(&[10; 32]).unwrap();
         take
+    }
+
+    fn cancellation(offer: &DirectOffer) -> DirectOfferCancellation {
+        let mut cancellation = DirectOfferCancellation {
+            header: header(offer.header.sequence + 1, NOW, NOW + 500),
+            offer_id: offer.offer_id,
+            offer_sequence: offer.header.sequence,
+            signature: [0; 64],
+        };
+        cancellation.sign(&[7; 32]).unwrap();
+        cancellation
     }
 
     #[test]
@@ -1895,6 +2034,113 @@ mod cross_chain_tests {
     }
 
     #[test]
+    fn signed_cancellation_before_offer_suppresses_stale_offer_after_restart() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let maker = PeerId(1);
+        let observer = PeerId(2);
+        let offer = offer();
+        let cancellation = cancellation(&offer);
+
+        relay
+            .receive_cross_chain(
+                observer,
+                1,
+                CrossChainMessage::DirectOfferInventory(Vec::new()),
+                NOW,
+            )
+            .unwrap();
+        let retained = relay
+            .receive_cross_chain(
+                maker,
+                2,
+                CrossChainMessage::CancelDirectOffer(cancellation.clone()),
+                NOW,
+            )
+            .expect("standalone signed tombstone is recoverable relay state");
+        assert!(retained.sends.is_empty());
+
+        let requested = relay
+            .receive_cross_chain(
+                maker,
+                3,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        let request_id = requested
+            .sends
+            .iter()
+            .find_map(|send| match send.message {
+                CrossChainMessage::GetDirectOffer(id) if id == offer.offer_id => {
+                    Some(send.request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let suppressed = relay
+            .receive_cross_chain(
+                maker,
+                request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .expect("exact offer proves and applies retained tombstone");
+        assert!(suppressed.sends.iter().any(|send| {
+            send.peer == observer
+                && matches!(
+                    &send.message,
+                    CrossChainMessage::CancelDirectOffer(value) if value == &cancellation
+                )
+        }));
+        let inventory = relay
+            .receive_cross_chain(
+                observer,
+                4,
+                CrossChainMessage::DirectOfferInventory(Vec::new()),
+                NOW,
+            )
+            .unwrap();
+        assert!(inventory.sends.iter().any(|send| matches!(
+            &send.message,
+            CrossChainMessage::DirectOfferInventory(ids) if ids.is_empty()
+        )));
+    }
+
+    #[test]
+    fn independently_invalid_cancellation_is_still_rejected() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let offer = offer();
+        let mut cancellation = cancellation(&offer);
+        cancellation.signature[0] ^= 1;
+
+        assert!(matches!(
+            relay.receive_cross_chain(
+                PeerId(1),
+                1,
+                CrossChainMessage::CancelDirectOffer(cancellation),
+                NOW,
+            ),
+            Err(ShakescapeRelayHandleError::CrossChain(
+                "invalid direct offer cancellation"
+            ))
+        ));
+    }
+
+    #[test]
     fn disconnected_maker_must_reprove_the_full_offer_before_receiving_takes() {
         let relay = ShakescapeRelayHandle::new(
             RelayRoles::ALL,
@@ -1938,6 +2184,9 @@ mod cross_chain_tests {
                 NOW,
             )
             .unwrap_err();
-        assert!(matches!(error, ShakescapeRelayHandleError::CrossChain(_)));
+        assert!(matches!(
+            error,
+            ShakescapeRelayHandleError::Uncorrelated("direct offer owner is currently unavailable")
+        ));
     }
 }
