@@ -1333,10 +1333,15 @@ fn validate_cross_chain_cancellation(
         ));
     }
     cancellation
-        .header
-        .validate_at(cancellation.header.network, now)
-        .and_then(|_| cancellation.encode().map(|_| ()))
+        .encode()
         .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid direct offer cancellation"))
+        .map(|_| ())?;
+    if now < cancellation.header.created_at || now >= cancellation.header.expires_at {
+        return Err(ShakescapeRelayHandleError::Uncorrelated(
+            "direct offer cancellation is outside its active window",
+        ));
+    }
+    Ok(())
 }
 
 fn remember_cross_chain_cancellation(
@@ -2136,6 +2141,32 @@ mod cross_chain_tests {
             ),
             Err(ShakescapeRelayHandleError::CrossChain(
                 "invalid direct offer cancellation"
+            ))
+        ));
+    }
+
+    #[test]
+    fn expired_signed_cancellation_is_stale_not_malformed() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let offer = offer();
+        let cancellation = cancellation(&offer);
+
+        assert!(matches!(
+            relay.receive_cross_chain(
+                PeerId(1),
+                1,
+                CrossChainMessage::CancelDirectOffer(cancellation),
+                NOW + 500,
+            ),
+            Err(ShakescapeRelayHandleError::Uncorrelated(
+                "direct offer cancellation is outside its active window"
             ))
         ));
     }

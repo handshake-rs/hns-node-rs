@@ -6868,7 +6868,7 @@ async fn handle_peer_event(
                     tracing::debug!(
                         peer = ?provenance.peer,
                         %reason,
-                        "rejected malformed or uncorrelated Shakescape cross-chain message"
+                        "rejected malformed Shakescape cross-chain message"
                     );
                 }
                 Err(ShakescapeRelayHandleError::Uncorrelated(reason)) => {
