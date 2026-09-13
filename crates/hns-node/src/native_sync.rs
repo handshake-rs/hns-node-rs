@@ -6741,6 +6741,7 @@ async fn handle_peer_event(
             direction,
             reason,
         } => {
+            shakescape_relay.name_market_peer_disconnected(peer)?;
             shakescape_relay.cross_chain_peer_disconnected(peer)?;
             scheduler.remove_peer(peer);
             served_getaddr.remove(&peer);

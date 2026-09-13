@@ -737,21 +737,16 @@ impl ShakescapeRelayHandle {
                 }
             }
             NameMarketMessage::Offer(listing) => {
-                let expected = service
-                    .name_market
-                    .pending
-                    .remove(&(peer, request_id))
-                    .ok_or(ShakescapeRelayHandleError::NameMarket(
-                        "uncorrelated singular name-market offer",
-                    ))?;
                 let hash = listing.listing_hash().map_err(|_| {
                     ShakescapeRelayHandleError::NameMarket("invalid listing signature")
                 })?;
-                if expected.hashes.as_slice() != [hash] {
-                    return Err(ShakescapeRelayHandleError::NameMarket(
-                        "singular offer does not match its request",
-                    ));
-                }
+                validate_singular_offer_delivery(&mut service.name_market, peer, request_id, hash)?;
+                // A negotiated seller may push its exact signed publication
+                // without first advertising an inventory hash. This is the
+                // direct-wallet publication path, not a response to a fetch.
+                // The same signature, network/window checks, bounded relay
+                // admission, identity sequencing, and idempotence below still
+                // apply; only the request-correlation precondition differs.
                 dispatch.admissions.push(admit_listing(
                     &mut service,
                     peer_identity,
@@ -1104,6 +1099,25 @@ impl ShakescapeRelayHandle {
         Ok(())
     }
 
+    /// Retire name-market hello authority and outstanding fetch correlations
+    /// for a closed transport. A reused peer identifier must complete a fresh
+    /// market hello before it may push a seller publication.
+    pub fn name_market_peer_disconnected(
+        &self,
+        peer: PeerId,
+    ) -> Result<(), ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        service.name_market.hello_peers.remove(&peer);
+        service
+            .name_market
+            .pending
+            .retain(|(pending_peer, _), _| *pending_peer != peer);
+        Ok(())
+    }
+
     /// Read one bounded, monotonic process-local event page for an
     /// authenticated wallet consumer.
     pub fn name_market_events(
@@ -1387,6 +1401,26 @@ fn active_inventory(state: &ShakescapeNameMarketState, now: u64) -> Vec<[u8; 32]
 
 fn active_listing_known(state: &ShakescapeNameMarketState, hash: [u8; 32], now: u64) -> bool {
     active_listing(state, hash, now).is_some()
+}
+
+fn validate_singular_offer_delivery(
+    state: &mut ShakescapeNameMarketState,
+    peer: PeerId,
+    request_id: u64,
+    listing_hash: [u8; 32],
+) -> Result<(), ShakescapeRelayHandleError> {
+    if let Some(expected) = state.pending.remove(&(peer, request_id)) {
+        if expected.hashes.as_slice() != [listing_hash] {
+            return Err(ShakescapeRelayHandleError::NameMarket(
+                "singular offer does not match its request",
+            ));
+        }
+    } else if !state.hello_peers.contains(&peer) {
+        return Err(ShakescapeRelayHandleError::NameMarket(
+            "uncorrelated singular name-market offer preceded peer hello",
+        ));
+    }
+    Ok(())
 }
 
 fn active_listing(
@@ -1759,6 +1793,38 @@ mod cross_chain_tests {
         };
         take.sign(&[10; 32]).unwrap();
         take
+    }
+
+    #[test]
+    fn negotiated_seller_may_push_an_exact_uncorrelated_name_offer() {
+        let peer = PeerId(7);
+        let listing_hash = [0x42; 32];
+        let mut state = ShakescapeNameMarketState::new(MAGIC, GENESIS);
+
+        assert!(matches!(
+            validate_singular_offer_delivery(&mut state, peer, 9, listing_hash),
+            Err(ShakescapeRelayHandleError::NameMarket(
+                "uncorrelated singular name-market offer preceded peer hello"
+            ))
+        ));
+
+        state.hello_peers.insert(peer);
+        validate_singular_offer_delivery(&mut state, peer, 9, listing_hash)
+            .expect("negotiated direct seller publication");
+
+        state.pending.insert(
+            (peer, 10),
+            PendingNameMarketRequest {
+                hashes: vec![[0x24; 32]],
+                expires_at_unix: NOW + 10,
+            },
+        );
+        assert!(matches!(
+            validate_singular_offer_delivery(&mut state, peer, 10, listing_hash),
+            Err(ShakescapeRelayHandleError::NameMarket(
+                "singular offer does not match its request"
+            ))
+        ));
     }
 
     #[test]
