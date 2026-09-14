@@ -38,12 +38,12 @@ clap = { version = "4.5", features = ["derive", "env"] }
 hns-covenants = { version = "=0.3.1" }
 hns-dns-relay-protocol = { version = "=0.3.0" }
 hns-hnsr-protocol = { version = "=0.3.0" }
-hns-marketplace-protocol = { version = "=0.4.0" }
-hns-protocol-primitives = { package = "hns-primitives", version = "=0.3.1" }
+hns-marketplace-protocol = { version = "=0.4.1" }
+hns-protocol-primitives = { package = "hns-primitives", version = "=0.4.1" }
 hns-odoh-protocol = { version = "=0.3.0" }
-hns-p2p-experimental = { version = "=0.4.0" }
+hns-p2p-experimental = { version = "=0.4.1" }
 hns-rollback-journal = { version = "=0.3.0" }
-hns-swap = { version = "=0.3.1" }
+hns-swap = { version = "=0.4.1" }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

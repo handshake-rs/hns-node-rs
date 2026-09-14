@@ -1134,10 +1134,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03d4f9e58c102174f12f40d32d917227e1e73cea8770ce9c48e53c23f1795f17"
 dependencies = [
  "hex",
- "hns-covenants",
- "hns-encoding",
+ "hns-covenants 0.3.1",
+ "hns-encoding 0.3.1",
  "hns-service-authority",
- "hns-transaction",
+ "hns-transaction 0.3.1",
  "k256",
  "thiserror",
 ]
@@ -1162,8 +1162,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a423d169b430185d42ec32ece6a9f06a2ce5ae68d7656266d30a21e0dd45a8a"
 dependencies = [
  "blake2",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-primitives 0.3.1",
+ "sha3",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-covenants"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a67c725440eb710c9f551465a89904a94c949ff39b5937d7661b904ae6e687fc"
+dependencies = [
+ "blake2",
+ "hns-encoding 0.4.1",
+ "hns-primitives 0.4.1",
  "sha3",
  "thiserror",
 ]
@@ -1174,7 +1187,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2bcabfea3f81359f8bd93a2a5a92c0002e59f85e50216240f985f2f3d4a3eef"
 dependencies = [
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "thiserror",
 ]
 
@@ -1183,6 +1196,15 @@ name = "hns-encoding"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e26a7824c63926c951c767e160dada9dbb8ebc8239788a2be912d0e46c80ebe"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "hns-encoding"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba7185f21350916dcaca381fbec134f216b525c7ac436045f6f58841b3937942"
 dependencies = [
  "thiserror",
 ]
@@ -1204,9 +1226,9 @@ dependencies = [
  "blake2",
  "getrandom 0.4.3",
  "hns-chat-protocol",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-service-authority",
- "hns-transaction",
+ "hns-transaction 0.3.1",
  "k256",
  "thiserror",
  "zeroize",
@@ -1237,14 +1259,14 @@ dependencies = [
 
 [[package]]
 name = "hns-marketplace-protocol"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "445e0978f94ee4e03056fd8c276a2d570507807cf2469d357832e9828ee991c4"
+checksum = "1c34becd4b9bbfda470b2976f505ddfec8ebe3a4750e6757095b78120e5de053"
 dependencies = [
  "blake2",
- "hns-encoding",
+ "hns-encoding 0.4.1",
  "hns-p2p-experimental",
- "hns-primitives 0.3.1",
+ "hns-primitives 0.4.1",
  "hns-swap",
  "k256",
  "sha2 0.10.9",
@@ -1291,8 +1313,8 @@ dependencies = [
  "hns-mempool",
  "hns-mining",
  "hns-p2p",
- "hns-primitives 0.3.1",
  "hns-primitives 0.3.5",
+ "hns-primitives 0.4.1",
  "hns-rpc",
  "hns-shakescape-market-relay",
  "hns-state",
@@ -1323,7 +1345,7 @@ dependencies = [
  "aes-gcm 0.10.3",
  "blake2",
  "hkdf 0.12.4",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hpke",
  "k256",
  "sha2 0.10.9",
@@ -1353,13 +1375,13 @@ dependencies = [
 
 [[package]]
 name = "hns-p2p-experimental"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c628a25f35064134059d4122ace0e8de078aff1bdb9fce2085d2d190a3100c6"
+checksum = "c2585057d0a5a83ff5e651d7444783c43b405fba54e0f8230c416fefc49090cc"
 dependencies = [
  "hex",
- "hns-encoding",
- "hns-primitives 0.3.1",
+ "hns-encoding 0.4.1",
+ "hns-primitives 0.4.1",
  "serde",
  "sha2 0.10.9",
  "thiserror",
@@ -1388,6 +1410,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-primitives"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58656f57b8ddc1b5667c986bed0f324391b4a042e37f76e43afe29e5ec53d96e"
+dependencies = [
+ "hex",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-resolver"
 version = "0.3.5"
 dependencies = [
@@ -1399,7 +1431,7 @@ dependencies = [
  "hex-literal",
  "hickory-server",
  "hns-consensus",
- "hns-covenants",
+ "hns-covenants 0.3.1",
  "hns-primitives 0.3.5",
  "hns-rpc",
  "ipnet",
@@ -1422,7 +1454,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94f822a24923f802ca1995d2009864497e739689e0b961687fcc3ff4cb71c30a"
 dependencies = [
  "blake2",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "thiserror",
 ]
 
@@ -1440,14 +1472,14 @@ dependencies = [
 
 [[package]]
 name = "hns-script"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b4d09362215c66509f36cfb5fd54797092f2cb939e43fb0040660d544900836"
+checksum = "9b2ab30d4586cce337df51cf8b28b392ca13e109339356ea92ff2d52d49aa5c6"
 dependencies = [
  "blake2",
- "hns-encoding",
- "hns-primitives 0.3.1",
- "hns-transaction",
+ "hns-encoding 0.4.1",
+ "hns-primitives 0.4.1",
+ "hns-transaction 0.4.1",
  "k256",
  "ripemd",
  "sha1",
@@ -1471,7 +1503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "627e6f900180c5facca6e006f3ef81181a4830d40685260f02ec2bba5ffe72bb"
 dependencies = [
  "blake2",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-hrm",
  "k256",
  "sha2 0.10.9",
@@ -1515,16 +1547,16 @@ dependencies = [
 
 [[package]]
 name = "hns-swap"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c030325fc0154fe4ee7696af0334fdae4bdba982f019deef5e8cab0fece6c3"
+checksum = "d9c3af3ab0b0c6d3a2d4ff0599e3dbdcf071654c5ab2153c86207b6282276c07"
 dependencies = [
  "blake2",
- "hns-covenants",
- "hns-encoding",
- "hns-primitives 0.3.1",
+ "hns-covenants 0.4.1",
+ "hns-encoding 0.4.1",
+ "hns-primitives 0.4.1",
  "hns-script",
- "hns-transaction",
+ "hns-transaction 0.4.1",
  "k256",
  "sha2 0.10.9",
  "sha3",
@@ -1561,9 +1593,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adc5fd7e6f7cbcf782f7566411db78b5db2fb2af4840234df8c675dc434098b4"
 dependencies = [
  "blake2",
- "hns-covenants",
- "hns-encoding",
+ "hns-covenants 0.3.1",
+ "hns-encoding 0.3.1",
  "hns-primitives 0.3.1",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-transaction"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be11f7f288e44711aab0356435729f10c671207c7390288e3930c4b15e030aa8"
+dependencies = [
+ "blake2",
+ "hns-covenants 0.4.1",
+ "hns-encoding 0.4.1",
+ "hns-primitives 0.4.1",
  "thiserror",
 ]
 
@@ -1583,7 +1628,7 @@ name = "hns-wallet-index"
 version = "0.3.5"
 dependencies = [
  "hns-consensus",
- "hns-covenants",
+ "hns-covenants 0.3.1",
  "hns-primitives 0.3.5",
  "hns-secp256k1",
  "hns-state",
