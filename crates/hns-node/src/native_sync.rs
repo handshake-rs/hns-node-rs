@@ -6782,7 +6782,7 @@ async fn handle_peer_event(
                 peer_identity,
                 provenance.peer,
                 request_id,
-                message,
+                *message,
                 unix_time(),
             ) {
                 Ok(dispatch) => {
@@ -6845,7 +6845,7 @@ async fn handle_peer_event(
             match shakescape_relay.receive_cross_chain(
                 provenance.peer,
                 request_id,
-                message,
+                *message,
                 unix_time(),
             ) {
                 Ok(dispatch) => {

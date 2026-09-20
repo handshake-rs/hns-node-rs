@@ -5,7 +5,16 @@ repo_root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
 rust_toolchain=${RUST_TOOLCHAIN:-1.97.1}
-cargo_target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
+
+# Ask Cargo for the effective target directory so this gate follows both an
+# explicit CARGO_TARGET_DIR and a target-dir configured in .cargo/config.toml.
+# Assuming "$repo_root/target" here would build successfully and then try to
+# execute the performance binary from the wrong tree.
+cargo_target_dir=$(
+  cargo +"$rust_toolchain" metadata --locked --manifest-path Cargo.toml \
+    --format-version 1 --no-deps |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+)
 
 python3 scripts/test-verify-hns-rs-source.py
 python3 scripts/verify-hns-rs-source.py
@@ -27,4 +36,7 @@ cargo +"$rust_toolchain" test --locked --manifest-path Cargo.toml \
 cargo +"$rust_toolchain" build --locked --release --manifest-path Cargo.toml \
   --workspace --all-targets --all-features
 "$cargo_target_dir/release/hsrd-performance-gate"
-./scripts/qualify-two-node-regtest.sh "$cargo_target_dir/release/hsrd"
+qualification_tmp_dir="$cargo_target_dir/qualification-tmp"
+mkdir -p "$qualification_tmp_dir"
+TMPDIR="$qualification_tmp_dir" \
+  ./scripts/qualify-two-node-regtest.sh "$cargo_target_dir/release/hsrd"

@@ -380,12 +380,12 @@ pub enum PeerEvent {
     ShakescapeNameMarket {
         provenance: ShakescapePeerProvenance,
         request_id: u64,
-        message: hns_marketplace_protocol::NameMarketMessage,
+        message: Box<hns_marketplace_protocol::NameMarketMessage>,
     },
     ShakescapeCrossChain {
         provenance: ShakescapePeerProvenance,
         request_id: u64,
-        message: hns_marketplace_protocol::CrossChainMessage,
+        message: Box<hns_marketplace_protocol::CrossChainMessage>,
     },
 }
 
@@ -1388,7 +1388,7 @@ where
                         authenticated_remote_static,
                     },
                     request_id,
-                    message,
+                    message: Box::new(message),
                 });
             }
             if let Some(ShakescapeCrossChainInbound {
@@ -1405,7 +1405,7 @@ where
                         authenticated_remote_static,
                     },
                     request_id,
-                    message,
+                    message: Box::new(message),
                 });
             }
             continue;

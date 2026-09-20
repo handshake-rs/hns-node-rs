@@ -31,15 +31,15 @@ class VerifyLockTests(unittest.TestCase):
         self,
         packages: list[dict[str, str]],
         *,
-        expected: set[str] | None = None,
-        checksums: dict[str, str] | None = None,
+        expected: set[tuple[str, str]] | None = None,
+        checksums: dict[tuple[str, str], str] | None = None,
         expected_local_name_collisions: dict[str, str] | None = None,
     ) -> None:
         with patch.dict(VERIFY_LOCK.__globals__, {"load_toml": lambda _path: {"package": packages}}):
             VERIFY_LOCK(
                 ROOT / "Cargo.lock",
-                expected or {"hns-covenants"},
-                checksums or {"hns-covenants": CHECKSUM},
+                expected or {("hns-covenants", "0.3.0")},
+                checksums or {("hns-covenants", "0.3.0"): CHECKSUM},
                 expected_local_name_collisions or {},
             )
 
@@ -100,10 +100,13 @@ class VerifyLockTests(unittest.TestCase):
         }
         self.verify(
             [canonical_package(), primitive_registry, primitive_local],
-            expected={"hns-covenants", "hns-primitives"},
+            expected={
+                ("hns-covenants", "0.3.0"),
+                ("hns-primitives", "0.3.0"),
+            },
             checksums={
-                "hns-covenants": CHECKSUM,
-                "hns-primitives": primitive_checksum,
+                ("hns-covenants", "0.3.0"): CHECKSUM,
+                ("hns-primitives", "0.3.0"): primitive_checksum,
             },
             expected_local_name_collisions={"hns-primitives": "0.3.5"},
         )
@@ -129,17 +132,51 @@ class VerifyManifestSourcePolicyTests(unittest.TestCase):
         document: dict[str, object],
         *,
         release_names: set[str] | None = None,
+        manifest: Path | None = None,
     ) -> None:
         with (
             patch.dict(
                 VERIFY_MANIFEST_SOURCE_POLICY.__globals__,
                 {
-                    "tracked_manifests": lambda: [self.MANIFEST],
+                    "tracked_manifests": lambda: [manifest or self.MANIFEST],
                     "load_toml": lambda _path: document,
                 },
             )
         ):
             VERIFY_MANIFEST_SOURCE_POLICY(release_names or {"hns-covenants"})
+
+    def test_accepts_exact_reviewed_root_package_alias(self) -> None:
+        self.verify_document(
+            {
+                "workspace": {
+                    "dependencies": {
+                        "hns-protocol-primitives": {
+                            "package": "hns-primitives",
+                            "version": "=0.4.1",
+                        },
+                    },
+                },
+            },
+            release_names={"hns-primitives"},
+            manifest=ROOT / "Cargo.toml",
+        )
+
+    def test_rejects_changed_root_package_alias(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "dependency aliases are forbidden"):
+            self.verify_document(
+                {
+                    "workspace": {
+                        "dependencies": {
+                            "hns-protocol-primitives": {
+                                "package": "hns-primitives",
+                                "version": "=0.4.2",
+                            },
+                        },
+                    },
+                },
+                release_names={"hns-primitives"},
+                manifest=ROOT / "Cargo.toml",
+            )
 
     def test_accepts_canonical_workspace_inheritance(self) -> None:
         self.verify("hns-covenants", {"workspace": True})

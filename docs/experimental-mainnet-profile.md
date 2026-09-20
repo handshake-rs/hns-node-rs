@@ -5,7 +5,7 @@ assignment** for private extension negotiation on mainnet, testnet, regtest,
 and simnet.
 
 The canonical authority is the exact crates.io `hns-p2p-experimental`
-`=0.3.0` artifact pinned by this repository. The live node never
+`=0.4.1` artifact pinned by this repository. The live node never
 copies a registry digest or private Hello/Ack message number.
 
 ## Canonical identity
@@ -15,7 +15,7 @@ copies a registry digest or private Hello/Ack message number.
 - Registry protocol: `0x0000`, version `1`
 - Wire profile: `shakescape-v1`
 - Fingerprint:
-  `95774db08c569b36fa7b7e4a071930f563b7251fc30934ba986732379a6e542d`
+  `04fce3f12b717c4254bb66ac07474a6c9f61bd2916efc18ebfc79df82a89a66b`
 - Extension service bit: `0x10000000`
 - Extension packet: `0xf4`
 - Maximum complete `SHAKESCAPE_EXT` payload: 1,048,576 bytes
