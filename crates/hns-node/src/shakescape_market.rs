@@ -10,7 +10,7 @@ use hns_marketplace_protocol::{
     DirectOfferCancellation, DirectOfferTake, NameMarketHello, NameMarketMessage,
     ShakescapePublicationAcceptanceExpectation, ShakescapePublicationAcceptancePolicy,
     ShakescapePublicationMessageKind, ShakescapeRegistryVersion, SwapSessionHello,
-    MAX_NAME_OFFERS_PER_MESSAGE, MAX_SHAKESCAPE_MARKET_PAYLOAD,
+    SwapSessionProposal, MAX_NAME_OFFERS_PER_MESSAGE, MAX_SHAKESCAPE_MARKET_PAYLOAD,
 };
 use hns_p2p::PeerId;
 use hns_primitives::blake2b_256;
@@ -316,6 +316,18 @@ struct CrossChainSessionRoute {
     hello: Option<SwapSessionHello>,
 }
 
+/// A previously countersigned swap can outlive both its public offer and this
+/// relay process. The maker's signed proposal followed by the taker's exact
+/// countersigned hello is sufficient to reconstruct only the private status
+/// route; it never resurrects the consumed public offer or admits a new take.
+#[derive(Clone, Debug)]
+struct CrossChainSessionRecoveryRoute {
+    maker: PeerId,
+    taker: Option<PeerId>,
+    proposal: SwapSessionProposal,
+    hello: Option<SwapSessionHello>,
+}
+
 #[derive(Debug)]
 struct ShakescapeCrossChainState {
     network_magic: u32,
@@ -326,6 +338,7 @@ struct ShakescapeCrossChainState {
     /// `verify_for_offer` succeeds against the exact offer.
     cancellations: BTreeMap<[u8; 32], Vec<PendingCrossChainCancellation>>,
     sessions: BTreeMap<[u8; 32], CrossChainSessionRoute>,
+    recovery_sessions: BTreeMap<[u8; 32], CrossChainSessionRecoveryRoute>,
     peers: BTreeSet<PeerId>,
     pending: HashMap<(PeerId, u64), ([u8; 32], u64)>,
     next_request_id: u64,
@@ -339,6 +352,7 @@ impl ShakescapeCrossChainState {
             offers: BTreeMap::new(),
             cancellations: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            recovery_sessions: BTreeMap::new(),
             peers: BTreeSet::new(),
             pending: HashMap::new(),
             next_request_id: 1,
@@ -362,6 +376,8 @@ impl ShakescapeCrossChainState {
         self.sessions.retain(|_, route| {
             self.offers.contains_key(&route.offer_id) && route.take.header.expires_at > now
         });
+        self.recovery_sessions
+            .retain(|_, route| route.proposal.terms().received_refund_deadline.value > now);
     }
 }
 
@@ -1024,61 +1040,128 @@ impl ShakescapeRelayHandle {
             }
             CrossChainMessage::SwapSessionProposal(proposal) => {
                 let session_id = proposal.terms().swap_session_id;
-                let route = state.sessions.get(&session_id).cloned().ok_or(
-                    ShakescapeRelayHandleError::Uncorrelated(
-                        "swap proposal session is unavailable",
-                    ),
-                )?;
-                if peer != route.maker {
-                    return Err(ShakescapeRelayHandleError::CrossChain(
-                        "swap proposal came from the non-maker peer",
-                    ));
+                if let Some(route) = state.sessions.get(&session_id).cloned() {
+                    if peer != route.maker {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "swap proposal came from the non-maker peer",
+                        ));
+                    }
+                    let offer = &state
+                        .offers
+                        .get(&route.offer_id)
+                        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+                            "swap proposal offer is unavailable",
+                        ))?
+                        .offer;
+                    proposal
+                        .verify_for_direct_offer(offer, &route.take, offer.header.network, now)
+                        .map_err(|_| {
+                            ShakescapeRelayHandleError::CrossChain("invalid swap proposal")
+                        })?;
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer: route.taker,
+                        request_id,
+                        message: CrossChainMessage::SwapSessionProposal(proposal),
+                    });
+                } else {
+                    validate_recovery_network(state, proposal.terms())?;
+                    if let Some(route) = state.recovery_sessions.get(&session_id) {
+                        if route.maker != peer || route.proposal != proposal {
+                            return Err(ShakescapeRelayHandleError::CrossChain(
+                                "swap recovery proposal conflicts with the current maker route",
+                            ));
+                        }
+                    } else {
+                        if state
+                            .sessions
+                            .len()
+                            .saturating_add(state.recovery_sessions.len())
+                            >= MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS
+                        {
+                            return Err(ShakescapeRelayHandleError::CrossChain(
+                                "cross-chain session capacity reached",
+                            ));
+                        }
+                        state.recovery_sessions.insert(
+                            session_id,
+                            CrossChainSessionRecoveryRoute {
+                                maker: peer,
+                                taker: None,
+                                proposal,
+                                hello: None,
+                            },
+                        );
+                    }
                 }
-                let offer = &state
-                    .offers
-                    .get(&route.offer_id)
-                    .ok_or(ShakescapeRelayHandleError::Uncorrelated(
-                        "swap proposal offer is unavailable",
-                    ))?
-                    .offer;
-                proposal
-                    .verify_for_direct_offer(offer, &route.take, offer.header.network, now)
-                    .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid swap proposal"))?;
-                dispatch.sends.push(ShakescapeCrossChainSend {
-                    peer: route.taker,
-                    request_id,
-                    message: CrossChainMessage::SwapSessionProposal(proposal),
-                });
             }
             CrossChainMessage::SwapSessionHello(hello) => {
-                let route = state.sessions.get(&hello.swap_session_id).cloned().ok_or(
-                    ShakescapeRelayHandleError::Uncorrelated("swap hello session is unavailable"),
-                )?;
-                if peer != route.taker {
-                    return Err(ShakescapeRelayHandleError::CrossChain(
-                        "swap hello came from the non-taker peer",
-                    ));
+                if let Some(route) = state.sessions.get(&hello.swap_session_id).cloned() {
+                    if peer != route.taker {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "swap hello came from the non-taker peer",
+                        ));
+                    }
+                    let offer = &state
+                        .offers
+                        .get(&route.offer_id)
+                        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+                            "swap hello offer is unavailable",
+                        ))?
+                        .offer;
+                    hello
+                        .verify_for_direct_offer(offer, &route.take, offer.header.network, now)
+                        .map_err(|_| {
+                            ShakescapeRelayHandleError::CrossChain("invalid swap hello")
+                        })?;
+                    state
+                        .sessions
+                        .get_mut(&hello.swap_session_id)
+                        .expect("validated session route remains present")
+                        .hello = Some(hello.clone());
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer: route.maker,
+                        request_id,
+                        message: CrossChainMessage::SwapSessionHello(hello),
+                    });
+                } else {
+                    validate_recovery_network(state, &hello)?;
+                    hello.verify_agreement(hello.header.network).map_err(|_| {
+                        ShakescapeRelayHandleError::CrossChain(
+                            "invalid countersigned swap recovery hello",
+                        )
+                    })?;
+                    let route = state
+                        .recovery_sessions
+                        .get_mut(&hello.swap_session_id)
+                        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+                            "swap recovery hello preceded its maker proposal",
+                        ))?;
+                    if peer == route.maker || route.taker.is_some_and(|taker| taker != peer) {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "swap recovery hello conflicts with the current taker route",
+                        ));
+                    }
+                    let mut maker_terms = hello.clone();
+                    maker_terms.taker_signature = [0; 64];
+                    let expected_proposal = SwapSessionProposal::from_maker_signed(maker_terms)
+                        .map_err(|_| {
+                            ShakescapeRelayHandleError::CrossChain(
+                                "swap recovery hello does not preserve its maker proposal",
+                            )
+                        })?;
+                    if expected_proposal != route.proposal {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "swap recovery hello does not preserve its maker proposal",
+                        ));
+                    }
+                    route.taker = Some(peer);
+                    route.hello = Some(hello.clone());
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer: route.maker,
+                        request_id,
+                        message: CrossChainMessage::SwapSessionHello(hello),
+                    });
                 }
-                let offer = &state
-                    .offers
-                    .get(&route.offer_id)
-                    .ok_or(ShakescapeRelayHandleError::Uncorrelated(
-                        "swap hello offer is unavailable",
-                    ))?
-                    .offer;
-                hello
-                    .verify_for_direct_offer(offer, &route.take, offer.header.network, now)
-                    .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid swap hello"))?;
-                state
-                    .sessions
-                    .get_mut(&hello.swap_session_id)
-                    .expect("validated session route remains present")
-                    .hello = Some(hello.clone());
-                dispatch.sends.push(ShakescapeCrossChainSend {
-                    peer: route.maker,
-                    request_id,
-                    message: CrossChainMessage::SwapSessionHello(hello),
-                });
             }
             CrossChainMessage::SwapFundingStatus(status) => {
                 let target = validate_cross_chain_status_route(
@@ -1160,6 +1243,9 @@ impl ShakescapeRelayHandle {
         state
             .sessions
             .retain(|_, route| route.maker != peer && route.taker != peer);
+        state.recovery_sessions.retain(|_, route| {
+            route.maker != peer && route.taker.is_none_or(|taker| taker != peer)
+        });
         Ok(())
     }
 
@@ -1405,6 +1491,20 @@ fn validate_cross_chain_offer(
         .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid direct offer"))
 }
 
+fn validate_recovery_network(
+    state: &ShakescapeCrossChainState,
+    hello: &SwapSessionHello,
+) -> Result<(), ShakescapeRelayHandleError> {
+    if hello.header.network.hns_magic != state.network_magic
+        || hello.header.network.hns_genesis.as_bytes() != &state.network_genesis
+    {
+        return Err(ShakescapeRelayHandleError::CrossChain(
+            "swap recovery is bound to another Handshake network",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_cross_chain_status_route<F>(
     state: &ShakescapeCrossChainState,
     peer: PeerId,
@@ -1414,27 +1514,47 @@ fn validate_cross_chain_status_route<F>(
 where
     F: FnOnce(&SwapSessionHello) -> hns_marketplace_protocol::Result<()>,
 {
-    let route = state
-        .sessions
-        .get(&session_id)
-        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
-            "cross-chain status session is unavailable",
-        ))?;
-    let target = if peer == route.maker {
-        route.taker
-    } else if peer == route.taker {
-        route.maker
+    let (target, hello) = if let Some(route) = state.sessions.get(&session_id) {
+        let target = if peer == route.maker {
+            route.taker
+        } else if peer == route.taker {
+            route.maker
+        } else {
+            return Err(ShakescapeRelayHandleError::CrossChain(
+                "cross-chain status came from an unrelated peer",
+            ));
+        };
+        let hello = route
+            .hello
+            .as_ref()
+            .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+                "cross-chain status preceded the signed hello",
+            ))?;
+        (target, hello)
     } else {
-        return Err(ShakescapeRelayHandleError::CrossChain(
-            "cross-chain status came from an unrelated peer",
-        ));
-    };
-    let hello = route
-        .hello
-        .as_ref()
-        .ok_or(ShakescapeRelayHandleError::Uncorrelated(
-            "cross-chain status preceded the signed hello",
+        let route = state.recovery_sessions.get(&session_id).ok_or(
+            ShakescapeRelayHandleError::Uncorrelated("cross-chain status session is unavailable"),
+        )?;
+        let taker = route.taker.ok_or(ShakescapeRelayHandleError::Uncorrelated(
+            "cross-chain status preceded the recovered taker route",
         ))?;
+        let target = if peer == route.maker {
+            taker
+        } else if peer == taker {
+            route.maker
+        } else {
+            return Err(ShakescapeRelayHandleError::CrossChain(
+                "cross-chain status came from an unrelated peer",
+            ));
+        };
+        let hello = route
+            .hello
+            .as_ref()
+            .ok_or(ShakescapeRelayHandleError::Uncorrelated(
+                "cross-chain status preceded the recovered signed hello",
+            ))?;
+        (target, hello)
+    };
     verify(hello)
         .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid cross-chain status"))?;
     Ok(target)
@@ -1857,8 +1977,9 @@ fn append_event(
 #[cfg(test)]
 mod cross_chain_tests {
     use hns_marketplace_protocol::{
-        AssetAmount, AssetId, ChainId, DirectOffer, DirectOfferCancellation, DirectOfferTake,
-        MarketPair, NetworkBinding, SignedObjectHeader, MARKETPLACE_PROTOCOL_VERSION,
+        AssetAmount, AssetId, ChainId, DeadlineKind, DirectOffer, DirectOfferCancellation,
+        DirectOfferTake, FundingState, MarketPair, NetworkBinding, SettlementDeadline,
+        SignedObjectHeader, SwapFundingStatus, SwapSessionProposal, MARKETPLACE_PROTOCOL_VERSION,
     };
     use hns_protocol_primitives::BlockHash;
 
@@ -1937,6 +2058,47 @@ mod cross_chain_tests {
         };
         cancellation.sign(&[7; 32]).unwrap();
         cancellation
+    }
+
+    fn accepted_session(
+        offer: &DirectOffer,
+        take: &DirectOfferTake,
+    ) -> (SwapSessionProposal, SwapSessionHello) {
+        let mut session_header = header(3, NOW, NOW + 400);
+        session_header.signer_public_key = offer.header.signer_public_key;
+        let hello = SwapSessionHello {
+            header: session_header,
+            direct_offer_id: offer.offer_id,
+            swap_session_id: offer.swap_session_id,
+            maker_settlement_public_key: offer.maker_settlement_public_key,
+            taker_settlement_public_key: take.taker_settlement_public_key,
+            offered_asset: offer.offered_asset,
+            offered_amount: offer.offered_amount,
+            received_asset: offer.received_asset,
+            received_amount: offer.received_amount,
+            hashlock: [0x41; 32],
+            first_funding_chain: ChainId::HANDSHAKE,
+            offered_lock_commitment: [0x42; 32],
+            offered_refund_deadline: SettlementDeadline {
+                kind: DeadlineKind::UnixTime,
+                value: NOW + 2_000,
+            },
+            offered_minimum_confirmations: 2,
+            received_lock_commitment: [0x43; 32],
+            received_refund_deadline: SettlementDeadline {
+                kind: DeadlineKind::UnixTime,
+                value: NOW + 1_000,
+            },
+            received_minimum_confirmations: 1,
+            maker_signature: [0; 64],
+            taker_signature: [0; 64],
+        };
+        let proposal = hello.into_maker_proposal(&[9; 32]).unwrap();
+        let accepted = proposal
+            .clone()
+            .accept_taker(network(), NOW, &[11; 32])
+            .unwrap();
+        (proposal, accepted)
     }
 
     #[test]
@@ -2036,6 +2198,84 @@ mod cross_chain_tests {
         assert_eq!(routed.sends.len(), 1);
         assert_eq!(routed.sends[0].peer, maker);
         assert!(!routed.sends.iter().any(|send| send.peer == observer));
+    }
+
+    #[test]
+    fn countersigned_session_rebuilds_private_status_route_without_public_offer() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let maker = PeerId(1);
+        let taker = PeerId(2);
+        let offer = offer();
+        let take = take(&offer);
+        let (proposal, hello) = accepted_session(&offer, &take);
+
+        let proposal_dispatch = relay
+            .receive_cross_chain(
+                maker,
+                1,
+                CrossChainMessage::SwapSessionProposal(proposal),
+                NOW,
+            )
+            .expect("maker proposal starts a private recovery route");
+        assert!(proposal_dispatch.sends.is_empty());
+
+        let hello_dispatch = relay
+            .receive_cross_chain(
+                taker,
+                2,
+                CrossChainMessage::SwapSessionHello(hello.clone()),
+                NOW,
+            )
+            .expect("taker hello completes the private recovery route");
+        assert_eq!(hello_dispatch.sends.len(), 1);
+        assert_eq!(hello_dispatch.sends[0].peer, maker);
+
+        let mut status = SwapFundingStatus {
+            header: SignedObjectHeader {
+                version: hello.header.version,
+                network: hello.header.network,
+                pair: hello.header.pair,
+                signer_public_key: [0; 33],
+                sequence: hello.header.sequence + 2,
+                created_at: NOW,
+                expires_at: hello.offered_refund_deadline.value,
+            },
+            swap_session_id: hello.swap_session_id,
+            chain: ChainId::HANDSHAKE,
+            lock_commitment: hello.offered_lock_commitment,
+            transaction_id: [0x44; 32],
+            output_index: 0,
+            amount: hello.offered_amount,
+            confirmations: hello.offered_minimum_confirmations,
+            state: FundingState::Confirmed,
+            signature: [0; 64],
+        };
+        status.sign(&[9; 32]).unwrap();
+        let status_dispatch = relay
+            .receive_cross_chain(maker, 3, CrossChainMessage::SwapFundingStatus(status), NOW)
+            .expect("authenticated funding status uses the recovered route");
+        assert_eq!(status_dispatch.sends.len(), 1);
+        assert_eq!(status_dispatch.sends[0].peer, taker);
+
+        let inventory = relay
+            .receive_cross_chain(
+                PeerId(3),
+                4,
+                CrossChainMessage::DirectOfferInventory(Vec::new()),
+                NOW,
+            )
+            .expect("recovery route does not publish a board offer");
+        assert!(matches!(
+            inventory.sends[0].message,
+            CrossChainMessage::DirectOfferInventory(ref ids) if ids.is_empty()
+        ));
     }
 
     #[test]
