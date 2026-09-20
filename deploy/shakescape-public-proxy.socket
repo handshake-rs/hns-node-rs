@@ -1,0 +1,12 @@
+[Unit]
+Description=Public raw-TCP socket for the ShakeScape rendezvous gateway
+Documentation=file:///usr/share/doc/systemd/systemd-socket-proxyd.html
+
+[Socket]
+ListenStream=0.0.0.0:12048
+NoDelay=true
+ReusePort=false
+Backlog=256
+
+[Install]
+WantedBy=sockets.target

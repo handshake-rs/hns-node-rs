@@ -1,0 +1,23 @@
+[Unit]
+Description=Raw-TCP proxy from the public VM to the synchronized ShakeScape rendezvous node
+Documentation=file:///usr/share/doc/systemd/systemd-socket-proxyd.html
+Requires=shakescape-public-proxy.socket
+After=network-online.target tailscaled.service
+
+[Service]
+ExecStart=/lib/systemd/systemd-socket-proxyd 100.80.34.21:12048
+DynamicUser=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
