@@ -85,19 +85,22 @@ before passing exact canonical bytes to `ShakescapeRelayHandle::put`. The node c
 - does not automatically accept or execute swaps.
 
 The active node transport and peer admission negotiate the exact Shakescape V1
-registry and fingerprint. The native name-market adapter is installed: it
-decodes the canonical protocol, verifies listings and cancellations, serves
-bounded inventory/get exchanges, and propagates only committed publications.
-The other four generic cache roles still have no native peer-wire adapter;
-enabling one of those role bits alone does not advertise or relay that
-application protocol.
+registry and fingerprint. Native typed adapters are installed for both the
+name market and the direct HNS/BTC market. They decode the canonical protocol,
+verify signed listings, cancellations, takes, and session messages, serve
+bounded inventory/get exchanges, and route funding, redeem, refund, and watch
+status only after the corresponding signed session has been established. The
+generic price-observation cache role still has no native peer-wire adapter;
+enabling that role bit alone does not advertise an application protocol.
 
 ## Mobile rendezvous gateway profile
 
 `--shakescape-mobile-rendezvous` is the fail-closed deployment profile for a
 shared, always-on mobile board peer. It composes only implemented services:
 
-- the typed name-market board relay;
+- the typed name-market and direct HNS/BTC board relays;
+- signed direct-offer cancellation, take, bilateral-session, and swap-status
+  routing;
 - an inbound Handshake/Brontide listener advertising the ordinary `NETWORK`
   service together with the Shakescape extension service;
 - the bounded opaque HNSR relay, including the canonical Shakescape swap
@@ -146,13 +149,15 @@ Set `PUBLIC_IP` to the actual public IPv4 address routed to the listener (or
 pass a bracketed public IPv6 socket directly). The advertised address is never
 inferred from the bind wildcard.
 
-The independently enabled HIP-78 opaque relay now advertises the canonical
+The independently enabled HIP-78 opaque relay advertises the canonical
 Shakescape swap circuit profile (`0x0004`) alongside Node, Web, and Chat. That
 profile permits two authenticated endpoints to carry bounded encrypted swap
-bytes through an ordinary relay. The relay does not decode the payload, invoke
-this marketplace cache, validate an offer, or acquire endpoint or settlement
-authority. A typed marketplace subprotocol remains disabled until its exact
-adapter and product boundary are separately joined and qualified.
+bytes through an ordinary relay. The opaque relay does not decode the payload,
+invoke the marketplace cache, validate an offer, or acquire endpoint or
+settlement authority. This is separate from the installed typed direct
+HNS/BTC board adapter above: the typed adapter handles signed discovery and
+session/status routing, while profile `0x0004` transports already-addressed
+private session bytes.
 
 The node now has descriptor-bound, restart-durable confirmed Shakedex-v2 and
 HNS-HTLC-v1 funding/spend/preimage tracking plus bounded mempool reconciliation.

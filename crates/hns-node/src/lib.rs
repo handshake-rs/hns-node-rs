@@ -246,7 +246,10 @@ const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
 // reaches its peer target.
 const NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD: u32 = 128;
 const MAX_NAME_PAGE_GENERATION_BYTES: u64 = 150_000_000_000;
-const MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
+// Runtime preflights account for the bytes the pending operation will
+// actually write. An additional free-space cushion is an operator policy and
+// must not prevent an otherwise correctly sized node from starting.
+const MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES: u64 = 0;
 const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_NAME_PAGE_VALIDATION_RECORDS: u64 =
     maximum_name_page_validation_records(MAX_NAME_PAGE_VALIDATION_SPILL_BYTES);
@@ -23691,9 +23694,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        // Page storage deliberately enforces the production 10 GB reserve;
-        // `/tmp` is commonly a much smaller tmpfs. Keep this fixture on the
-        // build-target filesystem that already hosts the test artifacts.
+        // Keep this fixture on the build-target filesystem that already hosts
+        // the test artifacts and is cleaned with the same scoped test state.
         let test_root = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target"));

@@ -6,6 +6,13 @@ qualification or authorize deployment.
 
 ## 0.3.5 - unreleased
 
+- Remove the arbitrary 10 GB free-space cushion from ordinary node startup,
+  name-page publication, validation spill, and segment compaction. Runtime
+  preflights still require the exact predicted bytes for each operation;
+  operators and qualification campaigns can impose a separate reserve.
+- Add an isolated requester → opaque relay → endpoint fixture for HNSR profile
+  `0x0004` that opens a canonical swap circuit and proves byte-exact opaque
+  payload delivery in both directions.
 - Make full-sync qualification samples crash-consistent with runtime state.
   Resume now validates the complete sample journal, reconciles only one exact
   trailing durable sample after binding state to the preceding journal prefix,

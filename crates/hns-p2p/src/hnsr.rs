@@ -1165,7 +1165,11 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use hns_consensus::Network;
-    use hns_hnsr_protocol::{public_key, EndpointReservation, HnsrOpcode};
+    use hns_hnsr_protocol::{
+        public_key, AcceptBody, DataBody, EndpointReservation, HnsrOpcode, HnsrPacket, HnsrPeerId,
+        HnsrRequester, HnsrRequesterConfig, HnsrRequesterEvent, OpaqueRelayConfig,
+        OpaqueRelayRuntime,
+    };
 
     use super::*;
 
@@ -1198,5 +1202,192 @@ mod tests {
             .expect("relay offer");
         let offer = HnsrPacket::decode(&offer).expect("relay offer encoding");
         assert_eq!(offer.opcode, HnsrOpcode::Offer);
+    }
+
+    #[test]
+    fn mobile_swap_profile_routes_opaque_fixture_end_to_end() {
+        const NOW: u64 = 1_700_000_000;
+        const SWAP_CIPHERTEXT_FIXTURE: &[u8] = &[
+            0x53, 0x68, 0x61, 0x6b, 0x65, 0x53, 0x63, 0x61, 0x70, 0x65, 0x00, 0x04, 0xa5, 0x7c,
+            0x19, 0xe2, 0x41, 0x8b, 0x03, 0xff, 0x62, 0xd0, 0x9a, 0x11,
+        ];
+
+        let peer = |name: &str| HnsrPeerId::new(name.as_bytes().to_vec()).expect("peer ID");
+        let relay_private = [7_u8; 32];
+        let mut config = HnsrCoordinatorConfig::for_network(Network::Regtest);
+        config.relay_backend = Some(HnsrRelayBackend {
+            advertised_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14_039),
+            private_key: relay_private,
+        });
+        let relay_service = build_relay_service(&config)
+            .expect("relay configuration")
+            .expect("enabled relay");
+        let relay_key = public_key(&relay_private).expect("relay public key");
+        let endpoint =
+            EndpointReservation::new(config.binding.magic, HNS_SHAKESCAPE_SWAP_V1, [9_u8; 32])
+                .expect("swap endpoint");
+        let reserve = endpoint
+            .reserve(&relay_key, [1_u8; 8], 300, 1, 65_536, [2_u8; 16])
+            .expect("signed reservation");
+        let mut service = HnsrService::new(Some(relay_service), None);
+        let offer = service
+            .handle(&reserve, "endpoint", NOW)
+            .expect("reservation admitted")
+            .expect("relay offer");
+        let (confirmation, ticket) = endpoint
+            .confirm_offer(&offer, &relay_key, NOW, true)
+            .expect("offer confirmation");
+        let confirmed = service
+            .handle(&confirmation, "endpoint", NOW)
+            .expect("confirmation admitted")
+            .expect("confirmed reservation");
+        let ticket = endpoint
+            .accept_confirmation(&confirmed, ticket)
+            .expect("relay ticket");
+
+        let relay_peer = peer("relay");
+        let requester_peer = peer("requester");
+        let endpoint_peer = peer("endpoint");
+        let mut requester = HnsrRequester::new(
+            [3_u8; 16],
+            1,
+            HnsrRequesterConfig {
+                network_magic: config.binding.magic,
+                profile: HNS_SHAKESCAPE_SWAP_V1,
+                allow_private_relay: true,
+                maximum_circuits: 4,
+                maximum_queue_bytes: MAX_CIRCUIT_QUEUE,
+                maximum_bytes_per_circuit: 65_536,
+            },
+            NOW,
+        )
+        .expect("swap requester");
+        let open = requester
+            .begin_open(
+                relay_peer.clone(),
+                ticket.relay_key,
+                ticket,
+                NOW,
+                NOW + 5,
+                DEFAULT_WINDOW,
+            )
+            .expect("open swap circuit");
+        let mut relay = OpaqueRelayRuntime::new([4_u8; 16], 1, OpaqueRelayConfig::default(), NOW)
+            .expect("opaque relay runtime");
+        let incoming = relay
+            .handle(
+                service.relay().expect("relay reservation service"),
+                &requester_peer,
+                &open.packet,
+                NOW,
+            )
+            .expect("route circuit open")
+            .pop()
+            .expect("incoming endpoint route");
+        assert_eq!(incoming.route.destination, endpoint_peer);
+        relay
+            .acknowledge(incoming.action_id, true)
+            .expect("incoming route delivered");
+
+        let accept = HnsrPacket::new(
+            HnsrOpcode::Accept,
+            incoming.route.packet.context_id,
+            AcceptBody {
+                accepted_window: DEFAULT_WINDOW,
+                endpoint_nonce: [5_u8; 16],
+            }
+            .encode()
+            .expect("accept body"),
+        )
+        .expect("accept packet");
+        let opened = relay
+            .handle(
+                service.relay().expect("relay reservation service"),
+                &endpoint_peer,
+                &accept,
+                NOW + 1,
+            )
+            .expect("route circuit acceptance")
+            .pop()
+            .expect("opened requester route");
+        assert_eq!(opened.route.destination, requester_peer);
+        relay
+            .acknowledge(opened.action_id, true)
+            .expect("opened route delivered");
+        let opened_event = requester
+            .handle(&relay_peer, &opened.route.packet, NOW + 1)
+            .expect("requester accepts opened circuit")
+            .expect("opened requester event");
+        let HnsrRequesterEvent::Opened { circuit_id, .. } = opened_event else {
+            panic!("unexpected requester event");
+        };
+
+        let outbound = requester
+            .send_data(circuit_id, SWAP_CIPHERTEXT_FIXTURE.to_vec())
+            .expect("send opaque swap fixture");
+        let forwarded = relay
+            .handle(
+                service.relay().expect("relay reservation service"),
+                &requester_peer,
+                &outbound.packet,
+                NOW + 1,
+            )
+            .expect("forward opaque swap fixture")
+            .pop()
+            .expect("endpoint data route");
+        assert_eq!(forwarded.route.destination, endpoint_peer);
+        assert_eq!(
+            DataBody::decode(&forwarded.route.packet.body)
+                .expect("forwarded data body")
+                .bytes,
+            SWAP_CIPHERTEXT_FIXTURE
+        );
+        relay
+            .acknowledge(forwarded.action_id, true)
+            .expect("fixture delivered");
+
+        let response_fixture = SWAP_CIPHERTEXT_FIXTURE
+            .iter()
+            .rev()
+            .copied()
+            .collect::<Vec<_>>();
+        let response = HnsrPacket::new(
+            HnsrOpcode::Data,
+            circuit_id,
+            DataBody {
+                bytes: response_fixture.clone(),
+            }
+            .encode()
+            .expect("response body"),
+        )
+        .expect("response packet");
+        let returned = relay
+            .handle(
+                service.relay().expect("relay reservation service"),
+                &endpoint_peer,
+                &response,
+                NOW + 1,
+            )
+            .expect("return opaque swap fixture")
+            .pop()
+            .expect("requester data route");
+        relay
+            .acknowledge(returned.action_id, true)
+            .expect("response delivered");
+        let event = requester
+            .handle(&relay_peer, &returned.route.packet, NOW + 1)
+            .expect("requester accepts returned data")
+            .expect("returned data event");
+        assert!(matches!(
+            event,
+            HnsrRequesterEvent::DataAvailable {
+                circuit_id: observed,
+                queued_bytes,
+            } if observed == circuit_id && queued_bytes == response_fixture.len()
+        ));
+        let (received, _) = requester
+            .take_data(circuit_id)
+            .expect("consume returned fixture");
+        assert_eq!(received, response_fixture);
     }
 }

@@ -89,7 +89,9 @@ pub const SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_FRAME_BYTES: u64 = 64 * 1024 * 102
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_LOCATOR_BYTES: u64 = 128 * 1024 * 1024;
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_PHYSICAL_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_PUBLICATION_BYTES: u64 = 256 * 1024 * 1024;
-pub const SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
+/// Ordinary runtime compaction reserves only its predicted temporary and
+/// output bytes. Deployments may enforce an additional free-space policy.
+pub const SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES: u64 = 0;
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_ELAPSED: Duration = Duration::from_secs(4 * 60 * 60);
 const SEGMENT_COMPACTION_BATCH_OPERATION_OVERHEAD_BYTES: u64 = 64;
 const SEGMENT_COMPACTION_DATABASE_TEMPORARY_MULTIPLIER: u64 = 2;
@@ -5906,7 +5908,7 @@ mod tests {
         const DATABASE: &str = "test database filesystem";
         assert_eq!(
             SegmentCompactionExecutionLimits::default().minimum_filesystem_reserve_bytes,
-            10_000_000_000
+            0
         );
         let request = SegmentCompactionCapacityRequest {
             payload_output_bytes: 40,

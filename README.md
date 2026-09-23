@@ -1,103 +1,57 @@
 # hns-node-rs (`hsrd`)
 
-`hsrd` is a lean Handshake full node written in Rust. It implements Handshake
-consensus, authenticated chain state, native P2P synchronization, a bounded
-mempool, mining templates, and block relay without an `hsd` runtime dependency.
+`hsrd` is a native Rust Handshake full node. It validates Handshake consensus,
+maintains authenticated chain state, synchronizes and serves peers, relays
+blocks and transactions, builds mining templates, and can provide a bounded
+noncustodial ShakeScape rendezvous service without an `hsd` runtime.
 
-The `hsrd` process is intentionally focused on the node and mining path. It is
-not a custodial wallet, desktop application, domain manager, DNS server, or
-explorer. Optional indexes and a typed noncustodial chain backend support a
-separate self-custodial wallet without storing or signing with wallet keys. The
-repository also contains the separately deployed, bounded
-[`hns-resolverd`](docs/hns-resolverd.md) companion for applications that need
-ordinary HNS DNS without an `hsd` runtime.
-
-The wallet-index source implementation includes bounded chain-epoch-bound
-confirmed restoration, chain-epoch/process-instance/generation-bound mempool
-reconciliation, ordered snapshot-bound outpoint-spend evidence, canonical
-encoded current/proof name state, atomic transaction/name evidence,
-active-chain height/root reads, exact-generation TRANSFER/FINALIZE preparation
-context with owner-spender and canonical maturity/renewal evidence, and restart/reorg-durable public
-Shakedex-v2/HNS-HTLC-v1 event tracking.
-Authenticated wallet RPC v1 now projects the safe subset through the native
-node process boundary without a sibling dependency. It requires explicit
-listener Authorization and `--wallet-index`; loopback alone never enables it.
-The subsystem is disabled by default and is not production-qualified. The
-code-bearing 0.3.5 candidate at
-`2b267ffe7fc6f9929063a18986a83b566d02ae6d` passed the repository CI,
-container, and CodeQL workflows on that exact revision, but those source and
-build gates do not replace live restart/reorganization, storage-fault,
-adversarial-topology, or deployment-scale qualification. The typed in-process
-backend can reclaim registrations that authoritative durable
-state proves were never confirmed, provided the caller permanently abandons
-every prior funding broadcast, the exact current accepted ordinary/airdrop pool
-has no matching funding, and the bound pool retains no transaction orphans.
-It also contains a source-complete, typed completed-contract retirement path:
-an exact fully spent lifecycle can become an immutable tombstone only after
-every confirmed event is below the store's irreversible undo-pruning frontier.
-The tombstone retains the complete descriptor, terminal spend and revealed
-preimages, min/max heights, and an ordered event commitment while reclaiming
-active global/per-address slots. At exact local revision
-`fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, this path passed all four matching
-focused `production_next_` wallet-index tests with zero failures. That narrow
-historical test record has not run a RocksDB reopen, live restart/reorg,
-adversarial topology, or performance measurement. Tombstones have a separate
-finite lifetime cap; later matching funding is deliberately untracked after
-explicit permanent abandonment, and registration remains absent from
-untrusted wallet RPC. `hns-wallet-rs` now contains a concrete node-RPC adapter
-boundary and the mobile repository contains fail-closed Android and iOS read
-projections. What
-remains is joined backend/authentication and lifecycle qualification, explicit
-product enablement, and a released canonical `hns-swap` dependency rather than
-initial adapter implementation. See the
-[wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
-[wire contract](docs/WALLET_RPC_V1.md).
+The process is a node, not a custodial wallet. It never stores wallet seeds or
+signs wallet transactions. Optional indexes and authenticated read APIs can
+serve a separate self-custodial wallet, but those facilities are disabled by
+default.
 
 > [!IMPORTANT]
-> Functional consensus readiness is complete, but production hardening is
-> ongoing. Ordinary mainnet synchronization does not grant mining authority.
-> Mainnet mining is restricted to the explicit, fail-closed
-> [canary profile](docs/mainnet-canary.md).
+> Consensus synchronization is implemented, but production hardening and
+> deployment qualification remain ongoing. Mainnet mining requires the
+> explicit fail-closed [canary profile](docs/mainnet-canary.md).
 
-## Requirements
+## Current compatibility
 
-The repository pins Rust 1.97.1 in `rust-toolchain.toml`. With
-[rustup](https://rustup.rs/) installed, Cargo selects it automatically.
+- Node source line: `0.3.5`
+- Rust toolchain: `1.97.1`
+- Handshake protocol crates: exact `hns-rs 0.4.1`
+- ShakeScape Experimental V1 registry fingerprint:
+  `04fce3f12b717c4254bb66ac07474a6c9f61bd2916efc18ebfc79df82a89a66b`
+- Ordinary public mainnet listener and rendezvous port: TCP `12038`
 
-The default build includes RocksDB and requires a C/C++ toolchain and Clang. On
-Ubuntu or Debian:
-
-```bash
-sudo apt-get update
-sudo apt-get install --yes build-essential clang libclang-dev
-```
+Port `44806` belongs to HSD's key-bearing fixed-seed/Brontide bootstrap
+endpoints. A normal public `hsrd` or LearnHNS rendezvous deployment should use
+TCP `12038` unless its operator deliberately configures a different reachable
+Handshake listener.
 
 ## Build
 
-```bash
+The default build includes RocksDB and requires a C/C++ toolchain and Clang.
+On Ubuntu or Debian:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes build-essential clang libclang-dev
+
 git clone https://github.com/handshake-rs/hns-node-rs.git
 cd hns-node-rs
 cargo build --locked --release -p hns-node --bin hsrd
 ```
 
 The binary is written to `target/release/hsrd`.
-The first release build compiles RocksDB and can take several minutes.
-
-To run both the node and ordinary DNS resolver from published containers, use:
-
-```bash
-docker compose up --detach
-dig @127.0.0.1 -p 5350 example. A
-```
-
-See [Docker and GHCR](docs/docker.md) for Pinner and container-network wiring.
 
 ## Run a mainnet node
 
-The following starts an outbound mainnet node, discovers Handshake peers, and
-synchronizes active chain state. Storage is pruned by default.
+The default storage profile is pruned. Outbound P2P, fixed-seed bootstrap,
+learned-peer discovery, header synchronization, block acquisition, and active
+state validation are enabled by default.
 
-```bash
+```sh
 mkdir -p "$PWD/data/mainnet"
 
 ./target/release/hsrd \
@@ -106,129 +60,189 @@ mkdir -p "$PWD/data/mainnet"
   --rpc-bind 127.0.0.1:12037
 ```
 
-Outbound native P2P, fixed-seed discovery, and active-state synchronization are
-enabled by default. `--no-native-sync` creates an RPC-only process, while
-`--no-p2p-discovery` requires an explicit `--connect` peer or inbound listener.
-The former positive flags remain accepted for deployment compatibility. Press
-`Ctrl-C` for a clean shutdown.
+Inspect status from the same host:
 
-HIP-76, ODoH, and HNSR requester policies also default on (`Auto` for HIP-76).
-With a persistent data directory, the `--no-hip76-requester`,
-`--no-odoh-requester`, `--no-hnsr-requester`, and `--no-hnsr-relay` choices
-persist across restart. Their matching positive flags explicitly reverse a
-saved opt-out; omitting both forms preserves the durable choice. These
-requester controls do not opt into HIP-76 or ODoH DNS-output provider roles.
-An explicitly configured HNSR relay can carry bounded opaque Node, Web, Chat,
-and Shakescape swap circuits. Swap-profile support is transport only: `hsrd`
-does not see wallet keys or plaintext circuit messages and does not validate,
-fund, or settle a marketplace offer.
-
-For a durable public peer that mobile wallets can use as their shared
-ShakeScape board gateway, use `--shakescape-mobile-rendezvous` together with an
-absolute `--data-dir`, an inbound `--p2p-listen`, and the externally reachable
-`--hnsr-relay-address`. That public raw-TCP socket is also injected into stock
-HSD `ADDR` gossip with `NETWORK | SHAKESCAPE`, a fresh timestamp, and the
-required zero key; `--p2p-advertise` can select a different public forwarding
-socket. The listener accepts both stock keyless Handshake framing and Brontide
-on that socket. The composite mode enables the implemented typed name-market
-relay and opaque swap-circuit relay and rejects incomplete or private mainnet
-configurations. It does not claim the unimplemented HNSR endpoint-directory
-role; see [the exact service boundary](docs/SHAKESCAPE_MARKET_RELAY.md#mobile-rendezvous-gateway-profile).
-
-In another terminal, inspect node and synchronization status:
-
-```bash
-curl --fail --silent --show-error \
-  http://127.0.0.1:12037/api/v1/status
-
-curl --fail --silent --show-error \
-  http://127.0.0.1:12037/api/v1/sync
+```sh
+curl --fail --silent --show-error http://127.0.0.1:12037/api/v1/status
+curl --fail --silent --show-error http://127.0.0.1:12037/api/v1/sync
 ```
 
 The RPC listener is loopback-only by default. Do not expose an unauthenticated
-RPC listener to another host. See the
-[control API documentation](docs/rpc-compat.md) for optional whole-listener
-authorization and the complete diagnostic surface.
+RPC listener to another host. See [`docs/rpc-compat.md`](docs/rpc-compat.md)
+for listener authentication and the complete diagnostic API.
 
-## Check a configuration
+## Deploy a public mobile rendezvous
 
-Add `--check-config` to any `hsrd` command to validate its arguments and exit
-without opening the node:
+The mobile-rendezvous profile makes one always-on `hsrd` reachable by multiple
+phones. It provides:
 
-```bash
+- a legitimate inbound Handshake listener advertising
+  `NETWORK | SHAKESCAPE`;
+- ordinary stock-HSD-compatible `ADDR` gossip for that reachable listener;
+- exact ShakeScape network, genesis, registry, and version negotiation;
+- typed signed Handshake name-sale board messages;
+- typed direct HNS/BTC offer discovery, cancellation, take, bilateral-session,
+  and swap-status routing;
+- an opaque HNSR relay supporting ShakeScape profile `0x0004` for
+  already-addressed encrypted swap-session bytes.
+
+It does not hold funds, choose trades, sign transactions, learn opaque HNSR
+payloads, or make a signed marketplace object trustworthy merely because it
+was relayed.
+
+Use an absolute persistent data directory and a public IPv4 or IPv6 address
+that routes raw TCP to the listener:
+
+```sh
 ./target/release/hsrd \
   --network mainnet \
-  --data-dir "$PWD/data/mainnet" \
-  --check-config
+  --data-dir /var/lib/hsrd/mainnet \
+  --rpc-bind 127.0.0.1:12037 \
+  --p2p-listen 0.0.0.0:12038 \
+  --p2p-advertise "$PUBLIC_IP:12038" \
+  --hnsr-relay-address "$PUBLIC_IP:12038" \
+  --shakescape-mobile-rendezvous
 ```
 
-Run `./target/release/hsrd --help` for all options.
+Before starting it, append `--check-config` to validate the deployment without
+opening storage or sockets. Open inbound TCP `12038` in the host and cloud
+firewalls. Do not place an HTTP/TLS reverse proxy in front of it: the forwarding
+path must preserve the raw TCP byte stream.
 
-## Local two-node smoke test
+The same listener accepts standard keyless Handshake framing and authenticated
+Brontide. Its stock-compatible `ADDR` entry uses a current timestamp, the
+public host/port, `NETWORK | SHAKESCAPE`, and the zero key required by stock
+HSD's ordinary address path. Application use still requires exact ShakeScape
+negotiation and signed-message validation.
 
-After building the release binary, run two temporary regtest nodes and verify
-their P2P and Shakescape negotiation:
+### Rendezvous data flow
 
-```bash
+```text
+Mobile A ──authenticated Handshake/ShakeScape──┐
+                                               │
+                                      public hsrd:12038
+                                               │
+Mobile B ──authenticated Handshake/ShakeScape──┘
+
+signed board inventory and session routing: A ↔ hsrd ↔ B
+opaque profile 0x0004 session bytes:          A ↔ hsrd ↔ B
+settlement transactions:                      each wallet ↔ its native chain
+```
+
+The typed marketplace adapter and the opaque HNSR relay are complementary.
+The former discovers and validates signed message structure and correlates
+sessions; the latter transports bounded encrypted bytes without parsing them.
+
+See [`docs/SHAKESCAPE_MARKET_RELAY.md`](docs/SHAKESCAPE_MARKET_RELAY.md) and
+[`docs/hip78-hnsr-runtime.md`](docs/hip78-hnsr-runtime.md) for the exact role
+and trust boundaries.
+
+## HNSR profile `0x0004` fixture
+
+The repository includes an isolated requester → opaque relay → endpoint test
+for the canonical ShakeScape swap profile. It reserves an endpoint, opens a
+circuit, sends fixed binary data in both directions, and asserts byte-exact
+delivery without marketplace parsing.
+
+```sh
+cargo test --locked -p hns-p2p \
+  mobile_swap_profile_routes_opaque_fixture_end_to_end
+```
+
+This protocol fixture is deterministic and does not require a blockchain,
+public IP, or real funds. It complements rather than replaces a public
+Brontide/two-phone canary.
+
+## Local two-node qualification
+
+Build the release binary, then run:
+
+```sh
 ./scripts/qualify-two-node-regtest.sh
 ```
 
-The script stops both nodes and removes their temporary data when it finishes.
+The harness verifies ready peers and exact ShakeScape V1 negotiation using the
+current registry fingerprint. Regtest intentionally uses plaintext local P2P;
+it is a node/registry qualification test, not evidence for public Brontide or
+HNSR deployment.
 
 ## Storage profiles
 
-The default `pruned` profile retains the rollback horizon required by the
-network while removing older raw block and undo payloads. To retain complete
-block history, start a new data directory with:
+The default `pruned` profile retains consensus state and the rollback horizon
+while removing older raw block and undo payloads. It can synchronize and serve
+current peers without maintaining a global wallet history index.
 
-```bash
+To retain the complete blockchain for historical peer serving, start a new
+data directory in archive mode:
+
+```sh
 ./target/release/hsrd \
   --network mainnet \
   --data-dir "$PWD/data/mainnet-archive" \
   --storage-mode archive
 ```
 
-A data directory that has pruned history cannot later be changed to the archive
-profile. Storage layout, migration, backup, and recovery procedures are
-documented in [Storage rollout](docs/storage-rollout.md). The narrow unclean
-older-candidate accumulator mismatch has a separate
-[cold recovery runbook](docs/interval-accumulator-recovery.md).
+A directory that has already pruned history cannot later become a complete
+archive. See [`docs/storage-rollout.md`](docs/storage-rollout.md).
+
+The node checks the predicted bytes required by individual storage operations.
+It does not impose an unrelated fixed 10 GB free-space cushion at ordinary
+startup or compaction. Operators and deployment tooling may impose their own
+reserve independently.
+
+## Optional indexes and wallet RPC
+
+`--wallet-index` enables the global transaction, script-history, spender,
+UTXO, name-state, and swap-evidence rows required by the authenticated wallet
+backend. It is not needed for a rendezvous-only node and remains disabled by
+default. Enabling it does not import or custody a wallet.
+
+Wallet RPC requires explicit listener authorization in addition to
+`--wallet-index`; loopback binding alone does not enable it. See:
+
+- [`docs/HNS_NODE_WALLET_INDEX.md`](docs/HNS_NODE_WALLET_INDEX.md)
+- [`docs/WALLET_RPC_V1.md`](docs/WALLET_RPC_V1.md)
+- [`docs/mainnet-pruned-wallet-node.md`](docs/mainnet-pruned-wallet-node.md)
+
+## Other components
+
+The repository also contains `hns-resolverd`, a separately deployed bounded
+Handshake DNS resolver. It is not automatically exposed by `hsrd`:
+
+```sh
+docker compose up --detach
+dig @127.0.0.1 -p 5350 example. A
+```
+
+See [`docs/hns-resolverd.md`](docs/hns-resolverd.md) and
+[`docs/docker.md`](docs/docker.md).
+
+## Validation
+
+```sh
+cargo fmt --all -- --check
+cargo test --locked
+./scripts/check.sh
+```
+
+The complete gate and external-tool requirements are documented in
+[`docs/testing.md`](docs/testing.md).
 
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [P2P and synchronization](docs/p2p-sync.md)
-- [HIP-77 ODoH requester boundary](docs/hip77-odoh-requester.md)
-- [HIP-78 HNSR requester and opaque relay](docs/hip78-hnsr-runtime.md)
-- [Control and diagnostic API](docs/rpc-compat.md)
-- [Native Handshake DNS resolver](docs/hns-resolverd.md)
-- [Mining engine](docs/mining-engine.md)
+- [HNSR requester and opaque relay](docs/hip78-hnsr-runtime.md)
+- [ShakeScape marketplace relay](docs/SHAKESCAPE_MARKET_RELAY.md)
+- [Storage schema and complexity](docs/storage-schema.md)
 - [Security model](docs/security-model.md)
 - [Readiness status](docs/readiness.md)
-- [Detailed implementation status](docs/implementation-status.md)
-- [Testing and qualification](docs/testing.md)
-- [Production assurance and external evidence](docs/production-assurance.md)
-- [Storage schema and complexity](docs/storage-schema.md)
-- [Wallet indexes and typed backend](docs/HNS_NODE_WALLET_INDEX.md)
-- [Authenticated wallet RPC v1](docs/WALLET_RPC_V1.md)
-- [Mainnet pruned wallet-index node](docs/mainnet-pruned-wallet-node.md)
-- [Bounded Shakescape marketplace relay](docs/SHAKESCAPE_MARKET_RELAY.md)
-- [Docker and GHCR](docs/docker.md)
-- [Legacy interval-accumulator recovery](docs/interval-accumulator-recovery.md)
-- [Native mainnet mining canary](docs/mainnet-canary.md)
-- [Extraction provenance](docs/extraction-provenance.md)
-
-The full development and release qualification gate is:
-
-```bash
-./scripts/check.sh
-```
-
-It requires the additional tools described in
-[Testing and qualification](docs/testing.md).
+- [Mining engine](docs/mining-engine.md)
+- [Mainnet mining canary](docs/mainnet-canary.md)
+- [Production assurance](docs/production-assurance.md)
 
 ## License
 
-Project-authored source is available under the
-[ISC License](LICENSE-ISC). Separately licensed bundled and third-party material
-remains under its original terms; see [Third-party notices](THIRD_PARTY_NOTICES.md).
+Project-authored source is available under the [ISC License](LICENSE-ISC).
+Separately licensed bundled and third-party material remains under its original
+terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
