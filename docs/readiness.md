@@ -218,11 +218,13 @@ measurement, or the full qualification gate. Its immutable tombstone registry
 has a finite 65,536-entry lifetime cap, and later matching outputs are
 deliberately untracked; untrusted registration therefore remains unavailable
 and production availability remains blocked.
-Live marketplace wire advertisement separately awaits active Shakescape V1
-transport/admission, the typed adapter gate, and joined qualification. Exact
-crates.io `hns-rs` `=0.3.0` artifacts are pinned from the published, non-yanked,
-provenance-verified 19-package cohort; that removes source ambiguity but is not
-product or wire-role qualification.
+Live marketplace wire transport and its typed node adapter are installed behind
+exact Shakescape V1 registry/network/genesis admission. Exact crates.io
+`hns-rs =0.4.1` artifacts are pinned from the published, non-yanked,
+provenance-verified 19-package cohort. The remaining gate is joined public
+multi-node/mobile canary qualification, not an absent marketplace adapter.
+HNSR profile `0x0004` is independently qualified as opaque, already-addressed
+session transport and does not provide marketplace discovery by itself.
 
 The focused local evidence is intentionally narrow: the NVMe `hns-consensus`
 `wallet_name_action` filter passed 2 tests with 0 failures and 75 filtered. At

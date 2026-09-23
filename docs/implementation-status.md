@@ -228,12 +228,14 @@ Implemented:
   not a RocksDB reopen, live restart/reorg, adversarial, or full-gate run.
 - A bounded hash-first Shakescape marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
-  strikes, consequential bounded scores/bans, and indexed expiry. Live
-  marketplace wire advertisement remains disabled. Exact crates.io `hns-rs`
-  `=0.3.0` artifacts from the published, non-yanked, provenance-verified
-  19-package cohort are now pinned, but the active peer transport remains
-  Shakescape V1 and no typed marketplace adapter is installed or qualified.
-  No live swap engine is claimed.
+  strikes, consequential bounded scores/bans, and indexed expiry. The active
+  Shakescape V1 peer transport now routes typed name-market and cross-chain
+  messages into the node adapter after exact registry/network/genesis
+  negotiation. Exact crates.io `hns-rs =0.4.1` artifacts are pinned. The
+  independently enabled HNSR `0x0004` role remains opaque byte transport for an
+  already-addressed session; it does not replace marketplace discovery or make
+  an offer trustworthy. Public multi-node canary qualification remains an
+  operational gate, and no custodial or autonomous swap engine is claimed.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup
