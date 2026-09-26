@@ -7242,6 +7242,7 @@ impl NamePageStorage {
                 state.manifest.generation,
                 state.manifest.active_segment,
                 filesystem_limits,
+                NamePageSegmentCleanup::Startup,
             )?;
             validate_name_page_segment_set(
                 &directory,
@@ -8554,6 +8555,7 @@ impl NamePageStorage {
                 self.state.manifest.generation,
                 self.state.manifest.active_segment,
                 production_name_page_filesystem_limits(),
+                NamePageSegmentCleanup::Rollback,
             )?;
             self.file_path = name_page_file_path(
                 &self.directory,
@@ -8675,11 +8677,18 @@ fn validate_name_page_segment_set(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamePageSegmentCleanup {
+    Startup,
+    Rollback,
+}
+
 fn remove_unpublished_name_page_segments(
     directory: &std::path::Path,
     generation: u64,
     active_segment: u32,
     limits: NamePageFilesystemLimits,
+    scope: NamePageSegmentCleanup,
 ) -> Result<()> {
     validate_name_page_active_segment(active_segment, limits)?;
     let mut removed = false;
@@ -8707,7 +8716,12 @@ fn remove_unpublished_name_page_segments(
         let Some((candidate_generation, segment)) = parse_name_page_file_name(&name) else {
             continue;
         };
-        if candidate_generation != generation || segment > active_segment {
+        // A runtime rollback may overlap the background rewrite of the next
+        // generation. Only startup recovery can discard other generations:
+        // there is no in-flight writer after the previous process has exited.
+        if (candidate_generation == generation && segment > active_segment)
+            || (candidate_generation != generation && scope == NamePageSegmentCleanup::Startup)
+        {
             discard.push(entry.path());
         }
     }
@@ -16545,16 +16559,33 @@ mod tests {
         drop(snapshot);
         drop(batch);
 
+        // Model a next-generation background compaction that overlaps the
+        // canonical writer's ordinary rollback.
+        let staged_generation = state_before.manifest.generation + 1;
+        let staged_path = name_page_file_path(&directory, staged_generation, 0);
+        let staged_appender = NamePageAppender::create_new(&staged_path, staged_generation, 0)
+            .expect("create background generation");
+
         pages
             .rollback_uncommitted_tail()
             .expect("roll back unpublished segment seal");
         assert!(!successor_path.exists());
+        assert!(staged_path.exists());
+        staged_appender
+            .filesystem_available_bytes()
+            .expect("background generation remains writable after rollback");
         assert_eq!(pages.file_path, path_before);
         assert_eq!(pages.state, state_before);
         assert_eq!(pages.generation_bytes, pages.committed_generation_bytes);
         assert_eq!(complete_store_image(&store), store_before);
 
         drop(pages);
+        drop(staged_appender);
+        let reopened =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("startup recovers unpublished generation");
+        assert!(!staged_path.exists());
+        drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove seal rollback fixture");
     }
 
