@@ -4,7 +4,12 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
-## 0.3.5 - unreleased
+## 0.3.5 - 2026-09-26 (prerelease)
+
+- Allow up to eight hours for a cold physical audit of authenticated name
+  pages, while retaining the one-hour filesystem recovery deadline. A mainnet
+  run was still validating pages at 77% when the former one-hour audit limit
+  stopped startup; the longer bound preserves the complete audit.
 
 - Remove the arbitrary 10 GB free-space cushion from ordinary node startup,
   name-page publication, validation spill, and segment compaction. Runtime
