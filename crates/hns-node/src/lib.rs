@@ -263,6 +263,10 @@ const fn startup_payload_segment_compaction_min_dead_bytes(native_active_sync: b
     }
 }
 const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(60 * 60);
+// A cold physical audit must read every committed page and can run alongside
+// chain services on a shared disk. Keep its bound distinct from the shorter
+// filesystem recovery deadline so sustained progress does not fail startup.
+const MAX_NAME_PAGE_PHYSICAL_VALIDATION_ELAPSED: Duration = Duration::from_secs(8 * 60 * 60);
 const MAX_NAME_PAGE_COMPACTION_ELAPSED: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED: Duration = Duration::from_secs(10 * 60);
 const NAME_PAGE_VALIDATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -1298,7 +1302,7 @@ fn production_name_page_validation_limits(
         snapshot,
         network,
         MAX_NAME_PAGE_VALIDATION_SPILL_BYTES,
-        now.checked_add(MAX_NAME_PAGE_VALIDATION_ELAPSED)
+        now.checked_add(MAX_NAME_PAGE_PHYSICAL_VALIDATION_ELAPSED)
             .unwrap_or(now),
     )
 }
@@ -16891,6 +16895,7 @@ mod tests {
     fn compact_generation_validation_and_compaction_deadlines_are_distinct() {
         let store = StoreHandle::memory();
         let snapshot = store.snapshot().expect("deadline snapshot");
+        let validation_started = Instant::now();
         let validation_limits = production_name_page_validation_limits(&snapshot, Network::Regtest)
             .expect("validation limits");
         let compaction_limits = production_name_page_compaction_filesystem_limits();
@@ -16898,6 +16903,10 @@ mod tests {
         assert_eq!(
             MAX_NAME_PAGE_VALIDATION_ELAPSED,
             Duration::from_secs(60 * 60),
+        );
+        assert_eq!(
+            MAX_NAME_PAGE_PHYSICAL_VALIDATION_ELAPSED,
+            Duration::from_secs(8 * 60 * 60),
         );
         assert_eq!(
             MAX_NAME_PAGE_COMPACTION_ELAPSED,
@@ -16908,8 +16917,14 @@ mod tests {
             Duration::from_secs(10 * 60),
         );
         assert!(
-            validation_limits.deadline > Instant::now(),
-            "validation deadline should remain in the future",
+            validation_limits.deadline
+                >= validation_started + MAX_NAME_PAGE_PHYSICAL_VALIDATION_ELAPSED,
+            "physical validation should receive its full audit budget",
+        );
+        assert!(
+            validation_limits.deadline
+                <= Instant::now() + MAX_NAME_PAGE_PHYSICAL_VALIDATION_ELAPSED,
+            "physical validation should not exceed its audit budget",
         );
         assert!(
             compaction_limits.deadline > validation_limits.deadline,
