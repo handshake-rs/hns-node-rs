@@ -96,7 +96,7 @@ class VerifyLockTests(unittest.TestCase):
         }
         primitive_local = {
             "name": "hns-primitives",
-            "version": "0.3.5",
+            "version": "0.3.6",
         }
         self.verify(
             [canonical_package(), primitive_registry, primitive_local],
@@ -108,7 +108,7 @@ class VerifyLockTests(unittest.TestCase):
                 ("hns-covenants", "0.3.0"): CHECKSUM,
                 ("hns-primitives", "0.3.0"): primitive_checksum,
             },
-            expected_local_name_collisions={"hns-primitives": "0.3.5"},
+            expected_local_name_collisions={"hns-primitives": "0.3.6"},
         )
 
 
