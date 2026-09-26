@@ -1119,9 +1119,9 @@ dependencies = [
 
 [[package]]
 name = "hns-chain"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-store",
  "serde",
  "thiserror",
@@ -1144,10 +1144,10 @@ dependencies = [
 
 [[package]]
 name = "hns-consensus"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-goosig",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-secp256k1",
  "openssl",
  "serde",
@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "hns-goosig"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "cc",
  "thiserror",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "hns-journaled-namespace"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-rollback-journal",
  "hns-store",
@@ -1276,10 +1276,10 @@ dependencies = [
 
 [[package]]
 name = "hns-mempool"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-consensus",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "rand 0.9.5",
  "serde",
  "serde_json",
@@ -1288,11 +1288,11 @@ dependencies = [
 
 [[package]]
 name = "hns-mining"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-consensus",
  "hns-mempool",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "hns-node"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -1313,7 +1313,7 @@ dependencies = [
  "hns-mempool",
  "hns-mining",
  "hns-p2p",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-primitives 0.4.1",
  "hns-rpc",
  "hns-shakescape-market-relay",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "hns-p2p"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chacha20poly1305",
  "hns-consensus",
@@ -1364,7 +1364,7 @@ dependencies = [
  "hns-marketplace-protocol",
  "hns-odoh-protocol",
  "hns-p2p-experimental",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-secp256k1",
  "rand 0.9.5",
  "serde",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "hns-primitives"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "blake2",
  "serde",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "hns-resolver"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1432,7 +1432,7 @@ dependencies = [
  "hickory-server",
  "hns-consensus",
  "hns-covenants 0.3.1",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-rpc",
  "ipnet",
  "libc",
@@ -1460,11 +1460,11 @@ dependencies = [
 
 [[package]]
 name = "hns-rpc"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-chain",
  "hns-mempool",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "serde",
  "serde_json",
  "thiserror",
@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "hns-secp256k1"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "cc",
  "thiserror",
@@ -1513,19 +1513,19 @@ dependencies = [
 
 [[package]]
 name = "hns-shakescape-market-relay"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "thiserror",
 ]
 
 [[package]]
 name = "hns-state"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-chain",
  "hns-consensus",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-store",
  "hns-urkel",
  "serde",
@@ -1535,10 +1535,10 @@ dependencies = [
 
 [[package]]
 name = "hns-store"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "fs4",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-urkel",
  "rocksdb",
  "serde",
@@ -1565,11 +1565,11 @@ dependencies = [
 
 [[package]]
 name = "hns-sync"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-chain",
  "hns-p2p",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-store",
  "serde",
  "thiserror",
@@ -1578,9 +1578,9 @@ dependencies = [
 
 [[package]]
 name = "hns-testkit"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "serde",
  "serde_json",
  "thiserror",
@@ -1614,10 +1614,10 @@ dependencies = [
 
 [[package]]
 name = "hns-urkel"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "ahash",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "serde",
  "serde_json",
  "thiserror",
@@ -1625,11 +1625,11 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-index"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "hns-consensus",
  "hns-covenants 0.3.1",
- "hns-primitives 0.3.5",
+ "hns-primitives 0.3.6",
  "hns-secp256k1",
  "hns-state",
  "hns-store",

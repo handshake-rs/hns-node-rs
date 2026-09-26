@@ -4,7 +4,7 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
-## 0.3.5 - 2026-09-26 (prerelease)
+## 0.3.6 - 2026-09-26 (prerelease)
 
 - Allow up to eight hours for a cold physical audit of authenticated name
   pages, while retaining the one-hour filesystem recovery deadline. A mainnet
@@ -152,7 +152,7 @@ qualification or authorize deployment.
 
 The current source remains a release candidate until its consolidated current-
 head gate and production-assurance evidence pass. Existing v0.3.4 container
-examples and tags remain historical and are not relabeled as v0.3.5 artifacts.
+examples and tags remain historical and are not relabeled as v0.3.6 artifacts.
 
 ## 0.3.4 - 2026-08-02
 

@@ -17,7 +17,7 @@ default.
 
 ## Current compatibility
 
-- Node source line: `0.3.5`
+- Node source line: `0.3.6`
 - Rust toolchain: `1.97.1`
 - Handshake protocol crates: exact `hns-rs 0.4.1`
 - ShakeScape Experimental V1 registry fingerprint:
