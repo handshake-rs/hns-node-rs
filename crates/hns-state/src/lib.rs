@@ -504,6 +504,53 @@ pub struct StateSummary {
     /// HSD's complete canonical checkpoint plan.
     pub historical_validation: HistoricalValidationPlan,
     pub validation: StateValidationSummary,
+    /// Diagnostic timings only; they do not participate in state transitions.
+    #[serde(skip)]
+    pub timings: StateConnectTimings,
+}
+
+/// Wall-clock costs within one contextual block connection. Script and name
+/// covenant times are subsets of `transactions_micros`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StateConnectTimings {
+    pub setup_micros: u64,
+    pub transactions_micros: u64,
+    pub scripts_micros: u64,
+    pub name_covenants_micros: u64,
+    pub post_transactions_micros: u64,
+    pub name_changes_micros: u64,
+    pub name_tree_commit_micros: u64,
+    pub undo_micros: u64,
+}
+
+impl StateConnectTimings {
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            setup_micros: self.setup_micros.saturating_add(other.setup_micros),
+            transactions_micros: self
+                .transactions_micros
+                .saturating_add(other.transactions_micros),
+            scripts_micros: self.scripts_micros.saturating_add(other.scripts_micros),
+            name_covenants_micros: self
+                .name_covenants_micros
+                .saturating_add(other.name_covenants_micros),
+            post_transactions_micros: self
+                .post_transactions_micros
+                .saturating_add(other.post_transactions_micros),
+            name_changes_micros: self
+                .name_changes_micros
+                .saturating_add(other.name_changes_micros),
+            name_tree_commit_micros: self
+                .name_tree_commit_micros
+                .saturating_add(other.name_tree_commit_micros),
+            undo_micros: self.undo_micros.saturating_add(other.undo_micros),
+        }
+    }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2614,6 +2661,8 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
     transaction_ids: &BlockTransactionIds<'_>,
     prepared_utxos: Option<&PreparedBlockUtxos>,
 ) -> Result<StateSummary, StateError> {
+    let mut timings = StateConnectTimings::default();
+    let setup_started = Instant::now();
     if !std::ptr::eq(request.block, transaction_ids.block()) {
         return Err(StateError::Codec(
             "transaction IDs were prepared for a different block borrow".to_owned(),
@@ -2743,6 +2792,8 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
         &mut name_state_changes,
         &issuance.claims,
     )?;
+    timings.setup_micros = elapsed_micros(setup_started);
+    let transactions_started = Instant::now();
 
     for (transaction_index, (transaction, txid)) in request
         .block
@@ -2786,7 +2837,11 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 }
             }
             if !assumes(route.scripts) {
+                let scripts_started = Instant::now();
                 verify_transaction_inputs(services.input_verifier, transaction, input_coins)?;
+                timings.scripts_micros = timings
+                    .scripts_micros
+                    .saturating_add(elapsed_micros(scripts_started));
             }
             if !assumes(route.covenant_links) {
                 verify_transaction_covenant_links(transaction, input_coins)?;
@@ -2810,6 +2865,7 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 Some(input_value - output_value)
             };
 
+            let name_covenants_started = Instant::now();
             apply_transaction_name_covenants_prepared(
                 snapshot,
                 transaction,
@@ -2821,6 +2877,9 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 false,
                 prepared_utxos,
             )?;
+            timings.name_covenants_micros = timings
+                .name_covenants_micros
+                .saturating_add(elapsed_micros(name_covenants_started));
 
             stage_transaction_spends(batch, &mut pending_created, &mut spent_coins, resolved)?;
             if let Some(fee) = fee {
@@ -2829,6 +2888,7 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                     .ok_or(StateError::FeeValueOverflow)?;
             }
         } else {
+            let name_covenants_started = Instant::now();
             apply_transaction_name_covenants_prepared(
                 snapshot,
                 transaction,
@@ -2840,6 +2900,9 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 true,
                 prepared_utxos,
             )?;
+            timings.name_covenants_micros = timings
+                .name_covenants_micros
+                .saturating_add(elapsed_micros(name_covenants_started));
         }
 
         for (output_index, output) in transaction.outputs.iter().enumerate() {
@@ -2881,6 +2944,8 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
             created_coins.push(outpoint);
         }
     }
+    timings.transactions_micros = elapsed_micros(transactions_started);
+    let post_transactions_started = Instant::now();
 
     // Pending spends already remove their coins from this map in O(1). Prune
     // the creation-order list once per block instead of rescanning it for
@@ -2901,6 +2966,8 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
         }
     }
 
+    timings.post_transactions_micros = elapsed_micros(post_transactions_started);
+    let name_changes_started = Instant::now();
     let mut name_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
     for name_hash in &name_state_changes.changed {
         let state = name_state_changes.current.get(name_hash).ok_or_else(|| {
@@ -2929,7 +2996,9 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
         interval_boundary,
         name_overrides.keys().copied(),
     )?;
+    timings.name_changes_micros = elapsed_micros(name_changes_started);
 
+    let name_tree_commit_started = Instant::now();
     let resulting_tree_root = if interval_boundary {
         let mut interval_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
         for name_hash in accumulator_session.names()? {
@@ -2949,6 +3018,8 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
         inherited_committed_tree_root
     };
     accumulator_session.finish_block(interval_boundary)?;
+    timings.name_tree_commit_micros = elapsed_micros(name_tree_commit_started);
+    let undo_started = Instant::now();
     let resulting_committed_tree_root = resulting_tree_root;
     batch.put(
         ColumnFamily::Meta,
@@ -3011,6 +3082,7 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
             },
         )?;
     }
+    timings.undo_micros = elapsed_micros(undo_started);
 
     Ok(StateSummary {
         coins_created: undo.created_coins.len(),
@@ -3033,6 +3105,7 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
             name_state_connected: true,
             tree_root_valid: true,
         },
+        timings,
     })
 }
 
@@ -4274,6 +4347,7 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
             tree_root_valid: true,
             ..StateValidationSummary::default()
         },
+        timings: StateConnectTimings::default(),
     })
 }
 

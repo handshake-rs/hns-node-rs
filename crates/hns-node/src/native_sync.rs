@@ -1146,12 +1146,21 @@ pub struct NativeSyncDiagnostics {
     /// Consensus/index staging inside the last multi-block atomic activation.
     #[serde(default)]
     pub active_state_last_block_staging_micros: u64,
+    /// Stored-block authentication before contextual state connection.
+    #[serde(default)]
+    pub active_state_last_stored_validation_micros: u64,
+    /// Deployment and prepared-UTXO work before wallet and consensus staging.
+    #[serde(default)]
+    pub active_state_last_pre_state_micros: u64,
     /// Wallet-derived index construction within the last activation.
     #[serde(default)]
     pub active_state_last_wallet_index_micros: u64,
     /// Contextual consensus/UTXO/name-state construction within the last activation.
     #[serde(default)]
     pub active_state_last_consensus_state_micros: u64,
+    /// Subphases of contextual state connection in the last committed slice.
+    #[serde(default)]
+    pub active_state_last_state_timings: hns_state::StateConnectTimings,
     /// Contextual grouped UTXO resolution inside block staging.
     #[serde(default)]
     pub active_state_last_utxo_prefetch_micros: u64,
@@ -1179,6 +1188,17 @@ pub struct NativeSyncDiagnostics {
     pub active_state_last_worker_micros: u64,
     pub active_state_max_preparation_in_flight: usize,
     pub active_state_stale_retries: u64,
+    /// Discarded atomic-effect attempts before the last committed slice.
+    #[serde(default)]
+    pub active_state_last_budget_retries: u64,
+    #[serde(default)]
+    pub active_state_last_budget_retry_micros: u64,
+    #[serde(default)]
+    pub active_state_total_budget_retries: u64,
+    #[serde(default)]
+    pub active_state_total_budget_retry_micros: u64,
+    #[serde(default)]
+    pub active_state_total_prefix_truncations: u64,
     /// Stable canonical reads which observed an overlapping writer generation.
     #[serde(default)]
     pub canonical_read_contentions: u64,
@@ -1265,8 +1285,11 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) planning_micros: u64,
     pub(super) state_commit_micros: u64,
     pub(super) block_staging_micros: u64,
+    pub(super) stored_validation_micros: u64,
+    pub(super) pre_state_micros: u64,
     pub(super) wallet_index_micros: u64,
     pub(super) consensus_state_micros: u64,
+    pub(super) state_timings: hns_state::StateConnectTimings,
     pub(super) utxo_prefetch_micros: u64,
     pub(super) utxos_prefetched: usize,
     pub(super) name_page_prepare_micros: u64,
@@ -1285,6 +1308,8 @@ struct ActiveStatePreparationMetrics {
     aggregate_worker_micros: u64,
     maximum_in_flight: usize,
     stale_retries: usize,
+    budget_retries: u64,
+    budget_retry_micros: u64,
 }
 
 #[derive(Debug)]
@@ -5400,8 +5425,11 @@ impl NodeService {
                     planning_micros,
                     state_commit_micros,
                     block_staging_micros: reorg.timings.block_staging_micros,
+                    stored_validation_micros: reorg.timings.stored_validation_micros,
+                    pre_state_micros: reorg.timings.pre_state_micros,
                     wallet_index_micros: reorg.timings.wallet_index_micros,
                     consensus_state_micros: reorg.timings.consensus_state_micros,
+                    state_timings: reorg.timings.state_timings,
                     utxo_prefetch_micros: reorg.timings.utxo_prefetch_micros,
                     utxos_prefetched: reorg.timings.utxos_prefetched,
                     name_page_prepare_micros: reorg.timings.name_page_prepare_micros,
@@ -8760,6 +8788,10 @@ fn accumulate_active_state_preparation(
         .aggregate_worker_micros
         .saturating_add(attempt.aggregate_worker_micros);
     total.maximum_in_flight = total.maximum_in_flight.max(attempt.maximum_in_flight);
+    total.budget_retries = total.budget_retries.saturating_add(attempt.budget_retries);
+    total.budget_retry_micros = total
+        .budget_retry_micros
+        .saturating_add(attempt.budget_retry_micros);
 }
 
 type ActiveStateValidator =
@@ -8950,6 +8982,8 @@ async fn prepare_native_active_state_plan_with_validator(
             aggregate_worker_micros,
             maximum_in_flight: maximum_in_flight.load(Ordering::Acquire),
             stale_retries: 0,
+            budget_retries: 0,
+            budget_retry_micros: 0,
         },
         workload,
     })
@@ -9006,12 +9040,19 @@ fn merge_active_state_outcomes(
     first.block_staging_micros = first
         .block_staging_micros
         .saturating_add(second.block_staging_micros);
+    first.stored_validation_micros = first
+        .stored_validation_micros
+        .saturating_add(second.stored_validation_micros);
+    first.pre_state_micros = first
+        .pre_state_micros
+        .saturating_add(second.pre_state_micros);
     first.wallet_index_micros = first
         .wallet_index_micros
         .saturating_add(second.wallet_index_micros);
     first.consensus_state_micros = first
         .consensus_state_micros
         .saturating_add(second.consensus_state_micros);
+    first.state_timings = first.state_timings.saturating_add(second.state_timings);
     first.utxo_prefetch_micros = first
         .utxo_prefetch_micros
         .saturating_add(second.utxo_prefetch_micros);
@@ -9054,6 +9095,7 @@ async fn execute_native_active_state_slice_with_validator(
     let mut stale_retries = 0usize;
     let mut preparation = ActiveStatePreparationMetrics::default();
     loop {
+        let attempt_started = StdInstant::now();
         let plan = match node
             .native_sync_plan_stored_state_with_hint(attempt_limit, stored_tip_hint.as_ref())
         {
@@ -9138,6 +9180,7 @@ async fn execute_native_active_state_slice_with_validator(
                 if outcome.contextual_failure.is_none() && outcome.budget_limited_connect.is_none()
                 {
                     if let Some(task) = second_task.take() {
+                        let second_attempt_started = StdInstant::now();
                         let mut buffered = task
                             .await
                             .context("second active-state preparation buffer panicked")??;
@@ -9180,6 +9223,15 @@ async fn execute_native_active_state_slice_with_validator(
                                         limit,
                                         actual,
                                     })) => {
+                                        preparation.budget_retries =
+                                            preparation.budget_retries.saturating_add(1);
+                                        preparation.budget_retry_micros =
+                                            preparation.budget_retry_micros.saturating_add(
+                                                u64::try_from(
+                                                    second_attempt_started.elapsed().as_micros(),
+                                                )
+                                                .unwrap_or(u64::MAX),
+                                            );
                                         tracing::warn!(
                                             retry_connect,
                                             limit,
@@ -9230,6 +9282,10 @@ async fn execute_native_active_state_slice_with_validator(
                 limit,
                 actual,
             })) => {
+                preparation.budget_retries = preparation.budget_retries.saturating_add(1);
+                preparation.budget_retry_micros = preparation.budget_retry_micros.saturating_add(
+                    u64::try_from(attempt_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
                 if let Some(task) = second_task.take() {
                     task.abort();
                     let _ = task.await;
@@ -9397,8 +9453,11 @@ async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
             state.active_state_last_planning_micros = outcome.planning_micros;
             state.active_state_last_commit_micros = outcome.state_commit_micros;
             state.active_state_last_block_staging_micros = outcome.block_staging_micros;
+            state.active_state_last_stored_validation_micros = outcome.stored_validation_micros;
+            state.active_state_last_pre_state_micros = outcome.pre_state_micros;
             state.active_state_last_wallet_index_micros = outcome.wallet_index_micros;
             state.active_state_last_consensus_state_micros = outcome.consensus_state_micros;
+            state.active_state_last_state_timings = outcome.state_timings;
             state.active_state_last_utxo_prefetch_micros = outcome.utxo_prefetch_micros;
             state.active_state_last_utxos_prefetched = outcome.utxos_prefetched;
             state.active_state_last_name_page_prepare_micros = outcome.name_page_prepare_micros;
@@ -9417,6 +9476,19 @@ async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
             state.active_state_stale_retries = state
                 .active_state_stale_retries
                 .saturating_add(preparation.stale_retries as u64);
+            state.active_state_last_budget_retries = preparation.budget_retries;
+            state.active_state_last_budget_retry_micros = preparation.budget_retry_micros;
+            state.active_state_total_budget_retries = state
+                .active_state_total_budget_retries
+                .saturating_add(preparation.budget_retries);
+            state.active_state_total_budget_retry_micros = state
+                .active_state_total_budget_retry_micros
+                .saturating_add(preparation.budget_retry_micros);
+            if outcome.budget_limited_connect.is_some() {
+                state.active_state_total_prefix_truncations = state
+                    .active_state_total_prefix_truncations
+                    .saturating_add(1);
+            }
             state.active_state_last_transactions = outcome.workload.transactions;
             state.active_state_last_non_coinbase_inputs = outcome.workload.non_coinbase_inputs;
             state.active_state_last_outputs = outcome.workload.outputs;

@@ -6498,8 +6498,10 @@ struct IndexStatusUpdate {
 struct StagedConnect {
     current: StagedIndexRecord,
     pruned: Vec<IndexStatusUpdate>,
+    pre_state_micros: u64,
     wallet_index_micros: u64,
     consensus_state_micros: u64,
+    state_timings: hns_state::StateConnectTimings,
 }
 
 #[derive(Debug)]
@@ -6843,8 +6845,11 @@ struct NodeReorgMutation {
 #[derive(Clone, Copy, Debug, Default)]
 struct NodeReorgTimings {
     block_staging_micros: u64,
+    stored_validation_micros: u64,
+    pre_state_micros: u64,
     wallet_index_micros: u64,
     consensus_state_micros: u64,
+    state_timings: hns_state::StateConnectTimings,
     utxo_prefetch_micros: u64,
     utxos_prefetched: usize,
     name_page_prepare_micros: u64,
@@ -12408,6 +12413,7 @@ impl NodeState {
         state_effects: Option<&PreparedBlockStateEffects>,
         wallet_effects: Option<&PreparedWalletIndexEffects>,
     ) -> Result<StagedConnect> {
+        let pre_state_started = Instant::now();
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
@@ -12462,6 +12468,8 @@ impl NodeState {
                 (transaction_ids, prepared)
             }
         };
+        let pre_state_micros =
+            u64::try_from(pre_state_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let wallet_index_started = Instant::now();
         match wallet_effects {
             Some(effects) => stage_connect_with_prepared_effects(
@@ -12603,8 +12611,10 @@ impl NodeState {
                 header: header_record,
             },
             pruned,
+            pre_state_micros,
             wallet_index_micros,
             consensus_state_micros,
+            state_timings: state_summary.timings,
         })
     }
 
@@ -13021,7 +13031,10 @@ impl NodeState {
         let mut index_updates = Vec::new();
         let mut truncated_direct_connect_limit = None;
         let mut wallet_index_micros = 0_u64;
+        let mut stored_validation_micros = 0_u64;
+        let mut pre_state_micros = 0_u64;
         let mut consensus_state_micros = 0_u64;
+        let mut state_timings = hns_state::StateConnectTimings::default();
         let block_staging_started = Instant::now();
 
         for disconnect in request.disconnect {
@@ -13081,6 +13094,7 @@ impl NodeState {
             let stored_record = load_block_index_record(&staged, &hash)
                 .map_err(ChainActivationFailure::Internal)?;
             let persist_raw_body = stored_record.is_none();
+            let stored_validation_started = Instant::now();
             let validated = match stored_record.as_ref() {
                 Some(stored_record)
                     if matches!(connect.validation, ImportValidationPolicy::Strict) =>
@@ -13110,6 +13124,9 @@ impl NodeState {
                     }),
             }
             .map_err(ChainActivationFailure::Internal)?;
+            stored_validation_micros = stored_validation_micros.saturating_add(
+                u64::try_from(stored_validation_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
             name_accumulator
                 .begin_checkpoint()
                 .map_err(anyhow::Error::new)
@@ -13222,8 +13239,10 @@ impl NodeState {
                 .map_err(ChainActivationFailure::Internal)?;
             wallet_index_micros =
                 wallet_index_micros.saturating_add(staged_connect.wallet_index_micros);
+            pre_state_micros = pre_state_micros.saturating_add(staged_connect.pre_state_micros);
             consensus_state_micros =
                 consensus_state_micros.saturating_add(staged_connect.consensus_state_micros);
+            state_timings = state_timings.saturating_add(staged_connect.state_timings);
             let previous = previous_block_records.get(&hash).cloned().ok_or_else(|| {
                 ChainActivationFailure::Internal(anyhow::anyhow!(
                     "reorganization cache plan omitted block {}",
@@ -13421,8 +13440,11 @@ impl NodeState {
             truncated_direct_connect_limit,
             timings: NodeReorgTimings {
                 block_staging_micros,
+                stored_validation_micros,
+                pre_state_micros,
                 wallet_index_micros,
                 consensus_state_micros,
+                state_timings,
                 utxo_prefetch_micros,
                 utxos_prefetched,
                 name_page_prepare_micros,

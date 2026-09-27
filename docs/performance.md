@@ -40,6 +40,17 @@ Sampler schema 3 records:
 - stored-to-active buffer depth, pending and inflight body work, active stalls,
   ready peers, failures, and unavailable evidence.
 
+The live `/api/v1/native-sync` snapshot also exposes
+`active_state_last_state_timings` for contextual setup, transactions, scripts,
+name covenants, post-transaction work, name changes, interval tree commits, and
+undo construction. Script and name-covenant times are subsets of transaction
+time; these fields must not all be added together. Stored-block validation and
+pre-state preparation have separate timers. Last-slice and cumulative budget
+retry counts and wall time report discarded attempts, while the prefix
+truncation counter records a committed prefix whose next block exceeded the
+atomic-effect budget. These timings describe completed slices and do not time
+an activation that fails terminally before publication.
+
 ### Fast in-memory smoke
 
 The default scenario is a deterministic, fast local smoke test:
