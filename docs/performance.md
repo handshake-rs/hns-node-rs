@@ -54,6 +54,15 @@ retry counts and wall time report discarded attempts, while the prefix
 truncation counter records a committed prefix whose next block exceeded the
 atomic-effect budget. These timings describe completed slices and do not time
 an activation that fails terminally before publication.
+`active_state_last_staged_effect_bytes` and
+`active_state_last_staged_effect_limit` report the busiest committed atomic
+publication in a slice. The batch tuner waits for four full slices before
+growing and now requires the busiest publication to use at most 60% of its
+budget; a 50% growth step then projects to at most 90% if workload density
+remains similar. This is a heuristic, not a guarantee against a heavier block.
+One-block direct replay has no aggregate effect charge because it must remain
+live after an oversized batch; the tuner still probes a larger slice after
+four such successful blocks.
 
 ### Fast in-memory smoke
 

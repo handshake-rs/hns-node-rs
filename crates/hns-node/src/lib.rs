@@ -6857,6 +6857,8 @@ struct NodeReorgTimings {
     name_page_path_records_read: u64,
     name_page_path_cache_hits: u64,
     store_publication_micros: u64,
+    staged_effect_bytes: u64,
+    staged_effect_limit: u64,
 }
 
 #[derive(Debug)]
@@ -13418,19 +13420,22 @@ impl NodeState {
             {
                 pages.commit_prepared(prepared);
             }
-            Ok(
+            Ok((
                 u64::try_from(store_publication_started.elapsed().as_micros())
                     .unwrap_or(u64::MAX),
-            )
+                meter.consumed,
+                meter.limit,
+            ))
         });
-        let store_publication_micros = match publication_result {
-            Ok(micros) => micros,
-            Err(error) => {
-                self.rollback_uncommitted_name_page_tail_if_safe()
-                    .map_err(ChainActivationFailure::Internal)?;
-                return Err(ChainActivationFailure::Internal(error));
-            }
-        };
+        let (store_publication_micros, staged_effect_bytes, staged_effect_limit) =
+            match publication_result {
+                Ok(usage) => usage,
+                Err(error) => {
+                    self.rollback_uncommitted_name_page_tail_if_safe()
+                        .map_err(ChainActivationFailure::Internal)?;
+                    return Err(ChainActivationFailure::Internal(error));
+                }
+            };
 
         Ok(NodeReorgMutation {
             summary,
@@ -13452,6 +13457,8 @@ impl NodeState {
                 name_page_path_records_read: name_page_path_read_stats.records,
                 name_page_path_cache_hits: name_page_path_read_stats.cache_hits,
                 store_publication_micros,
+                staged_effect_bytes,
+                staged_effect_limit,
             },
         })
     }
@@ -22604,6 +22611,11 @@ mod tests {
                 .native_sync_connect_stored_state(320)
                 .expect("direct connector slice");
             assert!(outcome.connected > 0);
+            if outcome.connected > 1 {
+                assert!(outcome.staged_effect_bytes > 0);
+                assert_eq!(outcome.staged_effect_limit, MAX_REORG_STAGED_EFFECT_BYTES);
+                assert!(outcome.staged_effect_bytes <= outcome.staged_effect_limit);
+            }
             assert_eq!(outcome.disconnected, 0);
             let first_height = Height::try_from(connected).expect("fixture height");
             let last_height =
@@ -22788,6 +22800,8 @@ mod tests {
             assert_eq!(diagnostics.active_state_last_non_coinbase_inputs, 0);
             assert_eq!(diagnostics.active_state_last_outputs, 1);
             assert_eq!(diagnostics.active_state_last_name_actions, 0);
+            assert_eq!(diagnostics.active_state_last_staged_effect_bytes, 0);
+            assert_eq!(diagnostics.active_state_last_staged_effect_limit, 0);
             assert!(
                 diagnostics.active_state_max_slice_millis
                     >= diagnostics.active_state_last_slice_millis

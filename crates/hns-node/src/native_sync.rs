@@ -1182,6 +1182,12 @@ pub struct NativeSyncDiagnostics {
     /// Durable database publication and page-state finalization in that activation.
     #[serde(default)]
     pub active_state_last_store_publication_micros: u64,
+    /// Final charged bytes for the busiest atomic publication in the last slice.
+    #[serde(default)]
+    pub active_state_last_staged_effect_bytes: u64,
+    /// Effect budget used for that publication.
+    #[serde(default)]
+    pub active_state_last_staged_effect_limit: u64,
     pub active_state_last_post_commit_micros: u64,
     pub active_state_last_prepared_blocks: usize,
     pub active_state_last_preparation_micros: u64,
@@ -1297,6 +1303,8 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) name_page_path_records_read: u64,
     pub(super) name_page_path_cache_hits: u64,
     pub(super) store_publication_micros: u64,
+    pub(super) staged_effect_bytes: u64,
+    pub(super) staged_effect_limit: u64,
     pub(super) post_commit_micros: u64,
     pub(super) workload: ActiveStateWorkload,
 }
@@ -1442,6 +1450,9 @@ impl ActiveStateBatchTuner {
     // linear 12.5% growth left IBD at one-to-four blocks per durable commit
     // for minutes after one unusually expensive name-state block.
     const GROWTH_SUCCESS_STREAK: usize = 4;
+    // A 50% increase at 60% utilization projects to 90% of the budget,
+    // leaving room for ordinary variation between adjacent blocks.
+    const GROWTH_MAX_BUDGET_PERCENT: u64 = 60;
 
     fn new(initial_connect_limit: usize) -> Self {
         let maximum_limit = initial_connect_limit.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
@@ -1460,8 +1471,16 @@ impl ActiveStateBatchTuner {
         self.next_limit = retry_connect;
     }
 
-    fn record_success(&mut self, connected: usize) {
-        if connected < self.next_limit || self.next_limit == self.maximum_limit {
+    fn record_success(&mut self, connected: usize, charged: u64, limit: u64) {
+        if connected < self.next_limit
+            || self.next_limit == self.maximum_limit
+            // One-block direct replay bypasses the aggregate effect meter
+            // so it can always make progress after an oversized slice.
+            || (limit == 0 && connected != 1)
+            || (limit != 0
+                && (charged as u128) * 100
+                    > (limit as u128) * (Self::GROWTH_MAX_BUDGET_PERCENT as u128))
+        {
             self.successful_full_slices = 0;
             return;
         }
@@ -3296,7 +3315,11 @@ impl NodeService {
                 Ok(startup_completed) => {
                     active_state_batch_tuner
                         .record_budget_retry(startup_completed.next_connect_limit);
-                    active_state_batch_tuner.record_success(startup_completed.outcome.connected);
+                    active_state_batch_tuner.record_success(
+                        startup_completed.outcome.connected,
+                        startup_completed.outcome.staged_effect_bytes,
+                        startup_completed.outcome.staged_effect_limit,
+                    );
                     startup_completed
                         .outcome
                         .contextual_failure
@@ -3435,9 +3458,14 @@ impl NodeService {
                             diagnostics: &diagnostics,
                             diagnostic_rpc: &diagnostic_rpc,
                         };
-                        let (next_connect_limit, connected_blocks) = active_state_completion
+                        let (next_connect_limit, connected_blocks, charged, limit) = active_state_completion
                             .as_ref()
-                            .map(|completed| (completed.next_connect_limit, completed.outcome.connected))
+                            .map(|completed| (
+                                completed.next_connect_limit,
+                                completed.outcome.connected,
+                                completed.outcome.staged_effect_bytes,
+                                completed.outcome.staged_effect_limit,
+                            ))
                             .expect("active-state completion remains retained");
                         let completion_result = {
                             let completed = active_state_completion
@@ -3459,7 +3487,7 @@ impl NodeService {
                                 // fallible deferred-orphan bookkeeping so a
                                 // terminal shutdown cannot publish it twice.
                                 active_state_batch_tuner.record_budget_retry(next_connect_limit);
-                                active_state_batch_tuner.record_success(connected_blocks);
+                                active_state_batch_tuner.record_success(connected_blocks, charged, limit);
                                 let completed = active_state_completion
                                     .take()
                                     .expect("published active-state completion remains retained");
@@ -5437,6 +5465,8 @@ impl NodeService {
                     name_page_path_records_read: reorg.timings.name_page_path_records_read,
                     name_page_path_cache_hits: reorg.timings.name_page_path_cache_hits,
                     store_publication_micros: reorg.timings.store_publication_micros,
+                    staged_effect_bytes: reorg.timings.staged_effect_bytes,
+                    staged_effect_limit: reorg.timings.staged_effect_limit,
                     post_commit_micros,
                     workload: committed_workload,
                 }))
@@ -9074,6 +9104,14 @@ fn merge_active_state_outcomes(
     first.store_publication_micros = first
         .store_publication_micros
         .saturating_add(second.store_publication_micros);
+    if second.staged_effect_limit != 0
+        && (first.staged_effect_limit == 0
+            || (second.staged_effect_bytes as u128) * (first.staged_effect_limit as u128)
+                > (first.staged_effect_bytes as u128) * (second.staged_effect_limit as u128))
+    {
+        first.staged_effect_bytes = second.staged_effect_bytes;
+        first.staged_effect_limit = second.staged_effect_limit;
+    }
     first.post_commit_micros = first
         .post_commit_micros
         .saturating_add(second.post_commit_micros);
@@ -9466,6 +9504,8 @@ async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
                 outcome.name_page_path_records_read;
             state.active_state_last_name_page_path_cache_hits = outcome.name_page_path_cache_hits;
             state.active_state_last_store_publication_micros = outcome.store_publication_micros;
+            state.active_state_last_staged_effect_bytes = outcome.staged_effect_bytes;
+            state.active_state_last_staged_effect_limit = outcome.staged_effect_limit;
             state.active_state_last_post_commit_micros = outcome.post_commit_micros;
             state.active_state_last_prepared_blocks = preparation.blocks;
             state.active_state_last_preparation_micros = preparation.wall_micros;
@@ -11854,18 +11894,18 @@ mod tests {
             // Production records the completed attempt limit before recording
             // its successful connection count.
             tuner.record_budget_retry(1);
-            tuner.record_success(1);
+            tuner.record_success(1, 0, 100);
             assert_eq!(tuner.next_limit, 1);
         }
 
         tuner.record_budget_retry(1);
-        tuner.record_success(1);
+        tuner.record_success(1, 0, 100);
         assert_eq!(tuner.next_limit, 2);
 
         // If the probe still exceeds the atomic budget, returning to one
         // block must not immediately schedule another two-block probe.
         tuner.record_budget_retry(1);
-        tuner.record_success(1);
+        tuner.record_success(1, 0, 100);
         assert_eq!(tuner.next_limit, 1);
     }
 
@@ -11874,9 +11914,59 @@ mod tests {
         let mut tuner = ActiveStateBatchTuner::new(8);
         for _ in 0..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK {
             tuner.record_budget_retry(8);
-            tuner.record_success(7);
+            tuner.record_success(7, 0, 100);
         }
         assert_eq!(tuner.next_limit, 8);
+    }
+
+    #[test]
+    fn active_state_batch_tuner_uses_committed_effect_headroom() {
+        let mut tuner = ActiveStateBatchTuner::new(32);
+        tuner.record_budget_retry(8);
+        for _ in 0..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK * 2 {
+            tuner.record_success(8, 61, 100);
+        }
+        assert_eq!(tuner.next_limit, 8);
+
+        for _ in 0..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK {
+            tuner.record_success(8, 60, 100);
+        }
+        assert_eq!(tuner.next_limit, 12);
+        // Missing usage must never be treated as spare capacity.
+        for _ in 0..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK {
+            tuner.record_success(12, 0, 0);
+        }
+        assert_eq!(tuner.next_limit, 12);
+    }
+
+    #[test]
+    fn active_state_batch_tuner_recovers_from_single_block_direct_fallback() {
+        let mut tuner = ActiveStateBatchTuner::new(32);
+        tuner.record_budget_retry(1);
+        for _ in 0..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK {
+            tuner.record_success(1, 0, 0);
+        }
+        assert_eq!(tuner.next_limit, 2);
+    }
+
+    #[test]
+    fn merged_active_state_slice_keeps_the_busier_effect_budget() {
+        let first = ActiveStateConnectOutcome {
+            connected: 8,
+            staged_effect_bytes: 40,
+            staged_effect_limit: 100,
+            ..ActiveStateConnectOutcome::default()
+        };
+        let second = ActiveStateConnectOutcome {
+            connected: 8,
+            staged_effect_bytes: 70,
+            staged_effect_limit: 100,
+            ..ActiveStateConnectOutcome::default()
+        };
+        let merged = merge_active_state_outcomes(first, second);
+        assert_eq!(merged.connected, 16);
+        assert_eq!(merged.staged_effect_bytes, 70);
+        assert_eq!(merged.staged_effect_limit, 100);
     }
 
     #[test]
@@ -11884,7 +11974,7 @@ mod tests {
         let mut tuner = ActiveStateBatchTuner::new(32);
         for _ in 0..(ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK * 4) {
             tuner.record_budget_retry(32);
-            tuner.record_success(32);
+            tuner.record_success(32, 0, 100);
         }
         assert_eq!(tuner.maximum_limit, 32);
         assert_eq!(tuner.next_limit, 32);
@@ -11893,7 +11983,7 @@ mod tests {
         for _ in 0..(ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK * 8) {
             let limit = tuner.next_limit;
             tuner.record_budget_retry(limit);
-            tuner.record_success(limit);
+            tuner.record_success(limit, 0, 100);
         }
         assert_eq!(tuner.next_limit, 32);
     }
