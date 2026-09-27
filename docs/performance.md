@@ -228,9 +228,14 @@ The atomic staged-effect meter can reduce a direct replay slice when historical
 name activity makes the configured block count too large. After such a retry,
 the adaptive batcher requires four consecutive full slices before increasing
 its candidate by 50%. A miss still halves repeatedly to a complete prefix that
-fits. This bounded additive-increase/multiplicative-decrease policy recovers
-quickly from an unusually expensive name-state block without probing a larger
-transaction on every following slice.
+fits. After a successful publication consumes over 80% of its effect budget,
+the batcher also projects the next limit from that publication's charged bytes
+per block, targeting 70% of the budget. Double-buffered completions use the
+block count from the busiest atomic publication rather than the combined
+completion count. Publications shorter than eight blocks do not drive this
+projection because an interval-boundary commit is not representative of a
+normal replay window. The exact meter remains authoritative for the next
+commit; the projection only selects its initial block count.
 
 `--active-state-staged-effect-mib` may raise the straight-line replay meter
 from its 256 MiB default to at most 1024 MiB on a memory-qualified host. The
