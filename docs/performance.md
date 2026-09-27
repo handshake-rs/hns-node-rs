@@ -43,8 +43,12 @@ Sampler schema 3 records:
 The live `/api/v1/native-sync` snapshot also exposes
 `active_state_last_state_timings` for contextual setup, transactions, scripts,
 name covenants, post-transaction work, name changes, interval tree commits, and
-undo construction. Script and name-covenant times are subsets of transaction
-time; these fields must not all be added together. Stored-block validation and
+undo construction. `name_state_prefetch_micros` is included in setup time;
+`interval_name_state_read_micros` is included in interval tree commit time.
+The former measures bounded first-use reads for a block, and the latter
+measures the unchanged-name fetch and override construction at a tree
+boundary. Script and name-covenant times are subsets of transaction time;
+these fields must not all be added together. Stored-block validation and
 pre-state preparation have separate timers. Last-slice and cumulative budget
 retry counts and wall time report discarded attempts, while the prefix
 truncation counter records a committed prefix whose next block exceeded the

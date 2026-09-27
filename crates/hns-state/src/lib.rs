@@ -112,6 +112,8 @@ const BLOCK_UNDO_CODEC_MAX: usize = MAX_BLOCK_WEIGHT * 8;
 const NAME_TREE_ACCUMULATOR_CODEC_MAX: usize = MAX_BLOCK_WEIGHT * 2;
 const BLOCK_UNDO_KEY_BYTES: usize = 32;
 const NAME_STATE_KEY_BYTES: usize = 32;
+// Keep each storage multi-get bounded even when an interval touches many names.
+const NAME_STATE_MULTI_GET_BATCH: usize = 256;
 const BLOCK_UNDO_FIXED_METADATA_BYTES: usize = 4 + 32 + 4 + 32 * 4;
 const OUTPOINT_CODEC_BYTES: usize = 32 + 4;
 const MIN_SPENT_COIN_CODEC_BYTES: usize =
@@ -514,12 +516,16 @@ pub struct StateSummary {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateConnectTimings {
     pub setup_micros: u64,
+    /// Included in setup_micros.
+    pub name_state_prefetch_micros: u64,
     pub transactions_micros: u64,
     pub scripts_micros: u64,
     pub name_covenants_micros: u64,
     pub post_transactions_micros: u64,
     pub name_changes_micros: u64,
     pub name_tree_commit_micros: u64,
+    /// Included in name_tree_commit_micros.
+    pub interval_name_state_read_micros: u64,
     pub undo_micros: u64,
 }
 
@@ -528,6 +534,9 @@ impl StateConnectTimings {
     pub fn saturating_add(self, other: Self) -> Self {
         Self {
             setup_micros: self.setup_micros.saturating_add(other.setup_micros),
+            name_state_prefetch_micros: self
+                .name_state_prefetch_micros
+                .saturating_add(other.name_state_prefetch_micros),
             transactions_micros: self
                 .transactions_micros
                 .saturating_add(other.transactions_micros),
@@ -544,6 +553,9 @@ impl StateConnectTimings {
             name_tree_commit_micros: self
                 .name_tree_commit_micros
                 .saturating_add(other.name_tree_commit_micros),
+            interval_name_state_read_micros: self
+                .interval_name_state_read_micros
+                .saturating_add(other.interval_name_state_read_micros),
             undo_micros: self.undo_micros.saturating_add(other.undo_micros),
         }
     }
@@ -2792,6 +2804,19 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
         &mut name_state_changes,
         &issuance.claims,
     )?;
+    let prefetch_started = Instant::now();
+    let mut prefetched_name_states = if services.name_flags_valid {
+        prefetch_block_name_states(
+            snapshot,
+            request.block,
+            request.height,
+            &chain_context,
+            &name_state_changes,
+        )?
+    } else {
+        HashMap::new()
+    };
+    timings.name_state_prefetch_micros = elapsed_micros(prefetch_started);
     timings.setup_micros = elapsed_micros(setup_started);
     let transactions_started = Instant::now();
 
@@ -2876,6 +2901,7 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 &mut name_state_changes,
                 false,
                 prepared_utxos,
+                Some(&mut prefetched_name_states),
             )?;
             timings.name_covenants_micros = timings
                 .name_covenants_micros
@@ -2899,6 +2925,7 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 &mut name_state_changes,
                 true,
                 prepared_utxos,
+                Some(&mut prefetched_name_states),
             )?;
             timings.name_covenants_micros = timings
                 .name_covenants_micros
@@ -3000,14 +3027,24 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
 
     let name_tree_commit_started = Instant::now();
     let resulting_tree_root = if interval_boundary {
+        let name_state_read_started = Instant::now();
         let mut interval_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
+        let mut unchanged_names = Vec::new();
         for name_hash in accumulator_session.names()? {
-            let state = match name_state_changes.current.get(&name_hash) {
-                Some(state) => (!state.is_null()).then_some(state.clone()),
-                None => load_name_state(snapshot, &name_hash)?.filter(|state| !state.is_null()),
-            };
-            interval_overrides.insert(name_hash, state);
+            if let Some(state) = name_state_changes.current.get(&name_hash) {
+                interval_overrides.insert(name_hash, (!state.is_null()).then_some(state.clone()));
+            } else {
+                unchanged_names.push(name_hash);
+            }
         }
+        for (name_hash, state) in unchanged_names
+            .iter()
+            .copied()
+            .zip(load_name_states_batched(snapshot, &unchanged_names)?)
+        {
+            interval_overrides.insert(name_hash, state.filter(|state| !state.is_null()));
+        }
+        timings.interval_name_state_read_micros = elapsed_micros(name_state_read_started);
         stage_name_tree_with_overrides(
             snapshot,
             batch,
@@ -3819,7 +3856,43 @@ fn apply_transaction_name_covenants<T: ReadSnapshot>(
         changes,
         allow_verified_claims,
         None,
+        None,
     )
+}
+
+fn prefetch_block_name_states<T: ReadSnapshot>(
+    snapshot: &T,
+    block: &Block,
+    height: Height,
+    context: &SnapshotChainContext<'_, T>,
+    changes: &NameStateChanges,
+) -> Result<HashMap<NameHash, Option<NameState>>, StateError> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for transaction in &block.transactions {
+        for output in &transaction.outputs {
+            let kind = output.covenant.kind;
+            if !kind.is_name()
+                || kind == CovenantKind::Claim
+                || (context.is_historical_height(height)
+                    && matches!(kind, CovenantKind::Bid | CovenantKind::Redeem))
+            {
+                continue;
+            }
+            if let Some(name_hash) = output
+                .covenant
+                .item(0)
+                .and_then(|item| <[u8; 32]>::try_from(item).ok())
+                .map(NameHash::new)
+            {
+                if !changes.current.contains_key(&name_hash) && seen.insert(name_hash) {
+                    names.push(name_hash);
+                }
+            }
+        }
+    }
+    let states = load_name_states_batched(snapshot, &names)?;
+    Ok(names.into_iter().zip(states).collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3833,6 +3906,7 @@ fn apply_transaction_name_covenants_prepared<T: ReadSnapshot>(
     changes: &mut NameStateChanges,
     allow_verified_claims: bool,
     prepared: Option<&PreparedBlockUtxos>,
+    mut prefetched_name_states: Option<&mut HashMap<NameHash, Option<NameState>>>,
 ) -> Result<(), StateError> {
     for (output_index, output) in transaction.outputs.iter().enumerate() {
         if !output.covenant.kind.is_name() {
@@ -3876,7 +3950,13 @@ fn apply_transaction_name_covenants_prepared<T: ReadSnapshot>(
         };
 
         if let std::collections::hash_map::Entry::Vacant(entry) = changes.current.entry(name_hash) {
-            let loaded = load_name_state(snapshot, &name_hash)?;
+            let loaded = match prefetched_name_states
+                .as_deref_mut()
+                .and_then(|states| states.remove(&name_hash))
+            {
+                Some(state) => state,
+                None => load_name_state(snapshot, &name_hash)?,
+            };
             changes
                 .previous
                 .entry(name_hash)
@@ -4048,6 +4128,7 @@ struct SnapshotChainContext<'a, T: ReadSnapshot> {
     candidate_height: Height,
     historical_validation: HistoricalValidationPlan,
     headers_by_height: RefCell<HashMap<Height, Option<HeaderRecord>>>,
+    main_chain_heights_by_hash: RefCell<HashMap<BlockHash, Option<Height>>>,
     median_times: RefCell<HashMap<Height, u64>>,
 }
 
@@ -4062,6 +4143,7 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
             candidate_height,
             historical_validation,
             headers_by_height: RefCell::new(HashMap::new()),
+            main_chain_heights_by_hash: RefCell::new(HashMap::new()),
             median_times: RefCell::new(HashMap::new()),
         }
     }
@@ -4131,18 +4213,28 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
 
 impl<T: ReadSnapshot> NameContext for SnapshotChainContext<'_, T> {
     fn main_chain_height(&self, hash: &BlockHash) -> Result<Option<Height>, ConsensusError> {
+        if let Some(cached) = self.main_chain_heights_by_hash.borrow().get(hash) {
+            return Ok(*cached);
+        }
         let Some(bytes) = self
             .snapshot
             .get(ColumnFamily::Headers, hash.as_bytes())
             .map_err(|error| ConsensusError::View(error.to_string()))?
         else {
+            self.main_chain_heights_by_hash
+                .borrow_mut()
+                .insert(*hash, None);
             return Ok(None);
         };
         let record = HeaderRecord::decode(&bytes)
             .map_err(|error| ConsensusError::View(error.to_string()))?;
         let canonical = read_canonical_hash(self.snapshot, record.height)
             .map_err(|error| ConsensusError::View(error.to_string()))?;
-        Ok((canonical == Some(*hash)).then_some(record.height))
+        let height = (canonical == Some(*hash)).then_some(record.height);
+        self.main_chain_heights_by_hash
+            .borrow_mut()
+            .insert(*hash, height);
+        Ok(height)
     }
 
     fn is_historical_height(&self, height: Height) -> bool {
@@ -7959,6 +8051,35 @@ fn load_name_state<T: ReadSnapshot>(
     decode_name_state(name_hash, &bytes).map(Some)
 }
 
+fn load_name_states_batched<T: ReadSnapshot>(
+    snapshot: &T,
+    name_hashes: &[NameHash],
+) -> Result<Vec<Option<NameState>>, StateError> {
+    let mut states = Vec::with_capacity(name_hashes.len());
+    for chunk in name_hashes.chunks(NAME_STATE_MULTI_GET_BATCH) {
+        let keys = chunk
+            .iter()
+            .map(|name_hash| name_hash.as_bytes().as_slice())
+            .collect::<Vec<_>>();
+        let values = snapshot.get_many(ColumnFamily::NameState, &keys)?;
+        if values.len() != chunk.len() {
+            return Err(StateError::Codec(format!(
+                "name-state multi-get returned {} values for {} keys",
+                values.len(),
+                chunk.len()
+            )));
+        }
+        for (name_hash, value) in chunk.iter().zip(values) {
+            states.push(
+                value
+                    .map(|bytes| decode_name_state(name_hash, &bytes))
+                    .transpose()?,
+            );
+        }
+    }
+    Ok(states)
+}
+
 fn encode_name_undo(undo: &NameUndo) -> Result<Vec<u8>, StateError> {
     let mut writer = Writer::with_capacity(NAME_UNDO_CODEC_MAX);
     writer.write_bytes(undo.name_hash.as_bytes());
@@ -8388,6 +8509,212 @@ mod tests {
             self.inner
                 .scan_prefix_page(family, prefix, start_after, budget)
         }
+    }
+
+    struct CountingPointSnapshot<S> {
+        inner: S,
+        name_state_points: Cell<usize>,
+        name_state_batches: RefCell<Vec<usize>>,
+        header_points: Cell<usize>,
+    }
+
+    impl<S> CountingPointSnapshot<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                name_state_points: Cell::new(0),
+                name_state_batches: RefCell::new(Vec::new()),
+                header_points: Cell::new(0),
+            }
+        }
+    }
+
+    impl<S: ReadSnapshot> ReadSnapshot for CountingPointSnapshot<S> {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            if family == ColumnFamily::NameState {
+                self.name_state_points.set(self.name_state_points.get() + 1);
+            } else if family == ColumnFamily::Headers {
+                self.header_points.set(self.header_points.get() + 1);
+            }
+            self.inner.get(family, key)
+        }
+
+        fn get_many(
+            &self,
+            family: ColumnFamily,
+            keys: &[&[u8]],
+        ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+            if family == ColumnFamily::NameState {
+                self.name_state_batches.borrow_mut().push(keys.len());
+            }
+            self.inner.get_many(family, keys)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<hns_store::ScanEntry>, StoreError> {
+            self.inner.scan_prefix(family, prefix)
+        }
+    }
+
+    #[test]
+    fn name_state_multi_get_is_bounded_and_observes_staged_changes() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let names = (0..NAME_STATE_MULTI_GET_BATCH + 4)
+            .map(|index| {
+                let name = format!("batched-name-{index}").into_bytes();
+                let name_hash = NameHash::new(hns_primitives::sha3_256(&name));
+                let mut state = NameState::null(name_hash);
+                state.initialize(name, 100);
+                state
+            })
+            .collect::<Vec<_>>();
+        let mut initial = store.batch();
+        for state in &names {
+            write_name_state_to_batch(&mut initial, state).expect("seed name");
+        }
+        store.commit(initial).expect("commit names");
+
+        let base = store.snapshot().expect("snapshot");
+        let overlay = StagingOverlay::new();
+        let mut staged_batch = overlay.batch(store.batch());
+        let mut changed = names[0].clone();
+        changed.height = 200;
+        write_name_state_to_batch(&mut staged_batch, &changed).expect("stage update");
+        staged_batch
+            .delete(ColumnFamily::NameState, names[1].name_hash.as_bytes())
+            .expect("stage deletion");
+        let staged = overlay.snapshot(&base);
+        let counted = CountingPointSnapshot::new(staged);
+        let keys = names
+            .iter()
+            .map(|state| state.name_hash)
+            .collect::<Vec<_>>();
+        let loaded = load_name_states_batched(&counted, &keys).expect("batched name reads");
+        assert_eq!(loaded[0], Some(changed));
+        assert_eq!(loaded[1], None);
+        assert_eq!(loaded[2], Some(names[2].clone()));
+        assert_eq!(counted.name_state_points.get(), 0);
+        assert_eq!(
+            *counted.name_state_batches.borrow(),
+            vec![NAME_STATE_MULTI_GET_BATCH, 4]
+        );
+    }
+
+    #[test]
+    fn block_name_prefetch_deduplicates_first_reads() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let counted = CountingPointSnapshot::new(store.snapshot().expect("snapshot"));
+        let candidate = block(
+            17,
+            vec![coinbase(vec![
+                open_output(b"prefetch-alpha"),
+                open_output(b"prefetch-beta"),
+                open_output(b"prefetch-alpha"),
+            ])],
+        );
+        let context = SnapshotChainContext::new(&counted, 101, HistoricalValidationPlan::full());
+        let names = prefetch_block_name_states(
+            &counted,
+            &candidate,
+            101,
+            &context,
+            &NameStateChanges::default(),
+        )
+        .expect("prefetch block names");
+        assert_eq!(names.len(), 2);
+        assert!(names.values().all(Option::is_none));
+        assert_eq!(counted.name_state_points.get(), 0);
+        assert_eq!(*counted.name_state_batches.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn block_connection_reads_first_name_states_in_one_batch() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let counted = CountingPointSnapshot::new(store.snapshot().expect("snapshot"));
+        let candidate = block(
+            18,
+            vec![coinbase(vec![
+                open_output(b"connect-prefetch-alpha"),
+                open_output(b"connect-prefetch-beta"),
+            ])],
+        );
+        let verifier = AllowAllInputVerifier;
+        let issuance = RejectSpecialCoinbaseIssuance;
+        let mut batch = store.batch();
+        let summary = connect_block_to_batch_with_services(
+            &counted,
+            &mut batch,
+            ConnectBlock {
+                block_hash: candidate.hash(),
+                height: 119,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &candidate,
+            },
+            StateServices {
+                network: Network::Regtest,
+                name_flags: NameFlags::NONE,
+                name_flags_valid: true,
+                historical_validation: HistoricalValidationPlan::full(),
+                input_verifier: &verifier,
+                issuance_verifier: &issuance,
+            },
+        )
+        .expect("connect two name transitions");
+        assert_eq!(summary.names_changed, 2);
+        assert_eq!(counted.name_state_points.get(), 0);
+        assert_eq!(*counted.name_state_batches.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn ancestor_membership_cache_reuses_positive_and_negative_results() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let header = Header::default();
+        let hash = header.hash();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Headers,
+                hash.as_bytes(),
+                &HeaderRecord {
+                    hash,
+                    height: 10,
+                    chainwork: Uint256::ONE,
+                    header,
+                    status: BlockStatus::default(),
+                }
+                .encode(),
+            )
+            .expect("seed header");
+        write_canonical_height_to_batch(&mut batch, 10, hash).expect("seed canonical height");
+        store.commit(batch).expect("commit header");
+        let counted = CountingPointSnapshot::new(store.snapshot().expect("snapshot"));
+        let context = SnapshotChainContext::new(&counted, 11, HistoricalValidationPlan::full());
+        assert_eq!(
+            context.main_chain_height(&hash).expect("first lookup"),
+            Some(10)
+        );
+        assert_eq!(
+            context.main_chain_height(&hash).expect("cached lookup"),
+            Some(10)
+        );
+        let missing = BlockHash::new([7; 32]);
+        assert_eq!(
+            context.main_chain_height(&missing).expect("missing lookup"),
+            None
+        );
+        assert_eq!(
+            context.main_chain_height(&missing).expect("cached missing"),
+            None
+        );
+        assert_eq!(counted.header_points.get(), 2);
     }
 
     fn streaming_name_state_fixture(
