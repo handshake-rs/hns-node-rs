@@ -269,6 +269,11 @@ struct Cli {
     #[arg(long, default_value_t = 32)]
     maximum_inbound: usize,
 
+    /// Reserve this many of the inbound slots for keyless ShakeScape peers.
+    /// The mobile rendezvous profile reserves eight by default.
+    #[arg(long = "p2p-reserved-shakescape-inbound")]
+    p2p_reserved_shakescape_inbound: Option<usize>,
+
     #[arg(long, default_value_t = 8)]
     maximum_outbound: usize,
 
@@ -486,6 +491,13 @@ impl Cli {
                 hnsr_relay_address: self.hnsr_relay_address,
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
+                reserved_shakescape_inbound: self.p2p_reserved_shakescape_inbound.unwrap_or(
+                    if self.shakescape_mobile_rendezvous {
+                        8
+                    } else {
+                        0
+                    },
+                ),
                 maximum_outbound: self.maximum_outbound,
                 validation_workers: self
                     .validation_workers
@@ -832,6 +844,7 @@ async fn main() -> anyhow::Result<()> {
             active_state_connect_batch = config.native_sync.active_state_connect_batch,
             active_state_staged_effect_bytes = config.native_sync.active_state_staged_effect_bytes,
             p2p_accept_keyless_shakescape = config.native_sync.accept_keyless_shakescape,
+            p2p_reserved_shakescape_inbound = config.native_sync.reserved_shakescape_inbound,
             hip76_requester_override = ?config.native_sync.hip76_requester_override,
             odoh_requester_capable = config.native_sync.odoh_requester,
             odoh_requester_override = ?config.native_sync.odoh_requester_override,
@@ -1000,6 +1013,8 @@ mod tests {
         .expect("mobile rendezvous config");
 
         assert!(config.shakescape_mobile_rendezvous);
+        assert_eq!(config.native_sync.maximum_inbound, 32);
+        assert_eq!(config.native_sync.reserved_shakescape_inbound, 8);
         assert!(config
             .shakescape_relay_roles
             .contains(hns_node::ShakescapeRelayKind::NameMarket));
@@ -1018,6 +1033,24 @@ mod tests {
         );
         assert_eq!(config.native_sync.hnsr_opaque_relay_override, Some(true));
         validate_node_config(&config).expect("complete public rendezvous config validates");
+
+        let tuned = Cli::try_parse_from([
+            "hsrd",
+            "--data-dir",
+            "/var/lib/hsrd/mainnet-mobile-rendezvous",
+            "--p2p-listen",
+            "0.0.0.0:12038",
+            "--hnsr-relay-address",
+            "8.8.8.8:12038",
+            "--shakescape-mobile-rendezvous",
+            "--p2p-reserved-shakescape-inbound",
+            "4",
+        ])
+        .expect("tuned mobile rendezvous CLI")
+        .into_config()
+        .expect("tuned mobile rendezvous config");
+        assert_eq!(tuned.native_sync.reserved_shakescape_inbound, 4);
+        validate_node_config(&tuned).expect("tuned reservation validates");
     }
 
     #[test]

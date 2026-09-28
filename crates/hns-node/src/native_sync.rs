@@ -834,6 +834,9 @@ pub struct NativeSyncConfig {
     pub hnsr_relay_address: Option<SocketAddr>,
     pub maximum_known_addresses: usize,
     pub maximum_inbound: usize,
+    /// Inbound slots reserved for keyless peers completing ShakeScape V1.
+    /// Counted within `maximum_inbound`, not added to it.
+    pub reserved_shakescape_inbound: usize,
     pub maximum_outbound: usize,
     pub validation_workers: usize,
     pub validation_queue: usize,
@@ -872,6 +875,7 @@ impl Default for NativeSyncConfig {
             hnsr_relay_address: None,
             maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
+            reserved_shakescape_inbound: 0,
             maximum_outbound: 8,
             validation_workers,
             validation_queue,
@@ -1040,6 +1044,15 @@ impl NativeSyncConfig {
         if maximum_peers > MAX_NATIVE_SYNC_PEERS {
             anyhow::bail!(
                 "Native sync total peer limit {maximum_peers} exceeds the hard limit {MAX_NATIVE_SYNC_PEERS}"
+            );
+        }
+        if self.reserved_shakescape_inbound > self.maximum_inbound
+            || (self.reserved_shakescape_inbound > 0
+                && (self.listen.is_none()
+                    || (self.advertise.is_none() && !self.accept_keyless_shakescape)))
+        {
+            anyhow::bail!(
+                "reserved ShakeScape inbound slots require a compatible listener and must fit within the inbound limit"
             );
         }
 
@@ -3029,6 +3042,7 @@ impl NodeService {
             peer_config.brontide_identity_durable = data_dir.is_some();
         }
         peer_config.maximum_inbound = native_sync_config.maximum_inbound;
+        peer_config.reserved_shakescape_inbound = native_sync_config.reserved_shakescape_inbound;
         peer_config.maximum_outbound = native_sync_config.maximum_outbound;
         peer_config.allow_public_plaintext_shakescape =
             native_sync_config.advertise.is_some() || native_sync_config.accept_keyless_shakescape;

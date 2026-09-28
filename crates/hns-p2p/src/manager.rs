@@ -49,7 +49,7 @@ use crate::{
     },
     runtime::{
         spawn_brontide_peer_runtime, spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle,
-        PeerId, PeerRuntimeConfig, PeerRuntimeParameters, PeerSnapshot,
+        PeerId, PeerRuntimeConfig, PeerRuntimeParameters, PeerSnapshot, PeerTransportKind,
     },
     shakescape::{extension_packet, ShakescapeRuntimeMetrics, ShakescapeSummary},
     wire::{NetAddress, NetworkMagic, Packet, VersionPacket},
@@ -70,6 +70,9 @@ pub struct LivePeerConfig {
     /// durable storage. HNSR relay tickets are unavailable without this bit.
     pub brontide_identity_durable: bool,
     pub maximum_inbound: usize,
+    /// Inbound slots held for keyless peers that complete ShakeScape registry
+    /// negotiation. These slots are included in `maximum_inbound`.
+    pub reserved_shakescape_inbound: usize,
     pub maximum_outbound: usize,
     pub event_capacity: usize,
     pub connect_timeout: Duration,
@@ -140,6 +143,7 @@ impl LivePeerConfig {
             transport,
             brontide_identity_durable: false,
             maximum_inbound: 32,
+            reserved_shakescape_inbound: 0,
             maximum_outbound: 8,
             event_capacity: 1_024,
             connect_timeout: Duration::from_secs(10),
@@ -175,6 +179,15 @@ impl LivePeerConfig {
         if self.maximum_inbound == 0 && self.maximum_outbound == 0 {
             return Err(P2pError::Configuration(
                 "at least one inbound or outbound peer slot is required".to_owned(),
+            ));
+        }
+        if self.reserved_shakescape_inbound > self.maximum_inbound
+            || (self.reserved_shakescape_inbound > 0
+                && (!self.allow_public_plaintext_shakescape
+                    || matches!(&self.transport, PeerTransport::Plaintext)))
+        {
+            return Err(P2pError::Configuration(
+                "reserved ShakeScape inbound slots require a compatible Brontide listener and must fit within the inbound limit".to_owned(),
             ));
         }
         if self.event_capacity == 0 {
@@ -332,6 +345,10 @@ impl fmt::Debug for LivePeerManager {
             .field("network", &self.config.network)
             .field("transport", &transport)
             .field("maximum_inbound", &self.config.maximum_inbound)
+            .field(
+                "reserved_shakescape_inbound",
+                &self.config.reserved_shakescape_inbound,
+            )
             .field("maximum_outbound", &self.config.maximum_outbound)
             .field("hnsr_profile", &self.config.hnsr_profile)
             .field("local_height", &self.local_height.load(Ordering::Acquire))
@@ -580,7 +597,7 @@ impl LivePeerManager {
                     .to_owned(),
             ));
         }
-        self.ensure_capacity(PeerDirection::Outbound, address)
+        self.ensure_capacity(PeerDirection::Outbound, address, None)
             .await?;
         let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(address))
             .await
@@ -600,7 +617,7 @@ impl LivePeerManager {
         match &self.config.transport {
             PeerTransport::Plaintext => self.connect(address).await,
             PeerTransport::Brontide(identity) => {
-                self.ensure_capacity(PeerDirection::Outbound, address)
+                self.ensure_capacity(PeerDirection::Outbound, address, None)
                     .await?;
                 if !matches!(peer.key[0], 0x02 | 0x03) {
                     return Err(P2pError::Configuration(format!(
@@ -633,7 +650,11 @@ impl LivePeerManager {
         mut stream: TcpStream,
         address: SocketAddr,
     ) -> Result<PeerId, P2pError> {
-        self.ensure_capacity(PeerDirection::Inbound, address)
+        let transport = match &self.config.transport {
+            PeerTransport::Plaintext => PeerTransportKind::Plaintext,
+            PeerTransport::Brontide(_) => PeerTransportKind::Brontide,
+        };
+        self.ensure_capacity(PeerDirection::Inbound, address, Some(transport))
             .await?;
         stream.set_nodelay(true)?;
         let session = match &self.config.transport {
@@ -667,7 +688,7 @@ impl LivePeerManager {
         if matches!(self.config.transport, PeerTransport::Plaintext) {
             return self.accept_stream(stream, address).await;
         }
-        self.ensure_capacity(PeerDirection::Inbound, address)
+        self.ensure_capacity(PeerDirection::Inbound, address, None)
             .await?;
         stream.set_nodelay(true)?;
         let mut prefix = [0_u8; 4];
@@ -693,10 +714,24 @@ impl LivePeerManager {
             ))
         })??;
         if compatible_stream_is_plaintext(self.config.network, prefix) {
-            return self
+            self.ensure_capacity(
+                PeerDirection::Inbound,
+                address,
+                Some(PeerTransportKind::Plaintext),
+            )
+            .await?;
+            let peer = self
                 .register_stream(stream, address, PeerDirection::Inbound, None)
-                .await;
+                .await?;
+            self.expire_unnegotiated_reserved_peer(peer).await;
+            return Ok(peer);
         }
+        self.ensure_capacity(
+            PeerDirection::Inbound,
+            address,
+            Some(PeerTransportKind::Brontide),
+        )
+        .await?;
         let identity = match &self.config.transport {
             PeerTransport::Brontide(identity) => identity,
             PeerTransport::Plaintext => unreachable!("plaintext returned before classification"),
@@ -713,6 +748,27 @@ impl LivePeerManager {
         })??;
         self.register_stream(stream, address, PeerDirection::Inbound, Some(session))
             .await
+    }
+
+    async fn expire_unnegotiated_reserved_peer(&self, peer: PeerId) {
+        if self.config.reserved_shakescape_inbound == 0 {
+            return;
+        }
+        let Some(handle) = self.peers.read().await.get(&peer).cloned() else {
+            return;
+        };
+        let deadline = self
+            .config
+            .runtime
+            .handshake_timeout
+            .saturating_add(self.config.runtime.shakescape_negotiation_timeout);
+        let network = self.config.network;
+        tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            if !exact_name_market_admission(&handle.snapshot().await, network, true, 0) {
+                handle.disconnect();
+            }
+        });
     }
 
     pub async fn serve_listener<F>(
@@ -1964,6 +2020,7 @@ impl LivePeerManager {
         &self,
         direction: PeerDirection,
         address: SocketAddr,
+        inbound_transport: Option<PeerTransportKind>,
     ) -> Result<(), P2pError> {
         let ip = normalize_peer_ip(address.ip());
         let now = unix_time();
@@ -1993,6 +2050,29 @@ impl LivePeerManager {
         if count >= limit {
             return Err(P2pError::PeerLimit { direction, limit });
         }
+        if direction == PeerDirection::Inbound && self.config.reserved_shakescape_inbound > 0 {
+            if let Some(transport) = inbound_transport {
+                let class_limit = if transport == PeerTransportKind::Plaintext {
+                    self.config.reserved_shakescape_inbound
+                } else {
+                    self.config
+                        .maximum_inbound
+                        .saturating_sub(self.config.reserved_shakescape_inbound)
+                };
+                let class_count = snapshots
+                    .iter()
+                    .filter(|peer| {
+                        peer.direction == PeerDirection::Inbound && peer.transport == transport
+                    })
+                    .count();
+                if class_count >= class_limit {
+                    return Err(P2pError::PeerLimit {
+                        direction,
+                        limit: class_limit,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2004,7 +2084,14 @@ impl LivePeerManager {
         brontide: Option<BrontideSession>,
     ) -> Result<PeerId, P2pError> {
         let _registration = self.registration_lock.lock().await;
-        self.ensure_capacity(direction, address).await?;
+        let inbound_transport =
+            (direction == PeerDirection::Inbound).then_some(if brontide.is_some() {
+                PeerTransportKind::Brontide
+            } else {
+                PeerTransportKind::Plaintext
+            });
+        self.ensure_capacity(direction, address, inbound_transport)
+            .await?;
         let id = PeerId(self.next_peer_id.fetch_add(1, Ordering::Relaxed));
         let nonce = self.local_nonce;
         let services = self.local_services();
@@ -2264,6 +2351,7 @@ mod tests {
         DNS_RELAY_SERVICE, REGISTRY_NEGOTIATION_MAX_PAYLOAD,
         SHAKESCAPE_EXTENSION_MAX_NESTED_PAYLOAD, SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD,
     };
+    use tokio::io::AsyncWriteExt;
 
     const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3112,6 +3200,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_shakescape_slot_survives_full_brontide_class_and_expires_without_registry() {
+        let mut server_config = LivePeerConfig::for_network(Network::Mainnet);
+        server_config.allow_public_plaintext_shakescape = true;
+        server_config.maximum_inbound = 2;
+        server_config.reserved_shakescape_inbound = 1;
+        server_config.runtime.handshake_timeout = Duration::from_secs(1);
+        server_config.runtime.shakescape_negotiation_timeout = Duration::from_secs(1);
+        let server_key = match &server_config.transport {
+            PeerTransport::Brontide(identity) => *identity.public_key(),
+            PeerTransport::Plaintext => panic!("mainnet must use Brontide"),
+        };
+        let (server_manager, mut server_events) =
+            LivePeerManager::new(server_config).expect("server");
+        let (client_manager, mut client_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Mainnet)).expect("client");
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.expect("bind"));
+        let address = listener.local_addr().expect("address");
+
+        let first = {
+            let listener = Arc::clone(&listener);
+            let manager = server_manager.clone();
+            tokio::spawn(async move {
+                let (stream, remote) = listener.accept().await.expect("accept Brontide");
+                manager
+                    .accept_compatible_stream(stream, remote)
+                    .await
+                    .expect("register Brontide")
+            })
+        };
+        let mut net_address = NetAddress::from_socket_addr(address, unix_time(), SERVICE_NETWORK);
+        net_address.key = server_key;
+        let client_peer = client_manager
+            .connect_net_address(&net_address)
+            .await
+            .expect("Brontide connect");
+        let brontide_peer = first.await.expect("Brontide listener task");
+        await_ready(&mut client_events, client_peer).await;
+        await_ready(&mut server_events, brontide_peer).await;
+
+        let mut surplus_brontide = TcpStream::connect(address).await.expect("second connect");
+        surplus_brontide
+            .write_all(b"abcd")
+            .await
+            .expect("send non-magic prefix");
+        let (stream, remote) = listener.accept().await.expect("second accept");
+        let error = server_manager
+            .accept_compatible_stream(stream, remote)
+            .await
+            .expect_err("general class is full");
+        assert!(matches!(
+            error,
+            P2pError::PeerLimit {
+                direction: PeerDirection::Inbound,
+                limit: 1
+            }
+        ));
+
+        let keyless = TcpStream::connect(address).await.expect("keyless connect");
+        let (read, write) = keyless.into_split();
+        let mut reader = AsyncFrameReader::new(read, NetworkMagic::Mainnet);
+        let mut writer = AsyncFrameWriter::new(write, NetworkMagic::Mainnet);
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        writer
+            .write_packet(&Packet::Version(VersionPacket {
+                version: PROTOCOL_VERSION,
+                services,
+                time: unix_time(),
+                remote: NetAddress::from_socket_addr(address, unix_time(), services),
+                nonce: [0x56; 8],
+                agent: "/reserved-keyless-test:0.1.0/".to_owned(),
+                height: 1,
+                no_relay: false,
+            }))
+            .await
+            .expect("send keyless version");
+        let (stream, remote) = listener.accept().await.expect("keyless accept");
+        let keyless_peer = server_manager
+            .accept_compatible_stream(stream, remote)
+            .await
+            .expect("reserved keyless slot");
+        let mut received_version = false;
+        let mut received_verack = false;
+        tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+            while !received_version || !received_verack {
+                match reader.read_packet().await.expect("server handshake packet") {
+                    Packet::Version(_) => {
+                        received_version = true;
+                        writer
+                            .write_packet(&Packet::Verack)
+                            .await
+                            .expect("send keyless verack");
+                    }
+                    Packet::Verack => received_verack = true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("keyless handshake frames");
+        await_ready(&mut server_events, keyless_peer).await;
+        assert_eq!(server_manager.snapshots().await.len(), 2);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server_manager
+                    .snapshots()
+                    .await
+                    .iter()
+                    .all(|peer| peer.id != keyless_peer)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unnegotiated keyless peer releases the reserved slot");
+        assert_eq!(server_manager.snapshots().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn live_manager_completes_authenticated_brontide_and_version_handshakes() {
         let mut server_config = LivePeerConfig::for_network(Network::Testnet);
         server_config.runtime.ping_interval = Duration::from_secs(60);
@@ -3206,6 +3415,20 @@ mod tests {
         invalid_ban_time.ban_time = Duration::from_nanos(1);
         assert!(matches!(
             LivePeerManager::new(invalid_ban_time),
+            Err(P2pError::Configuration(_))
+        ));
+
+        let mut missing_keyless_listener = LivePeerConfig::for_network(Network::Mainnet);
+        missing_keyless_listener.reserved_shakescape_inbound = 1;
+        assert!(matches!(
+            LivePeerManager::new(missing_keyless_listener),
+            Err(P2pError::Configuration(_))
+        ));
+        let mut oversized_reservation = LivePeerConfig::for_network(Network::Mainnet);
+        oversized_reservation.allow_public_plaintext_shakescape = true;
+        oversized_reservation.reserved_shakescape_inbound = 33;
+        assert!(matches!(
+            LivePeerManager::new(oversized_reservation),
             Err(P2pError::Configuration(_))
         ));
 

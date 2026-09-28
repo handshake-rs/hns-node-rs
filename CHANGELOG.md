@@ -4,6 +4,15 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## 0.3.7 - 2026-09-28 (prerelease)
+
+- Reserve eight of the default 32 inbound peer slots for keyless ShakeScape
+  clients when the mobile rendezvous profile is enabled. Keep the total limit
+  at 32, cap ordinary Brontide inbound peers at 24, and release reserved slots
+  if clients do not complete the exact name-market registry negotiation within
+  the bounded handshake and negotiation window. Operators can tune the split
+  with `--p2p-reserved-shakescape-inbound`.
+
 ## 0.3.6 - 2026-09-26 (prerelease)
 
 - Allow up to eight hours for a cold physical audit of authenticated name

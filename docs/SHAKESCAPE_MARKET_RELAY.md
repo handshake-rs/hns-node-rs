@@ -125,6 +125,15 @@ validation gate board use above that transport. A TLS/HTTP reverse proxy is
 not compatible; a forwarding service must preserve the raw TCP byte stream end
 to end.
 
+The mobile rendezvous profile keeps the default 32 total inbound slots but
+reserves eight for keyless ShakeScape sessions. Brontide peers may occupy the
+other 24. Keyless peers must complete ShakeScape registry negotiation within
+the bounded Handshake and registry deadlines or release their reserved slot.
+`--p2p-reserved-shakescape-inbound N` changes the reservation without raising
+`--maximum-inbound`; `N=0` restores the shared inbound pool. A public relay
+that has already filled all 32 slots needs one graceful restart after enabling
+the reservation to establish the new split.
+
 This profile is rendezvous in the product sense that separately connected
 phones share one continuously reachable board and relay. It does not claim an
 HNSR endpoint-directory role, does not publish wallet endpoint records, and
