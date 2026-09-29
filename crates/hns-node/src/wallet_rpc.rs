@@ -71,6 +71,10 @@ enum WalletRpcCall {
         height: u32,
         expected_chain_epoch: u64,
     },
+    CanonicalBlock {
+        height: u32,
+        expected_chain_epoch: u64,
+    },
     ConfirmedScriptsPage {
         script_ids: Vec<String>,
         #[serde(default)]
@@ -377,6 +381,80 @@ pub(crate) async fn dispatch_wallet_rpc(
     }
 }
 
+/// Narrow account-wallet chain feed. It is available with authenticated native
+/// active-state sync even when the chain-wide wallet index is disabled.
+pub(crate) async fn dispatch_wallet_chain_rpc(
+    backend: Option<&WalletBackend>,
+    authenticated_boundary: bool,
+    body: &[u8],
+) -> (StatusCode, Json<WalletRpcResponse>) {
+    if !authenticated_boundary {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_required",
+            "wallet chain RPC requires listener authentication",
+            false,
+        );
+    }
+    let Some(backend) = backend else {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_unavailable",
+            "wallet chain RPC requires native active-state sync",
+            true,
+        );
+    };
+    let request = match serde_json::from_slice::<WalletRpcRequest>(body) {
+        Ok(request) => request,
+        Err(_) => {
+            return wallet_rpc_failure(
+                None,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "wallet chain RPC request is malformed",
+                false,
+            )
+        }
+    };
+    let request_id = request.request_id;
+    if request_id
+        .as_ref()
+        .is_some_and(|id| id.len() > MAX_REQUEST_ID_BYTES)
+        || request.api_version != WALLET_RPC_API_VERSION
+    {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "wallet chain RPC envelope is invalid",
+            false,
+        );
+    }
+    if !matches!(
+        &request.call,
+        WalletRpcCall::ChainSnapshot
+            | WalletRpcCall::BlockHash { .. }
+            | WalletRpcCall::CanonicalBlock { .. }
+    ) {
+        return wallet_rpc_failure(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "unsupported_method",
+            "wallet chain RPC supports only chain_snapshot, block_hash, and canonical_block",
+            false,
+        );
+    }
+    match dispatch_call(backend, request.call).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(WalletRpcResponse::success(request_id, result)),
+        ),
+        Err(error) => map_dispatch_error(request_id, error),
+    }
+}
+
 async fn dispatch_call(
     backend: &WalletBackend,
     call: WalletRpcCall,
@@ -565,6 +643,21 @@ async fn dispatch_call(
             let evidence = backend.get_block_hash_evidence(height).await?;
             require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
             value(&WireBlockHashEvidence::from(evidence))?
+        }
+        WalletRpcCall::CanonicalBlock {
+            height,
+            expected_chain_epoch,
+        } => {
+            let evidence = backend
+                .get_canonical_block_evidence(height, expected_chain_epoch)
+                .await?;
+            serde_json::json!({
+                "chain_epoch": evidence.chain_epoch,
+                "tip": wire_tip(evidence.tip),
+                "height": evidence.height,
+                "block_hash": evidence.hash.map(|hash| hash.to_hex()),
+                "block_hex": evidence.raw.map(hex::encode),
+            })
         }
         WalletRpcCall::ConfirmedScriptsPage {
             script_ids,
@@ -2475,6 +2568,85 @@ fn wire_mempool_contract_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn account_chain_feed_works_without_global_wallet_index_and_rejects_wallet_queries() {
+        let node = crate::NodeService::try_new(crate::NodeConfig {
+            network: hns_consensus::Network::Regtest,
+            ..crate::NodeConfig::default()
+        })
+        .expect("node without global index");
+        let runtime =
+            crate::NodeRuntime::spawn(node, crate::DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY)
+                .expect("runtime");
+        let (peers, _events) = hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(
+            hns_consensus::Network::Regtest,
+        ))
+        .expect("peers");
+        let backend = runtime.wallet_backend(peers);
+        let request = |method: &str, params: Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "api_version": 1,
+                "request_id": "chain-only-test",
+                "call": { "method": method, "params": params },
+            }))
+            .expect("request")
+        };
+
+        let (status, Json(snapshot)) = dispatch_wallet_chain_rpc(
+            Some(&backend),
+            true,
+            &request("chain_snapshot", Value::Null),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let snapshot = serde_json::to_value(snapshot).expect("snapshot wire");
+        assert_eq!(snapshot["result"]["chain_epoch"], 0);
+        assert!(snapshot["result"]["tip"].is_null());
+
+        let (status, Json(block)) = dispatch_wallet_chain_rpc(
+            Some(&backend),
+            true,
+            &request(
+                "canonical_block",
+                serde_json::json!({"height": 0, "expected_chain_epoch": 0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let block = serde_json::to_value(block).expect("block wire");
+        assert!(block["result"]["block_hash"].is_null());
+        assert!(block["result"]["block_hex"].is_null());
+
+        let (status, Json(stale)) = dispatch_wallet_chain_rpc(
+            Some(&backend),
+            true,
+            &request(
+                "canonical_block",
+                serde_json::json!({"height": 0, "expected_chain_epoch": 1}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            serde_json::to_value(stale).expect("stale wire")["error"]["code"],
+            "stale_snapshot"
+        );
+
+        let (status, _) = dispatch_wallet_chain_rpc(
+            Some(&backend),
+            true,
+            &request(
+                "confirmed_scripts_page",
+                serde_json::json!({"script_ids": [], "limit": 1}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        drop(backend);
+        runtime.shutdown_unclean().await.expect("shutdown");
+    }
 
     #[test]
     fn chain_tip_wire_projection_remains_exact() {

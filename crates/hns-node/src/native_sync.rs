@@ -1428,7 +1428,7 @@ struct NativeActiveStatePreparationInput {
 struct NativeActiveStatePreparationOutput {
     proof: StatelessBodyValidation,
     state_effects: PreparedBlockStateEffects,
-    wallet_effects: PreparedWalletIndexEffects,
+    wallet_effects: Option<PreparedWalletIndexEffects>,
     worker_micros: u64,
     workload: ActiveStateWorkload,
 }
@@ -3282,6 +3282,8 @@ impl NodeService {
         let wallet_rpc_profile_enabled = node.wallet_index_profile().wallet;
         let wallet_rpc_active_state_enabled =
             native_sync_config.connect_active_state && !native_sync_config.headers_only;
+        let wallet_chain_backend = (wallet_rpc_authenticated && wallet_rpc_active_state_enabled)
+            .then(|| runtime.wallet_backend(peers.clone()));
         let wallet_backend = (wallet_rpc_authenticated
             && wallet_rpc_profile_enabled
             && wallet_rpc_active_state_enabled)
@@ -3301,6 +3303,7 @@ impl NodeService {
             diagnostic_rpc: Arc::clone(&diagnostic_rpc),
             read_context: rpc_read_context,
             wallet_backend,
+            wallet_chain_backend,
             wallet_rpc_authenticated,
             wallet_rpc_profile_enabled,
             limits: rpc_limits,
@@ -6132,6 +6135,7 @@ struct NativeSyncHttpState {
     diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
     read_context: RpcReadContext,
     wallet_backend: Option<WalletBackend>,
+    wallet_chain_backend: Option<WalletBackend>,
     wallet_rpc_authenticated: bool,
     wallet_rpc_profile_enabled: bool,
     limits: RpcLimits,
@@ -6172,6 +6176,14 @@ async fn serve_native_sync_rpc(
         );
     let app = if wallet_rpc_enabled {
         app.route("/api/v1/wallet", post(handle_native_sync_wallet))
+    } else {
+        app
+    };
+    let app = if authorization.is_some() && state.wallet_chain_backend.is_some() {
+        app.route(
+            "/api/v1/wallet-chain",
+            post(handle_native_sync_wallet_chain),
+        )
     } else {
         app
     };
@@ -6520,6 +6532,19 @@ async fn handle_native_sync_wallet(
         state.wallet_backend.as_ref(),
         state.wallet_rpc_authenticated,
         state.wallet_rpc_profile_enabled,
+        &body,
+    )
+    .await
+    .into_response()
+}
+
+async fn handle_native_sync_wallet_chain(
+    State(state): State<NativeSyncHttpState>,
+    body: Bytes,
+) -> axum::response::Response {
+    wallet_rpc::dispatch_wallet_chain_rpc(
+        state.wallet_chain_backend.as_ref(),
+        state.wallet_rpc_authenticated,
         &body,
     )
     .await
@@ -8854,6 +8879,7 @@ type ActiveStateValidator =
 async fn prepare_native_active_state_plan_with_validator(
     plan: NativeActiveStatePlan,
     network: Network,
+    prepare_wallet_index: bool,
     workers: usize,
     queue_capacity: usize,
     validate: ActiveStateValidator,
@@ -8899,12 +8925,16 @@ async fn prepare_native_active_state_plan_with_validator(
             let state_effects =
                 PreparedBlockStateEffects::prepare(input.import.block(), input.import.height())
                     .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
-            let wallet_effects = PreparedWalletIndexEffects::prepare(
-                input.import.block(),
-                input.import.height(),
-                &state_effects,
-            )
-            .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
+            let wallet_effects = prepare_wallet_index
+                .then(|| {
+                    PreparedWalletIndexEffects::prepare(
+                        input.import.block(),
+                        input.import.height(),
+                        &state_effects,
+                    )
+                })
+                .transpose()
+                .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
             Ok::<_, ValidationRejection>(NativeActiveStatePreparationOutput {
                 proof: StatelessBodyValidation::for_block(
                     input.import.block(),
@@ -8983,7 +9013,9 @@ async fn prepare_native_active_state_plan_with_validator(
                 prepared_connect.push(input.import);
                 proofs.push(success.output.proof);
                 state_effects.push(success.output.state_effects);
-                wallet_effects.push(success.output.wallet_effects);
+                if let Some(effects) = success.output.wallet_effects {
+                    wallet_effects.push(effects);
+                }
             }
             Err(failure) => {
                 cancellation.cancel();
@@ -9207,6 +9239,7 @@ async fn execute_native_active_state_slice_with_validator(
         let prepared = prepare_native_active_state_plan_with_validator(
             first_plan,
             node.network(),
+            node.wallet_index_profile().enabled(),
             workers,
             queue_capacity,
             Arc::clone(&validate),
@@ -9224,6 +9257,7 @@ async fn execute_native_active_state_slice_with_validator(
             tokio::spawn(prepare_native_active_state_plan_with_validator(
                 plan,
                 node.network(),
+                node.wallet_index_profile().enabled(),
                 workers,
                 queue_capacity,
                 Arc::clone(&validate),
@@ -12664,6 +12698,7 @@ mod tests {
             prepare_native_active_state_plan_with_validator(
                 active_state_preparation_fixture(BLOCKS),
                 Network::Regtest,
+                true,
                 1,
                 2,
                 Arc::new(move |block: &Block, height: Height| {
@@ -12682,6 +12717,7 @@ mod tests {
             prepare_native_active_state_plan_with_validator(
                 active_state_preparation_fixture(BLOCKS),
                 Network::Regtest,
+                true,
                 4,
                 2,
                 Arc::new(move |block: &Block, height: Height| {
@@ -12719,6 +12755,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unindexed_active_state_preparation_skips_wallet_candidates() {
+        let validator = HnsBodyValidator::new(Network::Regtest);
+        let prepared = prepare_native_active_state_plan_with_validator(
+            active_state_preparation_fixture(2),
+            Network::Regtest,
+            false,
+            1,
+            2,
+            Arc::new(move |block: &Block, height: Height| validator.validate(block, height)),
+        )
+        .await
+        .expect("unindexed active-state preparation");
+        assert_eq!(prepared.prepared.stateless.len(), 2);
+        assert_eq!(prepared.prepared.state_effects.len(), 2);
+        assert!(prepared.prepared.wallet_effects.is_empty());
+    }
+
+    #[tokio::test]
     async fn ordered_active_state_preparation_reports_earliest_failure_and_cancels() {
         const BLOCKS: usize = 32;
         let started = Arc::new(AtomicUsize::new(0));
@@ -12728,6 +12782,7 @@ mod tests {
             prepare_native_active_state_plan_with_validator(
                 active_state_preparation_fixture(BLOCKS),
                 Network::Regtest,
+                true,
                 4,
                 2,
                 Arc::new({
@@ -15021,6 +15076,7 @@ mod tests {
             diagnostic_rpc,
             read_context,
             wallet_backend: None,
+            wallet_chain_backend: None,
             wallet_rpc_authenticated: false,
             wallet_rpc_profile_enabled: false,
             limits: rpc_limits,
@@ -15198,6 +15254,7 @@ mod tests {
                 diagnostic_rpc,
                 read_context,
                 wallet_backend: None,
+                wallet_chain_backend: None,
                 wallet_rpc_authenticated: true,
                 wallet_rpc_profile_enabled: false,
                 limits: rpc_limits,

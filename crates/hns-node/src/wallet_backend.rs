@@ -550,6 +550,17 @@ pub struct BlockHashEvidence {
     pub hash: Option<BlockHash>,
 }
 
+/// One canonical block captured with the same durable chain binding as its
+/// active-height lookup. A pruned body is explicit rather than an empty block.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalBlockEvidence {
+    pub chain_epoch: u64,
+    pub tip: Option<WalletChainTip>,
+    pub height: Height,
+    pub hash: Option<BlockHash>,
+    pub raw: Option<Vec<u8>>,
+}
+
 /// Confirmed transaction inclusion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransactionInclusion {
@@ -1208,6 +1219,42 @@ impl WalletBackend {
                 tip: wallet_chain_tip(snapshot)?,
                 height,
                 hash: read_canonical_hash(snapshot, height).map_err(node_error)?,
+            })
+        })
+        .await
+    }
+
+    /// Supply an account-owned wallet with one retained canonical block.
+    /// The read is snapshot- and epoch-bound; this does not require a global
+    /// wallet or transaction index. A missing body for an existing height means
+    /// pruning has already passed it, and the wallet must recover elsewhere.
+    pub async fn get_canonical_block_evidence(
+        &self,
+        height: Height,
+        expected_chain_epoch: u64,
+    ) -> Result<CanonicalBlockEvidence, WalletBackendError> {
+        let read = self.read.clone();
+        blocking_chain_read(read, move |_, snapshot| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != expected_chain_epoch {
+                return Err(WalletBackendError::StaleChainEpoch {
+                    expected: expected_chain_epoch,
+                    actual: chain_epoch,
+                });
+            }
+            let tip = wallet_chain_tip(snapshot)?;
+            let hash = read_canonical_hash(snapshot, height).map_err(node_error)?;
+            let raw = hash
+                .map(|hash| super::load_block(snapshot, &hash).map_err(node_error))
+                .transpose()?
+                .flatten()
+                .map(|block| block.encode());
+            Ok(CanonicalBlockEvidence {
+                chain_epoch,
+                tip,
+                height,
+                hash,
+                raw,
             })
         })
         .await

@@ -1,5 +1,25 @@
 # Authenticated wallet RPC v1
 
+## Account-wallet chain feed
+
+`POST /api/v1/wallet-chain` is a narrower authenticated native-sync route for
+an `hns-wallet-rs` account-local scanner. It is installed when native active
+state synchronization and explicit listener Authorization are enabled, even if
+`--wallet-index` is off. It accepts only the v1 `chain_snapshot`, `block_hash`,
+and `canonical_block` calls. The existing `/api/v1/wallet` gate and the meaning
+of `--wallet-index` are unchanged.
+
+`canonical_block` takes `height` and `expected_chain_epoch`. Its result contains
+the captured `chain_epoch`, exact `tip`, requested `height`, `block_hash`, and
+`block_hex` in one stable canonical read. Both block fields are null above the
+tip. A non-null hash with null block hex means the body was pruned. A changed
+epoch returns `stale_snapshot`. The caller must not advance its durable wallet
+scan cursor on a pruned or stale result. Before using retained bytes, the
+caller must validate the full block body and match its computed header hash to
+`block_hash`. This route supplies chain evidence;
+it does not choose an account, store a wallet, retain bodies for a lagging
+wallet, or recover an imported wallet's pruned history.
+
 `POST /api/v1/wallet` is the versioned process boundary for a separate
 noncustodial wallet. It is a source-complete transport projection of the typed
 `WalletBackend`; it is not an hsd compatibility RPC and is not a production

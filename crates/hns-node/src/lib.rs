@@ -6642,7 +6642,7 @@ impl PreparedNativeActivation {
     ) -> Result<Self> {
         let prepared = Self::new(stateless)?;
         if prepared.stateless.len() != state_effects.len()
-            || prepared.stateless.len() != wallet_effects.len()
+            || (!wallet_effects.is_empty() && prepared.stateless.len() != wallet_effects.len())
         {
             anyhow::bail!(
                 "prepared native activation has {} proofs, {} state-effect batches and {} wallet-effect batches",
