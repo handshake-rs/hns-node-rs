@@ -1244,11 +1244,37 @@ impl WalletBackend {
             }
             let tip = wallet_chain_tip(snapshot)?;
             let hash = read_canonical_hash(snapshot, height).map_err(node_error)?;
+            if tip.as_ref().is_some_and(|tip| height <= tip.height) && hash.is_none() {
+                return Err(WalletBackendError::Corrupt(
+                    "canonical hash is missing at or below the active tip",
+                ));
+            }
+            if tip.as_ref().is_none_or(|tip| height > tip.height) && hash.is_some() {
+                return Err(WalletBackendError::Corrupt(
+                    "canonical hash is present above the active tip",
+                ));
+            }
+            if tip
+                .as_ref()
+                .is_some_and(|tip| height == tip.height && hash != Some(tip.hash))
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "canonical hash disagrees with the active tip",
+                ));
+            }
             let raw = hash
                 .map(|hash| super::load_block(snapshot, &hash).map_err(node_error))
                 .transpose()?
                 .flatten()
-                .map(|block| block.encode());
+                .map(|block| {
+                    if Some(block.hash()) != hash {
+                        return Err(WalletBackendError::Corrupt(
+                            "retained block does not match its canonical hash",
+                        ));
+                    }
+                    Ok(block.encode())
+                })
+                .transpose()?;
             Ok(CanonicalBlockEvidence {
                 chain_epoch,
                 tip,

@@ -12451,6 +12451,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wallet_chain_feed_returns_retained_canonical_genesis_without_global_index() {
+        let (mut service, genesis_hash) = strict_stored_genesis_service();
+        let connected = service
+            .native_sync_connect_stored_state(1)
+            .expect("activate retained genesis");
+        assert_eq!(connected.connected, 1);
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        assert!(!runtime.read().wallet_index_profile().enabled());
+        let (peers, _events) =
+            hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(Network::Regtest))
+                .expect("peers");
+        let backend = runtime.wallet_backend(peers);
+        let snapshot = backend.get_chain_snapshot().await.expect("chain snapshot");
+        let tip = snapshot.tip.expect("genesis tip");
+        assert_eq!(tip.hash, genesis_hash);
+        assert_eq!(tip.height, 0);
+
+        let retained = backend
+            .get_canonical_block_evidence(0, snapshot.chain_epoch)
+            .await
+            .expect("retained canonical block");
+        assert_eq!(retained.hash, Some(genesis_hash));
+        let raw = retained.raw.expect("retained genesis bytes");
+        assert_eq!(
+            Block::decode(&raw).expect("decode retained block").hash(),
+            genesis_hash
+        );
+        let request = serde_json::to_vec(&serde_json::json!({
+            "api_version": 1,
+            "request_id": "retained-genesis",
+            "call": {
+                "method": "canonical_block",
+                "params": {"height": 0, "expected_chain_epoch": snapshot.chain_epoch},
+            },
+        }))
+        .expect("chain-only request");
+        let (status, Json(response)) =
+            wallet_rpc::dispatch_wallet_chain_rpc(Some(&backend), true, &request).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let response = serde_json::to_value(response).expect("chain-only response");
+        assert_eq!(response["result"]["block_hash"], genesis_hash.to_hex());
+        assert_eq!(response["result"]["block_hex"], hex::encode(&raw));
+
+        let beyond = backend
+            .get_canonical_block_evidence(1, snapshot.chain_epoch)
+            .await
+            .expect("above-tip response");
+        assert!(beyond.hash.is_none());
+        assert!(beyond.raw.is_none());
+        assert!(matches!(
+            backend
+                .get_canonical_block_evidence(0, snapshot.chain_epoch + 1)
+                .await,
+            Err(crate::WalletBackendError::StaleChainEpoch { .. })
+        ));
+        drop(backend);
+        runtime.shutdown_unclean().await.expect("shutdown");
+    }
+
+    #[tokio::test]
     async fn prepared_activation_matches_serial_activation_and_commits_atomically() {
         let (mut serial, hash) = strict_stored_genesis_service();
         let serial_outcome = serial
@@ -15246,6 +15306,10 @@ mod tests {
         let authorization =
             RpcAuthorizationHeader::new("Bearer native-sync-test").expect("authorization");
         let read_context_probe = read_context.clone();
+        let (wallet_peers, _wallet_events) =
+            hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(Network::Regtest))
+                .expect("wallet peer manager");
+        let wallet_chain_backend = runtime.wallet_backend(wallet_peers);
         let server = tokio::spawn(serve_native_sync_rpc(
             listener,
             NativeSyncHttpState {
@@ -15254,7 +15318,7 @@ mod tests {
                 diagnostic_rpc,
                 read_context,
                 wallet_backend: None,
-                wallet_chain_backend: None,
+                wallet_chain_backend: Some(wallet_chain_backend),
                 wallet_rpc_authenticated: true,
                 wallet_rpc_profile_enabled: false,
                 limits: rpc_limits,
@@ -15313,6 +15377,44 @@ mod tests {
             native_registry.expect("native registry diagnostics"),
             status_registry.expect("status registry diagnostics")
         );
+
+        let chain_body = serde_json::json!({
+            "api_version": 1,
+            "request_id": "chain-auth-test",
+            "call": { "method": "chain_snapshot" },
+        })
+        .to_string();
+        for (authorization, expected_status) in [
+            ("", "HTTP/1.1 401 Unauthorized"),
+            (
+                "Authorization: Bearer native-sync-test\r\n",
+                "HTTP/1.1 200 OK",
+            ),
+        ] {
+            let request = format!(
+                "POST /api/v1/wallet-chain HTTP/1.1\r\nHost: {address}\r\n{authorization}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{chain_body}",
+                chain_body.len()
+            );
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect wallet chain RPC");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write wallet chain request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .await
+                .expect("read wallet chain response");
+            assert!(response.starts_with(expected_status), "{response}");
+            if expected_status.ends_with("200 OK") {
+                let (_, body) = response.split_once("\r\n\r\n").expect("body");
+                let json: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+                assert_eq!(json["result"]["chain_epoch"], 0);
+                assert!(json["result"]["tip"].is_null());
+            }
+        }
 
         let (writer_started_tx, writer_started_rx) = tokio::sync::oneshot::channel();
         let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
