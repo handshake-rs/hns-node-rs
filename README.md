@@ -193,12 +193,16 @@ reserve independently.
 ## Optional indexes and wallet RPC
 
 `--wallet-index` enables the global transaction, script-history, spender,
-UTXO, name-state, and swap-evidence rows required by the authenticated wallet
-backend. It is not needed for a rendezvous-only node and remains disabled by
-default. Enabling it does not import or custody a wallet.
+UTXO, name-state, and swap-evidence rows used by indexed wallet queries. It
+remains disabled by default and does not import or custody a wallet.
 
-Wallet RPC requires explicit listener authorization in addition to
-`--wallet-index`; loopback binding alone does not enable it. See:
+An account-local wallet can instead scan the authenticated canonical-block
+feed at `/api/v1/wallet-chain` without `--wallet-index`, provided native active
+state synchronization and explicit listener authorization are enabled. Its
+caller must validate retained block bytes and keep its own durable scan cursor;
+pruned block bodies cannot be recovered through this feed. The indexed
+`/api/v1/wallet` route still requires `--wallet-index`. Loopback binding alone
+authorizes neither route. See:
 
 - [`docs/HNS_NODE_WALLET_INDEX.md`](docs/HNS_NODE_WALLET_INDEX.md)
 - [`docs/WALLET_RPC_V1.md`](docs/WALLET_RPC_V1.md)
