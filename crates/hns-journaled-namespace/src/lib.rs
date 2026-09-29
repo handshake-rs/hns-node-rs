@@ -3604,7 +3604,7 @@ mod tests {
                 "forbidden dependency {forbidden}"
             );
         }
-        assert!(workspace.contains("hns-rollback-journal = { version = \"=0.3.0\" }"));
+        assert!(workspace.contains("hns-rollback-journal = { version = \"=0.5.0\" }"));
     }
 
     #[test]
