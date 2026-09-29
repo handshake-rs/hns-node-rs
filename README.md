@@ -17,9 +17,9 @@ default.
 
 ## Current compatibility
 
-- Node source line: `0.3.7`
+- Node source line: `0.3.8`
 - Rust toolchain: `1.97.1`
-- Handshake protocol crates: exact `hns-rs 0.4.1`
+- Handshake protocol crates: exact `hns-rs 0.5.0`
 - ShakeScape Experimental V1 registry fingerprint:
   `04fce3f12b717c4254bb66ac07474a6c9f61bd2916efc18ebfc79df82a89a66b`
 - Ordinary public mainnet listener and rendezvous port: TCP `12038`

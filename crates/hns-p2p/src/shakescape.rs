@@ -916,7 +916,7 @@ fn is_cross_chain_message(message: KnownMessage) -> bool {
             | KnownMessage::GetDirectOffer
             | KnownMessage::DirectOffer
             | KnownMessage::CancelDirectOffer
-            | KnownMessage::TakeDirectOffer
+            | KnownMessage::AcceptDirectOffer
             | KnownMessage::SwapSessionHello
             | KnownMessage::SwapFundingStatus
             | KnownMessage::SwapRedeemStatus
