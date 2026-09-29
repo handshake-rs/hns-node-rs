@@ -14,61 +14,56 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-MANIFEST_SHA256 = "69f2115f090e3bdeafaea3db8a65db33b42524434d44bdd3f9f80e9f601dea6a"
+MANIFEST_SHA256 = "c6e25c64f4e18544264cce0c70ce1b67efdb1b9f2b8da00b12900acf9fbd8aa1"
 DIRECT = {
-    "hns-covenants": "0.3.1",
-    "hns-dns-relay-protocol": "0.3.0",
-    "hns-hnsr-protocol": "0.3.0",
-    "hns-odoh-protocol": "0.3.0",
-    "hns-p2p-experimental": "0.4.1",
-    "hns-rollback-journal": "0.3.0",
+    "hns-covenants": "0.5.0",
+    "hns-dns-relay-protocol": "0.5.0",
+    "hns-hnsr-protocol": "0.5.0",
+    "hns-marketplace-protocol": "0.5.0",
+    "hns-odoh-protocol": "0.5.0",
+    "hns-p2p-experimental": "0.5.0",
+    "hns-rollback-journal": "0.5.0",
+    "hns-swap": "0.5.0",
 }
 ROOT_CLOSURE = {
-    ("hns-chat-protocol", "0.3.0"),
-    ("hns-covenants", "0.3.1"),
-    ("hns-covenants", "0.4.1"),
-    ("hns-dns-relay-protocol", "0.3.0"),
-    ("hns-encoding", "0.3.1"),
-    ("hns-encoding", "0.4.1"),
-    ("hns-hnsr-protocol", "0.3.0"),
-    ("hns-hrm", "0.3.0"),
-    ("hns-marketplace-protocol", "0.4.1"),
-    ("hns-odoh-protocol", "0.3.0"),
-    ("hns-p2p-experimental", "0.4.1"),
-    ("hns-primitives", "0.3.1"),
-    ("hns-primitives", "0.4.1"),
-    ("hns-rollback-journal", "0.3.0"),
-    ("hns-script", "0.4.1"),
-    ("hns-service-authority", "0.3.0"),
-    ("hns-swap", "0.4.1"),
-    ("hns-transaction", "0.3.1"),
-    ("hns-transaction", "0.4.1"),
+    ('hns-chat-protocol', '0.5.0'),
+    ('hns-covenants', '0.5.0'),
+    ('hns-dns-relay-protocol', '0.5.0'),
+    ('hns-encoding', '0.5.0'),
+    ('hns-hnsr-protocol', '0.5.0'),
+    ('hns-hrm', '0.5.0'),
+    ('hns-marketplace-protocol', '0.5.0'),
+    ('hns-odoh-protocol', '0.5.0'),
+    ('hns-p2p-experimental', '0.5.0'),
+    ('hns-primitives', '0.5.0'),
+    ('hns-rollback-journal', '0.5.0'),
+    ('hns-script', '0.5.0'),
+    ('hns-service-authority', '0.5.0'),
+    ('hns-swap', '0.5.0'),
+    ('hns-transaction', '0.5.0'),
 }
 FUZZ_CLOSURE = {
-    ("hns-chat-protocol", "0.3.0"),
-    ("hns-covenants", "0.3.0"),
-    ("hns-covenants", "0.4.1"),
-    ("hns-dns-relay-protocol", "0.3.0"),
-    ("hns-encoding", "0.3.0"),
-    ("hns-encoding", "0.4.1"),
-    ("hns-hnsr-protocol", "0.3.0"),
-    ("hns-hrm", "0.3.0"),
-    ("hns-marketplace-protocol", "0.4.1"),
-    ("hns-odoh-protocol", "0.3.0"),
-    ("hns-p2p-experimental", "0.4.1"),
-    ("hns-primitives", "0.3.0"),
-    ("hns-primitives", "0.4.1"),
-    ("hns-script", "0.4.1"),
-    ("hns-service-authority", "0.3.0"),
-    ("hns-swap", "0.4.1"),
-    ("hns-transaction", "0.3.0"),
-    ("hns-transaction", "0.4.1"),
+    ('hns-chat-protocol', '0.5.0'),
+    ('hns-covenants', '0.5.0'),
+    ('hns-dns-relay-protocol', '0.5.0'),
+    ('hns-encoding', '0.5.0'),
+    ('hns-hnsr-protocol', '0.5.0'),
+    ('hns-hrm', '0.5.0'),
+    ('hns-marketplace-protocol', '0.5.0'),
+    ('hns-odoh-protocol', '0.5.0'),
+    ('hns-p2p-experimental', '0.5.0'),
+    ('hns-primitives', '0.5.0'),
+    ('hns-script', '0.5.0'),
+    ('hns-service-authority', '0.5.0'),
+    ('hns-swap', '0.5.0'),
+    ('hns-transaction', '0.5.0'),
 }
 ROOT_LOCAL_NAME_COLLISIONS = {
-    "hns-primitives": "0.3.7",
+    "hns-mining": "0.3.8",
+    "hns-primitives": "0.3.8",
 }
 FUZZ_LOCAL_NAME_COLLISIONS = {
-    "hns-primitives": "0.3.7",
+    "hns-primitives": "0.3.8",
 }
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 ALLOWED_PACKAGE_ALIASES = {
@@ -77,7 +72,7 @@ ALLOWED_PACKAGE_ALIASES = {
         ("workspace", "dependencies", "hns-protocol-primitives"),
     ): {
         "package": "hns-primitives",
-        "version": "=0.4.1",
+        "version": "=0.5.0",
     },
 }
 
@@ -137,7 +132,7 @@ def tracked_manifests() -> list[Path]:
 
 
 def published_checksums() -> dict[tuple[str, str], str]:
-    path = ROOT / "release/hns-rs-reviewed-crates.sha256"
+    path = ROOT / "release/hns-rs-0.5.0-crates.sha256"
     try:
         raw = path.read_bytes()
     except OSError as error:
@@ -164,8 +159,8 @@ def published_checksums() -> dict[tuple[str, str], str]:
         if key in checksums:
             fail(f"duplicate release archive: {filename}")
         checksums[key] = checksum
-    if len(checksums) != 24:
-        fail(f"expected 24 reviewed hns-rs archives, found {len(checksums)}")
+    if len(checksums) != 19:
+        fail(f"expected 19 reviewed hns-rs archives, found {len(checksums)}")
     return checksums
 
 

@@ -231,7 +231,7 @@ Implemented:
   strikes, consequential bounded scores/bans, and indexed expiry. The active
   Shakescape V1 peer transport now routes typed name-market and cross-chain
   messages into the node adapter after exact registry/network/genesis
-  negotiation. Exact crates.io `hns-rs =0.4.1` artifacts are pinned. The
+  negotiation. Exact crates.io `hns-rs =0.5.0` artifacts are pinned. The
   independently enabled HNSR `0x0004` role remains opaque byte transport for an
   already-addressed session; it does not replace marketplace discovery or make
   an offer trustworthy. Public multi-node canary qualification remains an

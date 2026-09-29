@@ -220,7 +220,7 @@ deliberately untracked; untrusted registration therefore remains unavailable
 and production availability remains blocked.
 Live marketplace wire transport and its typed node adapter are installed behind
 exact Shakescape V1 registry/network/genesis admission. Exact crates.io
-`hns-rs =0.4.1` artifacts are pinned from the published, non-yanked,
+`hns-rs =0.5.0` artifacts are pinned from the published, non-yanked,
 provenance-verified 19-package cohort. The remaining gate is joined public
 multi-node/mobile canary qualification, not an absent marketplace adapter.
 HNSR profile `0x0004` is independently qualified as opaque, already-addressed

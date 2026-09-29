@@ -698,7 +698,7 @@ remain wallet responsibilities.
 
 The separate Shakescape cache is connected to the active peer transport through
 the typed name-market and cross-chain node adapter. The workspace pins exact
-crates.io `hns-rs =0.4.1` artifacts containing the generated Shakescape V1
+crates.io `hns-rs =0.5.0` artifacts containing the generated Shakescape V1
 registry assignments and typed envelopes. Messages reach the adapter only after
 exact Shakescape V1 registry/network/genesis admission; no sibling path or
 unassigned message ID is permitted. Joined public multi-node/mobile canary

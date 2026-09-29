@@ -20,7 +20,7 @@ CHECKSUM = "a" * 64
 def canonical_package() -> dict[str, str]:
     return {
         "name": "hns-covenants",
-        "version": "0.3.0",
+        "version": "0.5.0",
         "source": REGISTRY_SOURCE,
         "checksum": CHECKSUM,
     }
@@ -38,8 +38,8 @@ class VerifyLockTests(unittest.TestCase):
         with patch.dict(VERIFY_LOCK.__globals__, {"load_toml": lambda _path: {"package": packages}}):
             VERIFY_LOCK(
                 ROOT / "Cargo.lock",
-                expected or {("hns-covenants", "0.3.0")},
-                checksums or {("hns-covenants", "0.3.0"): CHECKSUM},
+                expected or {("hns-covenants", "0.5.0")},
+                checksums or {("hns-covenants", "0.5.0"): CHECKSUM},
                 expected_local_name_collisions or {},
             )
 
@@ -49,7 +49,7 @@ class VerifyLockTests(unittest.TestCase):
     def test_rejects_canonical_and_path_duplicates(self) -> None:
         path_package = {
             "name": "hns-covenants",
-            "version": "0.3.0",
+            "version": "0.5.0",
         }
         with self.assertRaisesRegex(SystemExit, "duplicate hns-rs packages"):
             self.verify([canonical_package(), path_package])
@@ -65,7 +65,7 @@ class VerifyLockTests(unittest.TestCase):
     def test_rejects_noncanonical_release_name_version(self) -> None:
         path_package = {
             "name": "hns-covenants",
-            "version": "0.3.1",
+            "version": "0.5.1",
         }
         with self.assertRaisesRegex(SystemExit, "unexpected hns-rs package"):
             self.verify([canonical_package(), path_package])
@@ -73,7 +73,7 @@ class VerifyLockTests(unittest.TestCase):
     def test_rejects_build_metadata_version(self) -> None:
         build_metadata_package = {
             **canonical_package(),
-            "version": "0.3.0+local",
+            "version": "0.5.0+local",
         }
         with self.assertRaisesRegex(SystemExit, "unexpected hns-rs package"):
             self.verify([build_metadata_package])
@@ -81,7 +81,7 @@ class VerifyLockTests(unittest.TestCase):
     def test_rejects_protected_underscore_lock_package(self) -> None:
         underscore_package = {
             "name": "hns_covenants",
-            "version": "0.3.0",
+            "version": "0.5.0",
         }
         with self.assertRaisesRegex(SystemExit, "protected package spelling"):
             self.verify([canonical_package(), underscore_package])
@@ -90,25 +90,25 @@ class VerifyLockTests(unittest.TestCase):
         primitive_checksum = "b" * 64
         primitive_registry = {
             "name": "hns-primitives",
-            "version": "0.3.0",
+            "version": "0.5.0",
             "source": REGISTRY_SOURCE,
             "checksum": primitive_checksum,
         }
         primitive_local = {
             "name": "hns-primitives",
-            "version": "0.3.7",
+            "version": "0.3.8",
         }
         self.verify(
             [canonical_package(), primitive_registry, primitive_local],
             expected={
-                ("hns-covenants", "0.3.0"),
-                ("hns-primitives", "0.3.0"),
+                ("hns-covenants", "0.5.0"),
+                ("hns-primitives", "0.5.0"),
             },
             checksums={
-                ("hns-covenants", "0.3.0"): CHECKSUM,
-                ("hns-primitives", "0.3.0"): primitive_checksum,
+                ("hns-covenants", "0.5.0"): CHECKSUM,
+                ("hns-primitives", "0.5.0"): primitive_checksum,
             },
-            expected_local_name_collisions={"hns-primitives": "0.3.7"},
+            expected_local_name_collisions={"hns-primitives": "0.3.8"},
         )
 
 
@@ -152,7 +152,7 @@ class VerifyManifestSourcePolicyTests(unittest.TestCase):
                     "dependencies": {
                         "hns-protocol-primitives": {
                             "package": "hns-primitives",
-                            "version": "=0.4.1",
+                            "version": "=0.5.0",
                         },
                     },
                 },
@@ -169,7 +169,7 @@ class VerifyManifestSourcePolicyTests(unittest.TestCase):
                         "dependencies": {
                             "hns-protocol-primitives": {
                                 "package": "hns-primitives",
-                                "version": "=0.4.2",
+                                "version": "=0.5.1",
                             },
                         },
                     },
@@ -253,7 +253,7 @@ class VerifyManifestSourcePolicyTests(unittest.TestCase):
                 {
                     "package": "hns-covenants",
                     "registry": "alternate",
-                    "version": "=0.3.0",
+                    "version": "=0.5.0",
                 },
             )
 
