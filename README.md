@@ -18,6 +18,9 @@ default.
 ## Current compatibility
 
 - Node source line: `0.3.8`
+- Latest prerelease: [`v0.3.8`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.8),
+  with an ARM64 Linux binary, offline relinking source bundle, build provenance,
+  and SHA-256 checksums
 - Rust toolchain: `1.97.1`
 - Handshake protocol crates: exact `hns-rs 0.5.0`
 - ShakeScape Experimental V1 registry fingerprint:
