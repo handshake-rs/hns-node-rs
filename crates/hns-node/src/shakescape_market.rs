@@ -37,11 +37,16 @@ pub const MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE: usize = 256;
 const MAX_SHAKESCAPE_NAME_MARKET_PENDING_REQUESTS: usize = 1_024;
 const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS: usize = 4_096;
+const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER: usize = 64;
 const MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS: usize = 1_024;
 const MAX_SHAKESCAPE_CROSS_CHAIN_PENDING_REQUESTS: usize = 4_096;
 const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS: usize = 4_096;
 const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_OFFER: usize = 4;
 const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_PEER: usize = 64;
+const MAX_SHAKESCAPE_CROSS_CHAIN_RECOVERY_SESSIONS_PER_PEER: usize = 64;
+/// Keep the typed cross-chain maps within the generic relay's default signed
+/// publication horizon even though those messages do not enter `RelayStore`.
+const MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 const SHAKESCAPE_CROSS_CHAIN_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const LOCAL_WALLET_RELAY_PEER: [u8; 32] = [0x57; 32];
 const NAME_MARKET_IDENTITY_DOMAIN: &[u8] = b"hns-node/shakescape-name-market-identity/v1";
@@ -367,6 +372,9 @@ impl ShakescapeNameMarketState {
 struct CrossChainOfferRecord {
     offer: DirectOffer,
     owner: Option<PeerId>,
+    /// Preserve admission attribution across disconnects so reconnecting
+    /// cannot refill the same peer's share of the public board.
+    source: PeerId,
 }
 
 #[derive(Clone, Debug)]
@@ -445,7 +453,7 @@ impl ShakescapeCrossChainState {
             self.offers.contains_key(&route.offer_id) && route.acceptance.header.expires_at > now
         });
         self.recovery_sessions
-            .retain(|_, route| route.proposal.terms().received_refund_deadline.value > now);
+            .retain(|_, route| route.proposal.terms().offered_refund_deadline.value > now);
     }
 }
 
@@ -983,6 +991,18 @@ impl ShakescapeRelayHandle {
                         "cross-chain offer capacity reached",
                     ));
                 }
+                if !state.offers.contains_key(&offer.offer_id)
+                    && state
+                        .offers
+                        .values()
+                        .filter(|record| record.source == peer)
+                        .count()
+                        >= MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER
+                {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "cross-chain offer peer capacity reached",
+                    ));
+                }
                 let offer_id = offer.offer_id;
                 if let Some(candidates) = state.cancellations.remove(&offer_id) {
                     if let Some(tombstone) = candidates.into_iter().find(|candidate| {
@@ -1017,6 +1037,7 @@ impl ShakescapeRelayHandle {
                     CrossChainOfferRecord {
                         offer,
                         owner: Some(peer),
+                        source: peer,
                     },
                 );
                 for target in state.peers.iter().copied().filter(|target| *target != peer) {
@@ -1142,7 +1163,7 @@ impl ShakescapeRelayHandle {
                         message: CrossChainMessage::SwapSessionProposal(proposal),
                     });
                 } else {
-                    validate_recovery_network(state, proposal.terms())?;
+                    validate_recovery_proposal(state, &proposal, now)?;
                     if let Some(route) = state.recovery_sessions.get(&session_id) {
                         if route.maker != peer || route.proposal != proposal {
                             return Err(ShakescapeRelayHandleError::CrossChain(
@@ -1158,6 +1179,17 @@ impl ShakescapeRelayHandle {
                         {
                             return Err(ShakescapeRelayHandleError::CrossChain(
                                 "cross-chain session capacity reached",
+                            ));
+                        }
+                        if state
+                            .recovery_sessions
+                            .values()
+                            .filter(|route| route.maker == peer)
+                            .count()
+                            >= MAX_SHAKESCAPE_CROSS_CHAIN_RECOVERY_SESSIONS_PER_PEER
+                        {
+                            return Err(ShakescapeRelayHandleError::CrossChain(
+                                "cross-chain recovery session peer capacity reached",
                             ));
                         }
                         state.recovery_sessions.insert(
@@ -1207,7 +1239,7 @@ impl ShakescapeRelayHandle {
                         message: CrossChainMessage::SwapSessionHello(hello),
                     });
                 } else {
-                    validate_recovery_network(state, &hello)?;
+                    validate_recovery_terms(state, &hello, now)?;
                     hello.verify_agreement(hello.header.network).map_err(|_| {
                         ShakescapeRelayHandleError::CrossChain(
                             "invalid countersigned swap recovery hello",
@@ -1505,7 +1537,11 @@ fn validate_cross_chain_cancellation(
         .encode()
         .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid direct offer cancellation"))
         .map(|_| ())?;
-    if now < cancellation.header.created_at || now >= cancellation.header.expires_at {
+    if !typed_publication_window_is_valid(
+        cancellation.header.created_at,
+        cancellation.header.expires_at,
+        now,
+    ) {
         return Err(ShakescapeRelayHandleError::Uncorrelated(
             "direct offer cancellation is outside its active window",
         ));
@@ -1569,14 +1605,20 @@ fn validate_cross_chain_offer(
             "direct offer is bound to another Handshake network",
         ));
     }
+    if !typed_publication_window_is_valid(offer.header.created_at, offer.header.expires_at, now) {
+        return Err(ShakescapeRelayHandleError::CrossChain(
+            "direct offer is outside the bounded active window",
+        ));
+    }
     offer
         .verify_at(offer.header.network, now)
         .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid direct offer"))
 }
 
-fn validate_recovery_network(
+fn validate_recovery_terms(
     state: &ShakescapeCrossChainState,
     hello: &SwapSessionHello,
+    now: u64,
 ) -> Result<(), ShakescapeRelayHandleError> {
     if hello.header.network.hns_magic != state.network_magic
         || hello.header.network.hns_genesis.as_bytes() != &state.network_genesis
@@ -1585,7 +1627,40 @@ fn validate_recovery_network(
             "swap recovery is bound to another Handshake network",
         ));
     }
+    let created_at = hello.header.created_at;
+    let offered_horizon = hello.offered_refund_deadline.value.checked_sub(created_at);
+    let received_horizon = hello.received_refund_deadline.value.checked_sub(created_at);
+    if created_at > now
+        || hello.offered_refund_deadline.value <= now
+        || offered_horizon
+            .is_none_or(|lifetime| lifetime > MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS)
+        || received_horizon
+            .is_none_or(|lifetime| lifetime > MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS)
+    {
+        return Err(ShakescapeRelayHandleError::CrossChain(
+            "swap recovery terms exceed the bounded settlement horizon",
+        ));
+    }
     Ok(())
+}
+
+fn validate_recovery_proposal(
+    state: &ShakescapeCrossChainState,
+    proposal: &SwapSessionProposal,
+    now: u64,
+) -> Result<(), ShakescapeRelayHandleError> {
+    validate_recovery_terms(state, proposal.terms(), now)?;
+    SwapSessionProposal::from_maker_signed(proposal.terms().clone())
+        .map(|_| ())
+        .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid swap recovery proposal"))
+}
+
+fn typed_publication_window_is_valid(created_at: u64, expires_at: u64, now: u64) -> bool {
+    created_at <= now
+        && now < expires_at
+        && expires_at
+            .checked_sub(created_at)
+            .is_some_and(|lifetime| lifetime <= MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS)
 }
 
 fn validate_cross_chain_status_route<F>(
@@ -2724,6 +2799,260 @@ mod cross_chain_tests {
                 "direct offer cancellation is outside its active window"
             ))
         ));
+    }
+
+    #[test]
+    fn cross_chain_publications_cannot_outlive_the_typed_relay_horizon() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let peer = PeerId(1);
+        let mut overlong_offer = offer();
+        overlong_offer.header.expires_at = overlong_offer
+            .header
+            .created_at
+            .checked_add(MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS + 1)
+            .expect("bounded test horizon");
+        overlong_offer
+            .sign(&[7; 32])
+            .expect("overlong signed offer");
+        let requested = relay
+            .receive_cross_chain(
+                peer,
+                1,
+                CrossChainMessage::DirectOfferInventory(vec![overlong_offer.offer_id]),
+                NOW,
+            )
+            .expect("offer inventory request");
+        let request_id = requested
+            .sends
+            .iter()
+            .find_map(|send| match send.message {
+                CrossChainMessage::GetDirectOffer(id) if id == overlong_offer.offer_id => {
+                    Some(send.request_id)
+                }
+                _ => None,
+            })
+            .expect("overlong offer request");
+        assert!(matches!(
+            relay.receive_cross_chain(
+                peer,
+                request_id,
+                CrossChainMessage::DirectOffer(overlong_offer),
+                NOW,
+            ),
+            Err(ShakescapeRelayHandleError::CrossChain(
+                "direct offer is outside the bounded active window"
+            ))
+        ));
+
+        let base_offer = offer();
+        let mut overlong_cancellation = cancellation(&base_offer);
+        overlong_cancellation.header.expires_at = overlong_cancellation
+            .header
+            .created_at
+            .checked_add(MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS + 1)
+            .expect("bounded cancellation horizon");
+        overlong_cancellation
+            .sign(&[7; 32])
+            .expect("overlong signed cancellation");
+        assert!(matches!(
+            relay.receive_cross_chain(
+                peer,
+                2,
+                CrossChainMessage::CancelDirectOffer(overlong_cancellation),
+                NOW,
+            ),
+            Err(ShakescapeRelayHandleError::Uncorrelated(
+                "direct offer cancellation is outside its active window"
+            ))
+        ));
+
+        let service = relay.inner.lock().expect("relay state");
+        assert!(service.cross_chain.offers.is_empty());
+        assert!(service.cross_chain.cancellations.is_empty());
+    }
+
+    #[test]
+    fn disconnected_peer_cannot_fill_the_shared_offer_board() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let peer = PeerId(1);
+        {
+            let mut service = relay.inner.lock().expect("relay state");
+            for index in 0..MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER {
+                let mut existing = offer();
+                existing.header.sequence = index as u64 + 10;
+                existing.swap_session_id = [index as u8 + 1; 32];
+                existing.sign(&[7; 32]).expect("signed offer");
+                service.cross_chain.offers.insert(
+                    existing.offer_id,
+                    CrossChainOfferRecord {
+                        offer: existing,
+                        owner: Some(peer),
+                        source: peer,
+                    },
+                );
+            }
+        }
+        relay
+            .cross_chain_peer_disconnected(peer)
+            .expect("disconnect");
+        let next = offer();
+        let request = relay
+            .receive_cross_chain(
+                peer,
+                1,
+                CrossChainMessage::DirectOfferInventory(vec![next.offer_id]),
+                NOW,
+            )
+            .expect("request after reconnect");
+        let request_id = request.sends[0].request_id;
+        assert!(matches!(
+            relay.receive_cross_chain(
+                peer,
+                request_id,
+                CrossChainMessage::DirectOffer(next.clone()),
+                NOW,
+            ),
+            Err(ShakescapeRelayHandleError::CrossChain(
+                "cross-chain offer peer capacity reached"
+            ))
+        ));
+        let other = PeerId(2);
+        let request = relay
+            .receive_cross_chain(
+                other,
+                2,
+                CrossChainMessage::DirectOfferInventory(vec![next.offer_id]),
+                NOW,
+            )
+            .expect("another peer may request");
+        relay
+            .receive_cross_chain(
+                other,
+                request.sends[0].request_id,
+                CrossChainMessage::DirectOffer(next),
+                NOW,
+            )
+            .expect("another peer retains board capacity");
+    }
+
+    #[test]
+    fn recovery_routes_bound_signed_horizons_and_each_peer() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let peer = PeerId(1);
+        let offer = offer();
+        let acceptance = acceptance(&offer);
+        let (base_proposal, _) = accepted_session(&offer, &acceptance);
+
+        let mut overlong_terms = base_proposal.terms().clone();
+        overlong_terms.received_refund_deadline.value = overlong_terms
+            .header
+            .created_at
+            .checked_add(MAX_SHAKESCAPE_TYPED_PUBLICATION_LIFETIME_SECONDS)
+            .expect("bounded received horizon");
+        overlong_terms.offered_refund_deadline.value = overlong_terms
+            .received_refund_deadline
+            .value
+            .checked_add(1)
+            .expect("overlong offered horizon");
+        let overlong_proposal = overlong_terms
+            .into_maker_proposal(&[9; 32])
+            .expect("signed overlong proposal");
+        assert!(matches!(
+            relay.receive_cross_chain(
+                peer,
+                1,
+                CrossChainMessage::SwapSessionProposal(overlong_proposal),
+                NOW,
+            ),
+            Err(ShakescapeRelayHandleError::CrossChain(
+                "swap recovery terms exceed the bounded settlement horizon"
+            ))
+        ));
+
+        let mut last_proposal = None;
+        for index in 0..MAX_SHAKESCAPE_CROSS_CHAIN_RECOVERY_SESSIONS_PER_PEER {
+            let mut terms = base_proposal.terms().clone();
+            let encoded = u64::try_from(index + 1)
+                .expect("bounded route index")
+                .to_be_bytes();
+            terms.swap_session_id[..8].copy_from_slice(&encoded);
+            terms.header.sequence = terms
+                .header
+                .sequence
+                .checked_add(u64::try_from(index).expect("bounded sequence"))
+                .expect("route sequence");
+            let proposal = terms
+                .into_maker_proposal(&[9; 32])
+                .expect("signed recovery proposal");
+            relay
+                .receive_cross_chain(
+                    peer,
+                    u64::try_from(index + 2).expect("bounded request id"),
+                    CrossChainMessage::SwapSessionProposal(proposal.clone()),
+                    NOW,
+                )
+                .expect("recovery route within peer quota");
+            last_proposal = Some(proposal);
+        }
+        relay
+            .receive_cross_chain(
+                peer,
+                100,
+                CrossChainMessage::SwapSessionProposal(
+                    last_proposal.expect("last accepted proposal"),
+                ),
+                NOW,
+            )
+            .expect("exact recovery proposal replay remains idempotent at capacity");
+
+        let mut overflow_terms = base_proposal.terms().clone();
+        overflow_terms.swap_session_id = [0x7f; 32];
+        overflow_terms.header.sequence = 10_000;
+        let overflow = overflow_terms
+            .into_maker_proposal(&[9; 32])
+            .expect("signed quota-overflow proposal");
+        assert!(matches!(
+            relay.receive_cross_chain(
+                peer,
+                101,
+                CrossChainMessage::SwapSessionProposal(overflow),
+                NOW,
+            ),
+            Err(ShakescapeRelayHandleError::CrossChain(
+                "cross-chain recovery session peer capacity reached"
+            ))
+        ));
+        assert_eq!(
+            relay
+                .inner
+                .lock()
+                .expect("relay state")
+                .cross_chain
+                .recovery_sessions
+                .len(),
+            MAX_SHAKESCAPE_CROSS_CHAIN_RECOVERY_SESSIONS_PER_PEER
+        );
     }
 
     #[test]
