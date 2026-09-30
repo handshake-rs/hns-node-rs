@@ -293,6 +293,44 @@ impl ShakescapeNameMarketState {
         self.pending
             .retain(|_, request| request.expires_at_unix > now);
     }
+
+    /// Retire typed latest-state rows at their signed exclusive horizon.
+    ///
+    /// Clearing the event window after a removal deliberately forces every
+    /// incremental consumer onto a coherent snapshot. Otherwise a silent row
+    /// deletion could either mix snapshot pages or leave a wallet unaware that
+    /// an offer disappeared. This also releases the bounded record capacity
+    /// before a later signed offer is considered.
+    fn expire_records(&mut self, now: u64) -> Result<usize, ShakescapeRelayHandleError> {
+        let expired = self
+            .records
+            .iter()
+            .filter_map(|(identity, record)| {
+                let expires_at = match &record.state {
+                    NameMarketRecordState::Active { listing } => listing.expires_at,
+                    NameMarketRecordState::Cancelled { cancellation } => cancellation.expires_at,
+                };
+                (expires_at <= now).then_some(*identity)
+            })
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let next_revision =
+            self.revision
+                .checked_add(1)
+                .ok_or(ShakescapeRelayHandleError::NameMarket(
+                    "name-market revision exhausted",
+                ))?;
+        for identity in &expired {
+            if let Some(record) = self.records.remove(identity) {
+                self.listing_index.remove(&record.listing_hash);
+            }
+        }
+        self.revision = next_revision;
+        self.events.clear();
+        Ok(expired.len())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -568,6 +606,7 @@ impl ShakescapeRelayHandle {
             .inner
             .lock()
             .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        service.name_market.expire_records(now)?;
         match message {
             NameMarketMessage::Offer(listing) => admit_listing(
                 &mut service,
@@ -618,6 +657,7 @@ impl ShakescapeRelayHandle {
             .inner
             .lock()
             .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        service.name_market.expire_records(now)?;
         let signer =
             service
                 .acceptance_signer
@@ -665,6 +705,7 @@ impl ShakescapeRelayHandle {
             .lock()
             .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         service.name_market.expire_pending(now);
+        service.name_market.expire_records(now)?;
         let mut dispatch = ShakescapeNameMarketDispatch::default();
         match message {
             NameMarketMessage::Hello(hello) => {
@@ -2070,6 +2111,61 @@ mod cross_chain_tests {
         };
         cancellation.sign(&[7; 32]).unwrap();
         cancellation
+    }
+
+    #[test]
+    fn expired_name_market_rows_release_typed_capacity_and_force_snapshot() {
+        let mut state = ShakescapeNameMarketState::new(MAGIC, GENESIS);
+        state.revision = 7;
+        state.events.push_back(ShakescapeNameMarketEvent {
+            revision: 7,
+            received_at_unix: NOW - 1,
+            kind: ShakescapeNameMarketEventKind::Cancellation,
+            content_hash: [0x44; 32],
+            envelope_bytes: vec![1],
+        });
+
+        for index in 0..MAX_SHAKESCAPE_NAME_MARKET_RECORDS {
+            let encoded = u32::try_from(index)
+                .expect("bounded test index")
+                .to_be_bytes();
+            let mut identity = [0_u8; 32];
+            identity[..4].copy_from_slice(&encoded);
+            let mut listing_hash = [0x51_u8; 32];
+            listing_hash[..4].copy_from_slice(&encoded);
+            let cancellation = ListingCancellation {
+                network: hns_swap::NetworkBinding {
+                    magic: MAGIC,
+                    genesis: BlockHash::new(GENESIS),
+                },
+                listing_hash,
+                seller_public_key: [2; 33],
+                created_at: NOW - 100,
+                expires_at: NOW,
+                sequence: 2,
+                signature: None,
+            };
+            state.listing_index.insert(listing_hash, identity);
+            state.records.insert(
+                identity,
+                NameMarketRecord {
+                    listing_hash,
+                    sequence: 2,
+                    state: NameMarketRecordState::Cancelled { cancellation },
+                    envelope_bytes: vec![2],
+                },
+            );
+        }
+
+        assert_eq!(state.records.len(), MAX_SHAKESCAPE_NAME_MARKET_RECORDS);
+        assert_eq!(
+            state.expire_records(NOW).expect("expire signed horizons"),
+            MAX_SHAKESCAPE_NAME_MARKET_RECORDS,
+        );
+        assert!(state.records.is_empty());
+        assert!(state.listing_index.is_empty());
+        assert!(state.events.is_empty());
+        assert_eq!(state.revision, 8);
     }
 
     fn accepted_session(
