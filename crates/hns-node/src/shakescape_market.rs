@@ -249,6 +249,16 @@ struct NameMarketRecord {
     envelope_bytes: Vec<u8>,
 }
 
+/// Bounded replay tombstone for one seller/name identity. The expiry is the
+/// maximum signed horizon ever accepted for that identity, so replacing a
+/// long-lived listing with a newer short-lived object cannot make an older
+/// sequence replayable when the replacement expires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NameMarketReplayWatermark {
+    sequence: u64,
+    expires_at_unix: u64,
+}
+
 #[derive(Clone, Debug)]
 struct PendingNameMarketRequest {
     hashes: Vec<[u8; 32]>,
@@ -260,6 +270,7 @@ struct ShakescapeNameMarketState {
     network_magic: u32,
     network_genesis: [u8; 32],
     records: BTreeMap<[u8; 32], NameMarketRecord>,
+    replay_watermarks: BTreeMap<[u8; 32], NameMarketReplayWatermark>,
     listing_index: BTreeMap<[u8; 32], [u8; 32]>,
     events: VecDeque<ShakescapeNameMarketEvent>,
     revision: u64,
@@ -274,6 +285,7 @@ impl ShakescapeNameMarketState {
             network_magic,
             network_genesis,
             records: BTreeMap::new(),
+            replay_watermarks: BTreeMap::new(),
             listing_index: BTreeMap::new(),
             events: VecDeque::new(),
             revision: 0,
@@ -313,6 +325,8 @@ impl ShakescapeNameMarketState {
                 (expires_at <= now).then_some(*identity)
             })
             .collect::<Vec<_>>();
+        self.replay_watermarks
+            .retain(|_, watermark| watermark.expires_at_unix > now);
         if expired.is_empty() {
             return Ok(0);
         }
@@ -330,6 +344,22 @@ impl ShakescapeNameMarketState {
         self.revision = next_revision;
         self.events.clear();
         Ok(expired.len())
+    }
+
+    fn record_replay_watermark(&mut self, identity: [u8; 32], sequence: u64, expires_at_unix: u64) {
+        let maximum_expiry = self
+            .replay_watermarks
+            .get(&identity)
+            .map_or(expires_at_unix, |watermark| {
+                watermark.expires_at_unix.max(expires_at_unix)
+            });
+        self.replay_watermarks.insert(
+            identity,
+            NameMarketReplayWatermark {
+                sequence,
+                expires_at_unix: maximum_expiry,
+            },
+        );
     }
 }
 
@@ -1783,12 +1813,23 @@ fn admit_listing(
                 rebroadcast: None,
             });
         }
-        if listing.sequence <= existing.sequence {
-            return Err(ShakescapeRelayHandleError::NameMarket(
-                "listing sequence does not advance seller/name state",
-            ));
-        }
-    } else if service.name_market.records.len() >= MAX_SHAKESCAPE_NAME_MARKET_RECORDS {
+    }
+    if service
+        .name_market
+        .replay_watermarks
+        .get(&identity)
+        .is_some_and(|watermark| listing.sequence <= watermark.sequence)
+    {
+        return Err(ShakescapeRelayHandleError::NameMarket(
+            "listing sequence does not advance seller/name state",
+        ));
+    }
+    if !service
+        .name_market
+        .replay_watermarks
+        .contains_key(&identity)
+        && service.name_market.replay_watermarks.len() >= MAX_SHAKESCAPE_NAME_MARKET_RECORDS
+    {
         return Err(ShakescapeRelayHandleError::NameMarket(
             "name-market record capacity reached",
         ));
@@ -1830,6 +1871,9 @@ fn admit_listing(
             envelope_bytes: envelope_bytes.clone(),
         },
     );
+    service
+        .name_market
+        .record_replay_watermark(identity, listing.sequence, listing.expires_at);
     append_event(
         &mut service.name_market,
         now,
@@ -1903,7 +1947,13 @@ fn admit_cancellation(
     cancellation
         .verify_for_listing(&listing, cancellation.network, now)
         .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing cancellation"))?;
-    if cancellation.sequence <= existing.sequence {
+    if cancellation.sequence <= existing.sequence
+        || service
+            .name_market
+            .replay_watermarks
+            .get(&identity)
+            .is_some_and(|watermark| cancellation.sequence <= watermark.sequence)
+    {
         return Err(ShakescapeRelayHandleError::NameMarket(
             "cancellation sequence does not advance seller/name state",
         ));
@@ -1934,6 +1984,11 @@ fn admit_cancellation(
             },
             envelope_bytes: envelope_bytes.clone(),
         },
+    );
+    service.name_market.record_replay_watermark(
+        identity,
+        cancellation.sequence,
+        cancellation.expires_at,
     );
     append_event(
         &mut service.name_market,
@@ -2029,12 +2084,15 @@ fn append_event(
 
 #[cfg(test)]
 mod cross_chain_tests {
+    use hns_covenants::FinalizeCovenant;
     use hns_marketplace_protocol::{
         AssetAmount, AssetId, ChainId, DeadlineKind, DirectOffer, DirectOfferAcceptance,
         DirectOfferCancellation, FundingState, MarketPair, NetworkBinding, SettlementDeadline,
         SignedObjectHeader, SwapFundingStatus, SwapSessionProposal, MARKETPLACE_PROTOCOL_VERSION,
     };
-    use hns_protocol_primitives::BlockHash;
+    use hns_protocol_primitives::{BlockHash, Dollarydoos, Height, TransactionHash};
+    use hns_swap::{lock_script_hash, NetworkBinding as SwapNetworkBinding, SwapProof};
+    use hns_transaction::{Address, Coin, Outpoint};
 
     use super::*;
 
@@ -2113,6 +2171,112 @@ mod cross_chain_tests {
         cancellation
     }
 
+    fn fixed_price_listing(sequence: u64, expires_at: u64) -> FixedPriceListing {
+        let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
+        let seller_public_key = signing_key.verifying_key().to_encoded_point(true);
+        let seller_public_key = seller_public_key
+            .as_bytes()
+            .try_into()
+            .expect("compressed public key");
+        let mut proof = SwapProof {
+            network: SwapNetworkBinding {
+                magic: MAGIC,
+                genesis: BlockHash::new(GENESIS),
+            },
+            locking_outpoint: Outpoint {
+                transaction_hash: TransactionHash::new([0x22; 32]),
+                index: 7,
+            },
+            name: b"relay-watermark".to_vec(),
+            seller_public_key,
+            payment_address: Address::new(0, vec![0x33; 20]).expect("payment address"),
+            price: Dollarydoos::new(12_345_678),
+            lock_time_seconds: 1_800_000_000,
+            signature: None,
+            fee_address: None,
+            fee: Dollarydoos::new(0),
+        };
+        let coin = Coin {
+            outpoint: proof.locking_outpoint,
+            value: Dollarydoos::new(900_000),
+            height: Height::new(123),
+            coinbase: false,
+            address: Address::new(0, lock_script_hash(&proof.seller_public_key).to_vec())
+                .expect("lock address"),
+            covenant: FinalizeCovenant::new(
+                proof.name.clone(),
+                Height::new(1),
+                false,
+                Height::new(0),
+                0,
+                BlockHash::new([0x55; 32]),
+            )
+            .expect("finalize")
+            .to_covenant()
+            .expect("covenant"),
+        };
+        proof
+            .sign(&coin, &signing_key)
+            .expect("signed Shakedex proof");
+        let mut listing = FixedPriceListing {
+            proof,
+            created_at: NOW - 10,
+            expires_at,
+            sequence,
+            signature: None,
+        };
+        listing
+            .sign(&signing_key)
+            .expect("signed fixed-price listing");
+        listing
+    }
+
+    fn relay_service() -> ShakescapeRelayService {
+        ShakescapeRelayService {
+            relay: RelayStore::new(RelayRoles::ALL, RelayLimits::default()).expect("relay limits"),
+            name_market: ShakescapeNameMarketState::new(MAGIC, GENESIS),
+            cross_chain: ShakescapeCrossChainState::new(MAGIC, GENESIS),
+            acceptance_signer: None,
+        }
+    }
+
+    #[test]
+    fn newer_short_lived_listing_does_not_reopen_an_older_sequence() {
+        let older = fixed_price_listing(1, NOW + 600);
+        let newer = fixed_price_listing(2, NOW + 100);
+        let identity = listing_identity(&older).expect("listing identity");
+        let mut service = relay_service();
+
+        admit_listing(&mut service, [9; 32], older.clone(), 1, NOW).expect("older listing");
+        admit_listing(&mut service, [9; 32], newer, 2, NOW + 1).expect("newer listing");
+        assert_eq!(
+            service.name_market.replay_watermarks.get(&identity),
+            Some(&NameMarketReplayWatermark {
+                sequence: 2,
+                expires_at_unix: NOW + 600,
+            })
+        );
+
+        assert_eq!(
+            service
+                .name_market
+                .expire_records(NOW + 100)
+                .expect("expire replacement"),
+            1
+        );
+        assert!(service.name_market.records.is_empty());
+        assert!(service
+            .name_market
+            .replay_watermarks
+            .contains_key(&identity));
+        assert!(matches!(
+            admit_listing(&mut service, [9; 32], older, 3, NOW + 101),
+            Err(ShakescapeRelayHandleError::NameMarket(
+                "listing sequence does not advance seller/name state"
+            ))
+        ));
+    }
+
     #[test]
     fn expired_name_market_rows_release_typed_capacity_and_force_snapshot() {
         let mut state = ShakescapeNameMarketState::new(MAGIC, GENESIS);
@@ -2155,6 +2319,13 @@ mod cross_chain_tests {
                     envelope_bytes: vec![2],
                 },
             );
+            state.replay_watermarks.insert(
+                identity,
+                NameMarketReplayWatermark {
+                    sequence: 2,
+                    expires_at_unix: NOW,
+                },
+            );
         }
 
         assert_eq!(state.records.len(), MAX_SHAKESCAPE_NAME_MARKET_RECORDS);
@@ -2163,6 +2334,7 @@ mod cross_chain_tests {
             MAX_SHAKESCAPE_NAME_MARKET_RECORDS,
         );
         assert!(state.records.is_empty());
+        assert!(state.replay_watermarks.is_empty());
         assert!(state.listing_index.is_empty());
         assert!(state.events.is_empty());
         assert_eq!(state.revision, 8);
