@@ -7,11 +7,9 @@ authenticated-tree mutation, and one durable commit per bounded state slice.
 
 ## Reproducible measurements
 
-The live sampler remains in the source MeshMine repository because `scripts/`
-was outside the extracted `hsrd/` prefix. Run that command from the source
-commit pinned in
-[`extraction-provenance.md`](extraction-provenance.md). The Rust performance
-gate runs directly from this standalone repository.
+The Rust performance gate runs from this repository. The live sampler is
+`scripts/measure-hsrd-native-sync.py` in the MeshMine repository; run the sampler
+command from that repository against the selected node instance.
 
 Measure an already-running native mainnet node:
 
@@ -199,7 +197,7 @@ local state/storage work. Growing `peer_event_backlog` or
 `validation_result_backlog` identifies coordinator starvation. Zero buffer with
 idle inflight work identifies acquisition/scheduling rather than state replay.
 
-## Implemented replay refactor
+## Bounded replay
 
 Network maintenance retains its configured polling cadence, while active-state
 work has a separate 10 ms minimum cadence. The activation branch connects
@@ -317,7 +315,7 @@ split ownership when coordinator backlog grows during otherwise healthy state
 slices; continue storage optimization when state-commit time dominates without
 backlog.
 
-## Authenticated-tree storage decision
+## Authenticated-tree storage
 
 The name tree is content addressed: keys are cryptographic hashes, records are
 immutable, and every mutation creates a new path while retaining old paths for
@@ -343,13 +341,11 @@ The implemented layout is an append-only, generation-based Urkel record store:
 4. Group affected paths by `(segment, page)` and traverse immutable addresses
    in descending physical order. One bounded worker pool serves the complete
    traversal instead of creating threads at every read-ahead refill.
-   Schema-18 pages combine selected legacy records into one covering payload
-   read per page; schema-19 pages read one 4 KiB index and only selected 4 KiB
-   record subpages. A mutation Patricia frontier then reconstructs and hashes
+   Current pages read one 4 KiB index and only selected 4 KiB record subpages. A mutation Patricia frontier then reconstructs and hashes
    every final shared path once rather than once per key. Exhaustive
    page-backed startup validation uses a bounded 65,536-root window so a
    mainnet tree needs hundreds of page plans rather than tens of thousands;
-   the legacy-only validator keeps its conservative 1,024-key window.
+   Validation of fallback node records keeps its conservative 1,024-key window.
 5. For a state transaction, append and sync segment data before committing the
    RocksDB root locator and chain-state batch. A crash before the batch leaves
    an unreachable tail; a committed locator can never reference unsynced data.
@@ -368,7 +364,7 @@ are bootstrapped into the current format before startup audit. That
 one-time conversion splits the upper tree into at most 4,096 deterministic
 subtrees, advances their post-order traversals together with RocksDB
 `MultiGet`s of at most 1,024 nodes, and writes each completed 64 KiB page
-immediately. It reads each reachable legacy record once and retains only a
+immediately. It reads each reachable fallback record once and retains only a
 deduplication set, shallow traversal stacks, and one page buffer rather than a
 second all-record map and an all-page output graph. Old `NameTreeNodes` records
 remain a read-only fallback for historical retained roots. New block and undo
@@ -416,7 +412,7 @@ retained root locators atomically before old files are removed.
 
 Point-oriented column families share a bounded 192 MiB cache. New raw blocks
 and undo payloads bypass the LSM and place only compact locators in RocksDB;
-legacy inline values retain a separate 32 MiB cache. Bloom filters, cached
+inline values retain a separate 32 MiB cache. Bloom filters, cached
 index/filter blocks, bounded WAL retention, and four background jobs constrain
 the remaining read and write amplification.
 
@@ -424,7 +420,7 @@ Name-tree compaction validates the complete retained-root union before deletion,
 performs a key-only preflight, and commits unreachable keys in 65,536-key
 chunks. The completion checkpoint is written last. A crash may leave extra
 unreachable records but cannot delete a validated reachable record; retry is
-idempotent. This compactor now applies only to legacy fallback data;
+idempotent. This compactor now applies only to fallback records;
 page-backed operation does not create new LSM name-node records. Cached
 diagnostic snapshots keep status RPC responsive during maintenance.
 

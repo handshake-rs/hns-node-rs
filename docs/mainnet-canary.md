@@ -35,18 +35,9 @@ invalid-corpus engines report functional readiness from their pinned
 differential suites. The invalid qualification is reproduced from 24
 independently generated noncontextual transaction/block cases and 12 contextual
 state-boundary cases, including valid controls and atomic rejection checks.
-Native active-state replay reached mainnet height 339,660. At height 339,654
-its stopped
-physical UTXO set, HSD-compatible name state, pending/committed Urkel roots,
-deployments, and checkpoint ancestry all matched pinned HSD. The retained
-evidence is in
-[`../qualification/mainnet-339654/`](../qualification/mainnet-339654/).
-The read-only normalized disconnect/reconnect comparison then matched every
-transition across the complete 288-block retained horizon through height
-339,660. Its evidence is in
-[`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).
-Historical replay readiness is promoted; a synchronized mainnet canary may now
-activate mining jobs without a live HSD or shadow connection.
+Before enabling mainnet authority, qualify semantic-state replay, deployment
+state, and the complete retained disconnect/reconnect horizon using
+[state parity](state-parity.md) and [production assurance](production-assurance.md).
 The base `NodeService` snapshot initializes `release_stage:
 "pre-authority"`, but the live native RPC composer reports
 `mainnet-canary-gated` for this configuration. That mode label is not a
@@ -73,29 +64,12 @@ cargo run --locked --release --manifest-path Cargo.toml \
 ```
 
 Remove `--check-config` to start synchronization. Never add
-`--acknowledge-incomplete-consensus`; mainnet canary validation rejects it.
-`pruned` is the default. It preserves the newest 288 mainnet raw blocks and
-undo records exactly as HSD specifies, rejects deeper reorganizations before
-mutation, retires matching historical root pins atomically, and runs name-tree
-reclamation on the configured height interval. Existing undo-only v1 stores
-upgrade in place by deleting old raw-block locators without replaying their
-payloads. On pruned startup without active sync, at least 256 MiB of dead
-append-only frames triggers a crash-safe generation rewrite so logical pruning
-also returns disk space. Native active-sync startup amortizes that rewrite
-until 4 GiB is reclaimable; synchronized online maintenance returns to 256 MiB.
-After sixteen sealed 360-block name-page segments, startup likewise rewrites
-only the reachable union of the current and rollback roots, atomically swaps
-their locators, and deletes the superseded page generation.
-
-Use `--storage-mode archive` only with a new, never-pruned data directory to
-retain every raw block and undo for historical serving. A pruned store cannot
-be changed back to archive because deleted history cannot be reconstructed
-locally.
-Keep the Authorization value out of command-line arguments, logs, and shell
-history. An authenticated local client may inspect `getauthorityinfo` or the
-atomic `getparentauthority` response. ASIC service must be started only through
-`AuthoritativeHsrdMiningStream` and `HsrdGatewayActivationRequest`; the
-observed/staged stream cannot construct that capability.
+`--acknowledge-incomplete-consensus`; canary configuration rejects it. The pruned
+profile preserves the configured rollback horizon. Archive mode requires a new,
+never-pruned data directory. Inspect `getauthorityinfo` or `getparentauthority`
+through authenticated local control, keeping credentials out of arguments,
+logs, and shell history. ASIC activation requires the typed authoritative mining
+stream and activation request; staged observations cannot grant that capability.
 
 For restart-surviving operation, build the release binary and install the
 provided user-service unit:
@@ -121,7 +95,7 @@ shutdown marker.
 The MeshMine-specific `meshmine-minerd` combined node/CPU/Vulkan/HandyStratum
 binary remains in the source MeshMine repository. It is intentionally not a
 member of this standalone workspace; see
-[the extraction provenance](extraction-provenance.md).
+[the native ownership boundary](architecture.md).
 
 The node is outbound-only unless `--p2p-listen <address>:12038` is supplied to
 `hsrd`. With a reachable firewall/NAT mapping it accepts inbound

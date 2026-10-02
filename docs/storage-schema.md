@@ -8,10 +8,10 @@ committed through an atomic batch.
 ## Current schema boundary
 
 The current persistent schema version is **19** and the storage profile is
-**`hsrd-mining-v15`**. Schema 18/profile `hsrd-mining-v14` and schema
-17/profile `hsrd-mining-v13` receive an atomic profile cutover. Schema
-16/profile `hsrd-mining-v12` uses the resumable, backup-first
-interval-accumulator migration. Other combinations fail closed.
+**`hsrd-mining-v15`**. Verify the exact schema/profile pair before opening a
+persistent data root. A mismatched or unsupported pair fails closed. Use the
+[current maintenance procedure](storage-rollout.md) and a verified complete
+fallback before any authorized conversion.
 
 Version 19 contains the authority, state, native synchronization, and mining
 publication schema plus the optimized storage tiers:
@@ -25,12 +25,8 @@ publication schema plus the optimized storage tiers:
   interval-accumulator state, and airdrop positions to clear on disconnect;
 - a checksummed accumulator that composes per-block name changes and commits
   the authenticated tree only at HSD's network `treeInterval` cadence;
-- exact changed-name undo for new blocks. A startup compatibility bridge for
-  earlier candidate data accepts only an accumulator whose counts are a
-  subset of the complete canonical pending-interval undo counts, validates
-  every height/root transition and the reconstructed committed boundary root,
-  then atomically replaces only the accumulator key. This preserves the raw
-  legacy counts needed by disconnect without rewriting undo or name state;
+- exact changed-name undo bound to canonical interval transitions and the
+  reconstructed committed boundary root;
 - mandatory 32-byte `name-tree-root` metadata equal to the last committed root;
 - mandatory 32-byte `name-tree-commit-root` binding for HSD's last
   `treeInterval` commitment used by candidate headers and mining templates;
@@ -42,7 +38,7 @@ publication schema plus the optimized storage tiers:
   after sixteen sealed segments. Legacy schema-18 pages remain readable in
   place;
 - checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
-  compact locators and authoritative manifests; legacy inline values remain
+  compact locators and authoritative manifests; inline values remain
   readable during migration;
 - versioned, checksummed `name-tree-snapshot/v1/<height-be>` records written in
   the `snapshots` column family at each network name-tree interval; each value
@@ -69,7 +65,7 @@ publication schema plus the optimized storage tiers:
   16 MiB of complete canonical state under
   `authenticated-namespace-state/v1/<namespace-id>` in `snapshots`.
 
-A schema/profile mismatch outside the two reviewed migrations, nonempty
+An unsupported schema/profile mismatch, nonempty
 unversioned database, missing/malformed root or airdrop-field binding, or
 network/genesis mismatch fails closed.
 
@@ -139,7 +135,7 @@ one mandatory is a later reviewed profile boundary.
   recovery.
 - Point-oriented column families share one bounded 192 MiB LRU block cache.
   The RocksDB `blocks` and `undo` families contain locator-sized values for new
-  data and retain a separate 32 MiB legacy cache. Every column family uses a
+  data and retain a separate 32 MiB inline-value cache. Every column family uses a
   10-bit full Bloom filter, cached high-priority index/filter blocks, and pinned
   level-zero index/filter blocks. Bulk block/undo data blocks are 32 KiB.
 - RocksDB receives four combined background flush/compaction jobs. This matches
@@ -466,17 +462,11 @@ cannot promote a block or grant authority.
   indexed history
   from being enabled after startup; see
   [Handshake wallet indexes](HNS_NODE_WALLET_INDEX.md).
-  Profile payload version 4 is a downgrade fence for confirmed incoming
-  TRANSFER indexing and compact source-inclusion evidence. Versions 1 through
-  3 remain decodable for diagnosis, but a legacy profile with the complete
-  `wallet` component enabled and any chain history or existing wallet-index
-  keys is never rewritten during normal startup. It requires a fresh v4 sync
-  unless a future separately qualified offline migration proves every active
-  TRANSFER and reconstructs its exact canonical transaction ordinal and total
-  output count. History-only and spender-only legacy profiles may
-  update the version fence because they never claimed wallet TRANSFER evidence.
-  Older binaries reject version 4 rather than silently ignoring
-  recipient/evidence state or pruning it incorrectly.
+  Profile payload version 4 binds confirmed incoming TRANSFER indexing and
+  compact source-inclusion evidence. Complete wallet indexing requires that
+  exact profile and complete evidence from genesis. Startup refuses to infer
+  missing inclusion from an already populated store. Use a fresh synchronized
+  data root if the persisted profile cannot prove the required completeness.
   Effective transaction-index, script-history, spender, and wallet capabilities
   are immutable once chain history or relevant index keys exist. Startup
   rejects both additions and removals; redundant raw flags with identical
@@ -487,7 +477,7 @@ cannot promote a block or grant authority.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.
 - `name_tree_nodes`: read-only migration/fallback records from profiles before
-  authenticated pages. Page-backed operation never adds LSM records. Legacy
+  authenticated pages. Page-backed operation never adds LSM records. Fallback
   compaction is disabled until every retained fallback root is explicitly
   retired.
 - `undo`: block UTXO/name/airdrop undo records, including pre-state and
@@ -579,7 +569,7 @@ path. The queue is bounded by configuration and by a hard maximum.
 
 ## Block status bit layout
 
-Schema version 14 preserves the existing `u32` status layout:
+`BlockStatus` uses this durable `u32` layout:
 
 | Bit | Field | Meaning |
 |---:|---|---|
@@ -675,24 +665,21 @@ durable data.
 ## Fixture integrity
 
 The HSD fixture manifest is versioned. Every entry has a safe relative path and
-an exact BLAKE2b-256 digest. Both the Rust loader and static validator check the
-exact bytes before fixture use.
+an exact BLAKE2b-256 digest. The Rust fixture loader verifies the exact bytes before fixture use.
 
-## Migration policy
+## Maintenance policy
 
-Schemas 17/profile `hsrd-mining-v13` and 18/profile `hsrd-mining-v14` already
-have interval semantics and receive only the atomic schema/profile cutover.
-Schema 16/profile `hsrd-mining-v12` backs up every rewritten undo and the old
-root/profile bindings before the final marker changes. Page bootstrap and
-segment-manifest initialization are idempotent; restart truncates unpublished
-tails. Older or mixed profiles require an explicit reindex.
+Persistent schema/profile changes require explicit qualification against the
+exact source pair and a complete verified backup. Restart must truncate
+unpublished tails and retain a coherent committed root. Unsupported profiles
+require a fresh synchronized data root.
 
 The operator workflow is specified in
 [`storage-rollout.md`](storage-rollout.md). `hsrd-storage-maintenance backup`
 accepts each reviewed source profile and publishes a complete fallback marker
 only after the RocksDB checkpoint and independent external-file copies are
 synced. `inventory` validates every committed archive frame.
-`migrate-inline` converts legacy block/undo values in bounded idempotent
+`migrate-inline` converts inline block/undo values in bounded idempotent
 transactions. It advances through each hash prefix with the same exclusive
 record/byte-bounded cursor rather than materializing the prefix, and mixed
 inline/locator operation remains supported when disk headroom is insufficient.

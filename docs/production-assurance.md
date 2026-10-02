@@ -185,7 +185,7 @@ SHA-256; and verify the recorded digest:
 ```bash
 umask 077
 install -d -m 0700 /ABS/private/hsrd-candidate
-artifact=/ABS/private/hsrd-candidate/hsrd-0.3.1-COMMIT
+artifact=/ABS/private/hsrd-candidate/hsrd-SOURCE_REVISION
 [[ ! -e "$artifact" && ! -L "$artifact" ]]
 install -m 0500 -- target/release/hsrd "$artifact"
 cmp --silent -- target/release/hsrd "$artifact"
@@ -207,7 +207,7 @@ must have at least the 150,000,000,000-byte operational limit plus the separate
 
 ```bash
 scripts/run-full-sync-qualification.sh run \
-  --binary /ABS/private/hsrd-candidate/hsrd-0.3.1-COMMIT \
+  --binary /ABS/private/hsrd-candidate/hsrd-SOURCE_REVISION \
   --data-root /ABS/fresh-mainnet-archive \
   --evidence-dir /ABS/full-sync-evidence \
   --auth-file /ABS/private/rpc-authorization-header \
@@ -257,7 +257,7 @@ its maxima and minimum into state, and writes a durable recovery record. Zero
 available bytes is evidence, never an uninitialized sentinel. The validator
 recomputes filesystem delta from the campaign baseline, checks exact sync-status
 and consecutive-count semantics, and requires the explicit decision in current
-journal records (while deriving it for legacy version-one records).
+journal records.
 
 More than one trailing sample, a gap, an unexpected entry, inconsistent sample
 fields, or a sample from another campaign or attempt fails closed. A recovered
@@ -363,8 +363,8 @@ Each external JSON record uses schema version 2:
   "status": "pass",
   "source_revision": "40-lowercase-hex-git-commit",
   "source_tree": "40-lowercase-hex-git-tree",
-  "started_at": "2026-07-29T00:00:00Z",
-  "completed_at": "2026-07-29T06:30:00Z",
+  "started_at": "2030-01-01T00:00:00Z",
+  "completed_at": "2030-01-01T06:30:00Z",
   "operator": "operator identity",
   "reviewer": "independent reviewer identity",
   "tool": {

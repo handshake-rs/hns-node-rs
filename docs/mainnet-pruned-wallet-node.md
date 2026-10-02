@@ -16,12 +16,12 @@ This host profile deliberately fixes these paths:
 ```bash
 NODE_MOUNT=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9
 NODE_ROOT="$NODE_MOUNT/hsrd"
-NODE_DATA="$NODE_ROOT/mainnet-pruned-wallet-v1"
+NODE_DATA="$NODE_ROOT/mainnet-pruned-wallet-v4"
 NODE_BIN_DIR="$NODE_ROOT/bin"
 NODE_SECRET_DIR="$NODE_ROOT/secrets"
 NODE_AUTH="$NODE_SECRET_DIR/mainnet-pruned-wallet-v1.authorization"
-NODE_TARGET="$NODE_MOUNT/codex-build-cache/hns-node-rs-audit/target"
-NODE_TMP="$NODE_MOUNT/codex-build-cache/hns-node-rs-audit/tmp"
+NODE_TARGET=/home/den/.cache/codex/hns-node-rs-audit/target
+NODE_TMP=/home/den/.cache/codex/hns-node-rs-audit/tmp
 NODE_ROCKS=/home/den/.cache/codex/rocksdb-10.4.2-aarch64/lib
 
 set -euo pipefail
@@ -88,13 +88,6 @@ test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 The absence checks are intentional. `--wallet-index` cannot truthfully be
 enabled after an unindexed mainnet history has already been synchronized. A
 fresh root must start with its final index profile.
-
-Confirm that the preserved archive remains a distinct path and do not change
-its owner, mode, schema, or contents:
-
-```text
-/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/Backups/namehold-hsrd/mainnet-archive-2026-08-09-before-wallet-rpc
-```
 
 ## Build the production feature set
 
@@ -405,14 +398,14 @@ nonzero best-header, active, and stored tips, zero pending/inflight/tracked
 blocks, at least one ready peer, and no sync error. A synchronized node still
 has no mining authority because `--mainnet-canary` is absent.
 
-## Initial send limitation and pruning boundary
+## Transaction relay and pruning boundary
 
-This first profile deliberately omits both `--mining-engine` and
+The service profile omits both `--mining-engine` and
 `--transaction-relay`. Confirmed restoration, receive history, name evidence,
 proofs, and wallet read operations are available while the chain synchronizes.
 `broadcast_transaction` fails closed with
-`mining_engine-transaction-relay-disabled` until a later, separately reviewed
-tranche enables both flags. Transaction relay must never be mistaken for
+`mining_engine-transaction-relay-disabled` unless a qualified service configuration
+enables both flags. Transaction relay must never be mistaken for
 mainnet mining authority; keep `--mainnet-canary` absent.
 
 Profile-v4 wallet indexes retain compact canonical source-inclusion metadata

@@ -10,8 +10,7 @@ docker pull ghcr.io/handshake-rs/hns-resolverd:canary-v0.3.4
 
 The first image runs the `hsrd` consensus node. The second runs the ordinary
 UDP/TCP DNS companion backed by that node. Docker selects the matching platform
-automatically. The v0.3.4 prerelease publishes only each exact
-`canary-v0.3.4` tag. Stable releases publish the exact version, minor-version,
+automatically. Prereleases publish only an exact `canary-vVERSION` tag. Stable releases publish the exact version, minor-version,
 and `latest` tags. Production deployments should pin both manifest digests
 recorded by the release workflow:
 
@@ -134,21 +133,6 @@ The build uses the locked Cargo dependency graph, the repository's Rust 1.97.1
 toolchain, architecture-scoped compiler caches, and digest-pinned Debian base
 indexes. The runtime image contains neither Cargo nor the native build
 toolchain.
-
-## Exact-commit recovery candidate
-
-The manual **hsrd arm64 recovery candidate** workflow exports the exact current
-`main` source as a `linux/arm64` OCI archive for the narrowly guarded legacy
-interval-accumulator recovery. It fails closed if the requested full commit,
-checked-out `HEAD`, workflow definition, and current canonical `origin/main`
-are not identical. The seven-day GitHub Actions artifact also contains
-checksums and provenance binding the full source tree and imported image ID.
-
-This workflow never publishes an image, tag, GitHub Release, or GHCR package;
-it is not a substitute for release qualification. The archive requires an
-explicit local `skopeo` import. Follow the complete stop, whole-root cold
-backup, one-shot start, success, and rollback procedure in
-[Legacy interval-accumulator recovery](interval-accumulator-recovery.md).
 
 ## Release publication
 

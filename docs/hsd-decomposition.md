@@ -1,10 +1,9 @@
-# hsd decomposition for a mining full node
+# HSD consensus ownership map
 
-This is the source-level boundary for replacing `hsd` without cloning its
-product surface. It was derived from the pinned production/oracle checkout at
-commit `698e252ebc7b5c1dd0a9587e342fdd153d020ae4`.
+This map identifies the node owners of the consensus and wire behavior
+validated against the pinned HSD oracle at commit `698e252ebc7b5c1dd0a9587e342fdd153d020ae4`.
 
-## Port exactly or reproduce with differential evidence
+## Consensus and wire behavior
 
 | hsd source | hsrd owner | Why mining needs it |
 |---|---|---|
@@ -12,7 +11,7 @@ commit `698e252ebc7b5c1dd0a9587e342fdd153d020ae4`.
 | `lib/primitives/{abstractblock,block,headers,tx,input,output,outpoint,coin,covenant,claim,airdropkey,airdropproof,invitem}.js` | `hns-primitives` | Exact wire/hash/sighash subjects and every block-contained object. |
 | `lib/script/*` | `hns-consensus` | Complete input verification is consensus-critical even though `hsrd` owns no keys. |
 | `goosig@0.11.0/src/goo/*` (HSD dependency) | `hns-goosig`, `hns-consensus` | Historical airdrop allocations use GooSig; the exact pinned C verifier is wrapped behind a verification-only Rust API. |
-| `bns/lib/{ownership,dnssec}.js`, `bcrypto/lib/gost94.js` (HSD dependencies) | `hns-primitives`, `hns-consensus` | CLAIM trust-chain parsing, signing policy, all DS digests, and legacy GOST94/CryptoPro are consensus-critical. |
+| `bns/lib/{ownership,dnssec}.js`, `bcrypto/lib/gost94.js` (HSD dependencies) | `hns-primitives`, `hns-consensus` | CLAIM trust-chain parsing, signing policy, all DS digests, and GOST94/CryptoPro are consensus-critical. |
 | `lib/covenants/{rules,namestate,namedelta,undo,view,ownership,reserved,locked,bitfield}.js` plus the committed name/lockup data | `hns-consensus`, `hns-state`, `hns-urkel` | Claims, airdrops, auctions, renewals, transfers, revocations, reserved names, historical lockups, and name-tree transitions determine block validity and the next header root. |
 | `lib/coins/{coins,coinentry,coinview,compress,undocoins}.js` | `hns-state`, `hns-store` | UTXO lookup, mutation, compression, and disconnect evidence. |
 | `lib/blockchain/{chain,chaindb,chainentry,common,records,layout}.js` | `hns-chain`, `hns-state`, `hns-store`, `hns-urkel` | Contextual validation, chainwork, MTP/difficulty, deployments, side chains, reorgs, UTXO/name commits, pruning, and crash recovery. |
@@ -35,7 +34,7 @@ and the live Urkel root from the chain before assembling claims, airdrops, and
 ordinary transactions. A fast template engine may cache and incrementally
 update those values, but it may not approximate or omit them.
 
-## Retain a smaller mining-specific form
+## Mining interfaces
 
 | hsd source | Lean treatment |
 |---|---|
@@ -47,7 +46,7 @@ update those values, but it may not approximate or omit them.
 | `lib/node/fullnode.js` | Recompose only chain, store, minimal mempool, P2P/sync, mining, metrics, and bounded control. Its DNS, HTTP, and broad RPC components are separable constructors and are not mining dependencies. |
 | `lib/node/rpc.js`, `http.js` | Keep a small authenticated/local diagnostics, differential, and operator-control surface. Mining never traverses it. |
 
-## Exclude from the production binary
+## Product boundary
 
 - `lib/wallet/*`, `lib/client/wallet.js`, `lib/hd/*`,
   `lib/primitives/keyring.js`, and `lib/utils/coinselector.js`.
@@ -60,20 +59,19 @@ update those values, but it may not approximate or omit them.
 - The CPU miner loop as a production data path. Its template/job semantics are
   useful differential references; ASIC jobs use the native prepared-job API.
 
-## Differential extraction order
+## Differential qualification
 
-1. Freeze every primitive, hash, target, genesis, and network constant.
-2. Port header/transaction/script checks and generate positive and mutated
-   negative fixtures from the exact `chain.js` rejection sites.
-3. Port claims, airdrops, covenant/name state, historical exception databases,
-   UTXO/name undo, and Urkel roots.
-4. Replay connect/disconnect/reorg sequences and compare accept/reject,
-   chainwork, UTXO outcome, name-tree root, and undo behavior at each step.
-5. Port peer/sync behavior and run a live shadow node without authority.
-6. Port template assembly and compare coinbase, ordered transactions, roots,
-   weight, sigops, target, version, and minimum time byte-for-byte.
-7. Enable the native MeshMine bridge only on a shadow-agreeing committed tip;
-   promote authority only after the removal gates pass.
+1. Verify every primitive, hash, target, genesis, and network constant.
+2. Compare header, transaction, and script acceptance with positive and mutated
+   negative fixtures from the pinned HSD implementation.
+3. Compare claims, airdrops, covenants, name state, UTXO/name undo, and Urkel roots.
+4. Compare connect/disconnect/reorg outcomes, chainwork, UTXOs, roots, and undo
+   behavior at each boundary.
+5. Qualify peer handshakes, synchronization, recovery, and bounded resource use.
+6. Compare template coinbase, transaction order, roots, weight, sigops, target,
+   version, and minimum time byte-for-byte.
+7. Admit authority only after the complete current readiness and production
+   assurance gates pass.
 
 This is a semantic reimplementation, not a line-for-line translation. Rust may
 replace JavaScript locks, caches, workers, databases, and event emitters, but

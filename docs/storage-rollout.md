@@ -64,13 +64,6 @@ loss of custody invalidates the rollout evidence: preserve the store, withhold
 authority, and rebuild through a full trusted replay (or a future qualified,
 separately protected complete-state commitment).
 
-The older-candidate `name-tree accumulator names disagree with canonical undo`
-startup failure is an unclean compatibility incident, not this normal clean
-rollout. Do not create a maintenance marker or claim a checkpoint backup for
-that store. Stop its restart loop and follow
-[Legacy interval-accumulator recovery](interval-accumulator-recovery.md), which
-requires a cold whole-root rollback copy before the guarded one-shot start.
-
 ## 1. Build and identify the rollout binary
 
 From a clean, reviewed source revision:
@@ -162,7 +155,7 @@ The command first performs the normal bounded recovery and then explicitly
 scrubs the checksum and complete-frame boundary of every committed block and
 undo segment. It validates both manifests, removes only unpublished future
 segments, and truncates only bytes beyond the authoritative active tails. The
-JSON separates legacy inline records/bytes from archived records/frame bytes
+JSON separates inline records/bytes from archived records/frame bytes
 and locator bytes and reports the scrubbed segment/record/byte totals.
 
 ## 4. Plan and run payload-segment compaction
@@ -288,7 +281,7 @@ before deleting anything.
 
 ## 5. Optional inline-payload conversion
 
-Legacy inline values are semantically valid and may remain indefinitely. They
+Inline values are semantically valid and may remain indefinitely. They
 do not block mining or new append-only writes. Convert them only when the disk
 preflight is safe:
 
@@ -369,10 +362,9 @@ reference artifact.
 4. Verify the copied fallback manifest and run `hsrd-state-manifest` against
    its `chain/` directory.
 5. Point the service at the replacement path.
-6. Use the binary matching the backed-up schema/profile. A schema-16/17 backup
-   is the rollback input for its pinned prior binary, schema 18 uses the
-   schema-18 storage-aware binary, and schema 19 requires the current
-   authenticated-subpage binary.
+6. Use the exact binary and configuration qualified for the fallback's
+   recorded schema/profile. Never let a replacement binary reinterpret an
+   unsupported storage profile.
 7. Start without a maintenance marker and confirm the exact tip hash, height,
    roots, deployment diagnostics, and mining generation before restoring
    authority.

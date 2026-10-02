@@ -534,22 +534,13 @@ the coherent live node lock and are never served from it.
 reports that choice, while `headers_only` reports the narrower no-body mode.
 None of these values changes the authority mode or claims a live HSD oracle.
 
-`scripts/compare-hsrd-hsd-shadow.py` consumes those diagnostics and a pinned
-operator-selected `hsd-cli`. It compares the canonical block at height `H` and
-the post-`H` hsrd root against HSD's header at `H+1`; at the live tip it labels
-HSD's next-template root provisional until a later header confirms it. The
-runner rereads both tips around every bounded probe, records coherent
-divergence separately from unavailable/racing observations, and can maintain a
-checksummed bounded restart/reorganization evidence checkpoint. See
-[`live-shadow-parity.md`](live-shadow-parity.md).
-
-With `--headers-only`, the same runner instead compares the durable hsrd
-best-header height/hash with `getblockhash` from a coherent pinned HSD RPC
-snapshot. At the current tip it also compares the header-derived deployment
-states and script-policy effects with HSD's softfork view.
-`--require-current-tip` fails unless both heights and both deployment views
-match. This mode deliberately rejects `--state-file`, whose schema records
-active block/root evidence rather than header-only evidence.
+Qualification must compare the canonical hash at the same height and the
+post-block committed name root. A live-tip next-template root is provisional
+until the next canonical header confirms it. Header-only synchronization
+qualifies header linkage, work, difficulty, time, and deployments; it does not
+qualify bodies, UTXOs, covenants, or name state. Use the current
+[state parity contract](state-parity.md) and
+[production assurance gates](production-assurance.md) for state qualification.
 
 ## Peer discovery
 

@@ -1,54 +1,81 @@
-# Testing strategy
+# Node qualification
 
-Full mainnet semantic-state comparison is specified in
-[`state-parity.md`](state-parity.md). The paired exporters use a shared
-constant-space transcript for UTXOs and names; deployment parity and
-disconnect/reconnect undo parity are separate evidence. The complete
-mainnet replay stopped-state and pinned deployment comparisons passed at height
-339,654. The normalized 288-block rollback transcript passed through height
-339,660. Retained artifacts are recorded in
-[`../qualification/mainnet-339654/`](../qualification/mainnet-339654/) and
-[`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).
+Run gates from this repository against the exact source and build configuration.
+For builds on the workspace ARM host, first verify the prebuilt
+`/home/den/.cache/codex/rocksdb-10.4.2-aarch64/lib/librocksdb.a` exists. Use the
+local `.cargo/config.toml` with target directory
+`/home/den/.cache/codex/hns-node-rs-audit/target`,
+`TMPDIR=/home/den/.cache/codex/hns-node-rs-audit/tmp`,
+`ROCKSDB_COMPILE=0`, `ROCKSDB_LIB_DIR` pointing to that prebuilt library, and
+`ROCKSDB_STATIC=1`. Do not compile bundled RocksDB on this host.
 
-The HSD-oracle generators, source-handoff validators, and comparison commands
-below were outside the extracted `hsrd/` prefix. Run those source-only tools
-from the exact MeshMine source commit recorded in
-[`extraction-provenance.md`](extraction-provenance.md). Cargo commands,
-committed fixture tests, `scripts/check.sh`, and
-`scripts/qualify-two-node-regtest.sh` run directly from this standalone
-repository.
-
-At exact local revision `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, one
-focused NVMe command ran with `--locked --offline`, `ROCKSDB_COMPILE=0`, and
-the existing prebuilt RocksDB 10.4.2 archive:
-`cargo test -p hns-wallet-index -p hns-node production_next --
---test-threads=1`. All four matching completed-retirement tests passed with
-zero failures and 15 wallet-index tests filtered; no hns-node test matched the
-filter, although the package compiled. This is not a RocksDB reopen, regtest,
-adversarial, performance, or full repository-gate result.
-
-## Current standalone gate
+## Standalone gate
 
 ```bash
 ./scripts/check.sh
 ```
 
-With Rust 1.97.1 by default, this verifies locked root and fuzz metadata,
-the assurance-verifier positive/tamper/missing/threshold/tool regressions, dependency policy
-for both lockfiles, formatting, every fuzz target, strict all-feature Clippy,
-all-feature and no-default-feature tests, and the optimized all-target release
-build. It runs the fixed native mining-path performance gate, then starts two
-independent regtest `hsrd` processes and requires ordinary P2P readiness,
-matching canonical Shakescape registry negotiation, the exact registry fingerprint,
-and bidirectional traffic. The normal test matrix also covers live HIP-76
-requester/provider admission, requester opt-out, provider opt-in/backend
-readiness, revocation, timeouts, queue/socket completion, and qname-free
-diagnostics.
+The gate uses Rust 1.97.1 by default and verifies the locked root and fuzz
+metadata, released protocol source policy, full-sync qualification self-tests,
+production-assurance verifier regressions, both dependency policies, formatting,
+fuzz compilation, strict all-feature Clippy, all-feature and no-default-feature
+tests, and an optimized all-target release build. It then runs the mining-path
+performance gate and the independent two-node regtest harness.
 
-## Production assurance tiers
+The two-node harness requires ordinary P2P readiness, exact Shakescape registry
+negotiation, and bidirectional traffic. Plaintext local regtest is separate from
+public Brontide, HIP-76, and HNSR qualification.
 
-Fast software smoke, persistent software qualification, and independently
-collected external production evidence are separate gates:
+For a read-only source-policy check without compilation:
+
+```bash
+python3 scripts/test-verify-hns-rs-source.py
+python3 scripts/verify-hns-rs-source.py
+scripts/run-full-sync-qualification.sh self-test
+scripts/run-production-assurance.sh self-test
+```
+
+## Consensus and state
+
+Use the pinned HSD fixture corpus and independently mutated invalid cases.
+Require byte-exact wire, hashes, genesis, network constants, script outcomes,
+sigops, claims, airdrops, covenants, name transitions, and committed roots.
+Compare canonical blocks at the same parent with the exact deployment and
+checkpoint context. Header-only agreement does not establish body or state
+agreement.
+
+Qualify atomic connect, disconnect, and reorganizations; spend staging;
+read-your-writes behavior; interval-committed versus working name roots;
+undo completeness; and crash/reopen behavior. Full-state and retained-horizon
+comparisons must satisfy [the semantic parity contract](state-parity.md).
+Optional wallet indexes must remain derivative and must not change consensus.
+
+## Storage and wallet indexes
+
+Exercise synchronous durability, bounded snapshot scans, segment checksum
+failures, incomplete generation publication, pruning/reopen, rollback retention,
+compaction, and persistent authority fences. A read error must fail closed.
+
+Wallet-index qualification includes source inclusion, chain-epoch binding,
+confirmed restoration pagination, mempool snapshot invalidation, typed contract
+funding/spend detection, retirement fences, and tracked-state recovery. Check
+both pruned and archive profiles and reject unsupported profile combinations.
+The exact contract is in [wallet indexes](HNS_NODE_WALLET_INDEX.md).
+
+## Synchronization, relay, and mining
+
+Test bounded framing, Brontide authentication, peer discovery, stalled or closed
+connections, ban thresholds, request timeouts, orphan limits, best-work branch
+selection, ordered body/state activation, and restart recovery. Revocation must
+fence queued and active work for HIP-76, ODoH, HNSR, and Shakescape roles.
+
+Qualify mempool admission and reconciliation, replacement policy, deterministic
+templates, package ordering, coinbase/claim/airdrop assembly, target/version/time,
+resource limits, and local solved-block validation. Persistent publication
+intents must survive interruption and clear only after successful peer-write
+completion. Diagnostics and observed templates cannot grant mining authority.
+
+## Performance and production assurance
 
 ```bash
 scripts/run-production-assurance.sh smoke \
@@ -61,724 +88,16 @@ scripts/run-production-assurance.sh release \
   --evidence-dir /path/to/complete-release-evidence
 ```
 
-The `smoke` tier, like `scripts/check.sh`, uses the performance binary's
-default in-memory scenario: ten unmeasured warm-up blocks followed by 100
-measured native regtest blocks. It is a fast correctness and latency signal;
-it does not exercise RocksDB, synchronous durability, or saturated
-block-index-cache occupancy.
-
-Scheduled and release runs require a fully clean worktree, including no
-non-ignored untracked files, Rust 1.97.1, and the pinned
-`nightly-2025-08-07` fuzz toolchain. Both tiers explicitly select
-`persistent-rocksdb-sync`. The scenario must observe the RocksDB backend with
-`Sync` durability, connect exactly 4,096 unmeasured setup blocks, observe both
-cache capacity and occupancy at exactly 4,096, and retain that exact occupancy
-after 100 measured blocks. Its schema-v2 report must pass every backend,
-durability, workload, cache, availability, and latency check. In particular,
-the 100-sample P99 values must remain strictly below 25,000 microseconds for
-tip-to-job work, 5,000 microseconds for candidate validation, and 50,000
-microseconds for local connection.
-
-The assurance script intentionally supplies no `--data-root` for that
-persistent scenario. The performance gate creates a unique marked root,
-closes the database, verifies ownership of the exact root, and removes only
-that automatically created root. Scheduled and release verification requires
-the schema-v2 `automatic-create-new-scoped-cleanup` policy and rejects evidence
-when the reported root still exists. The scheduled tier also runs every fuzz
-target with the pinned nightly toolchain and emits a source-bound,
-hash-addressed summary.
-
-External verification separately requires all seven production records:
-production-scale pruning, RocksDB fault injection, sustained
-reorganization/partition, WAN/load latency, physical gateway/ASIC validation,
-long-duration multi-peer operation, and production
-mempool/template/publication differential testing. These remain open gates
-until their real campaigns and reviewed artifacts exist; a local regtest
-scenario cannot satisfy them. Every external schema-v2 record binds the same
-actual typed `hsrd` binary and build manifest to the release source tree, plus
-a hashed exact campaign configuration and gate-specific typed input artifacts.
-
-Production release also requires reviewed exclusive custody of the data root
-and external page/segment files; unaccounted writers invalidate evidence. The
-full non-pruned mainnet baseline must stay within the 150,000,000,000-byte
-operational envelope while preserving a separate 10,000,000,000-byte
-filesystem reserve. A 90,000,000,000-byte observation is informational only.
-The exact schema and minimum acceptance criteria are in
-[`production-assurance.md`](production-assurance.md). A callable verifier or
-available harness is not completed production evidence.
-
-## Fast static gate
-
-`python3 scripts/validate-hsrd-static.py` runs without a Rust toolchain and
-checks:
-
-- every repository `Cargo.toml` and JSON file parses;
-- fixture manifest schema, unique IDs, safe relative paths, exact oracle pin,
-  file presence, and BLAKE2b-256 digests;
-- HSD package/lock revision pinning;
-- schema version, profile, root marker, sync checkpoint, and block-status
-  coordination;
-- fixture-only chainwork restrictions;
-- authority-mode safety tokens;
-- sigop-limit, authorization, covenant, name-transition, and spend-staging
-  order;
-- correct pre-state root validation before transaction mutation;
-- null-state deletion and durable root binding;
-- non-authoritative network wiring, active-state acknowledgement/batch bounds,
-  resource ceilings, frame limits, peer/sync modules, and CLI configuration;
-- mempool/template/publication bounds, fixture wiring, local-first
-  publication ordering, authority checks, and schema/profile coordination.
-
-This is a fail-fast integrity gate, not a compiler or consensus proof.
-
-## Complete offline source-handoff gate
-
-```bash
-scripts/verify-hsrd-source-handoff.sh
-```
-
-This reproducible wrapper runs the static authority/schema validator, direct
-Cargo-lock/path-dependency coverage, Rust lexical-balance checks, every pinned
-HSD fixture generator in check mode, baseline MeshMine/HSD body and payout
-oracles, the vendored secp256k1 C smoke test, source-language syntax checks,
-Git whitespace checks, and merge-conflict-marker detection. It is suitable for
-source handoffs on machines that do not have Rust installed. The wrapper gives
-the npm advisory service a bounded timeout and reports an unavailable service
-without disguising that audit as successful. CI separately runs strict
-`npm run audit`. The offline wrapper does not replace that strict audit or the
-Cargo gates below.
-
-## Pinned HSD fixtures
-
-The oracle is pinned to HSD commit
-`698e252ebc7b5c1dd0a9587e342fdd153d020ae4`.
-Generators support `--check` reproducibility mode:
-
-```bash
-npm run hsrd-script-fixtures --prefix hsd-oracle
-npm run hsrd-deployment-fixtures --prefix hsd-oracle
-npm run hsrd-genesis-fixtures --prefix hsd-oracle
-npm run hsrd-airdrop-fixtures --prefix hsd-oracle
-npm run hsrd-claim-fixtures --prefix hsd-oracle
-npm run hsrd-mainnet-claim-history --prefix hsd-oracle
-npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
-npm run hsrd-covenant-fixtures --prefix hsd-oracle
-npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
-npm run hsrd-name-transition-fixtures --prefix hsd-oracle
-npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
-npm run hsrd-name-policy-fixtures --prefix hsd-oracle
-npm run hsrd-p2p-wire-fixtures --prefix hsd-oracle
-npm run hsrd-mining-template-fixtures --prefix hsd-oracle
-npm run hsrd-invalid-corpus --prefix hsd-oracle
-npm run hsrd-contextual-invalid-corpus --prefix hsd-oracle
-```
-
-Current evidence includes:
-
-- 24 independently constructed non-contextual cases (22 invalid plus valid
-  transaction/block controls) covering empty bodies, output money/address
-  bounds, duplicate/null inputs, coinbase outpoint and witness rules,
-  malformed covenants, per-transaction OPEN/update/renewal limits, merkle/witness
-  commitments, and missing/multiple coinbases. Pinned HSD supplies the exact
-  accept/reject decision, ban score, and rejection code; Rust must match both
-  admission and the normalized semantic reason. The generator records that no
-  upstream invalid vector was copied;
-- 12 independently constructed state-boundary block cases (8 invalid plus 4
-  positive controls) executed through pinned HSD's exact `Chain.verifyInputs`
-  composition. They cover missing inputs, an in-block double spend, premature
-  coinbase spend, input/output conservation, height/time sequence locks,
-  mandatory witness-script failure, and coinbase overclaim. Rust replays each
-  immutable UTXO/header snapshot through the atomic state connector, requires
-  the corresponding rejection class, proves every rejected case leaves all
-  column families unchanged, and proves accepted controls connect, write undo,
-  disconnect, and restore the exact seed state;
-- HSD's complete canonical 452-byte genesis blocks for mainnet, testnet,
-  regtest, and simnet, regenerated from `lib/protocol/genesis-data.json`,
-  round-tripped and body-checked by HSD, then decoded, strictly imported,
-  connected, and reopened by Rust; mainnet continues through the canonical
-  block-1 finality regression;
-- signature-hash vectors for every defined base mode/modifier combination;
-- all five HSD airdrop-key codecs, proof hashes and signature preimages,
-  allocation-root checks, strict decode failures, HSD-generated valid and
-  mutated RSA/P-256/Ed25519/GooSig signature cases, a complete valid faucet
-  proof, and an upstream production-root GooSig proof exercised through native
-  consensus and active-node state;
-- an exact typed HSD AIRDROP frame plus hash/position admission, durable-spent
-  revalidation, duplicate rejection, inventory/GETDATA access, connected
-  removal, disconnected-coinbase readmission, and a byte-identical HSD
-  fee-bearing airdrop coinbase;
-- an exact typed HSD CLAIM frame, envelope encoding and blob-only hashes,
-  strict length/trailing failures, checksummed ownership TXT payloads for every
-  network prefix, all
-  four upstream signed DNSKEY/DS/TXT/RRSIG proofs, their exact codec/sanity/
-  window/weak outputs, SHA-256 and legacy GOST94 historical-anchor results,
-  and direct GOST94 boundary/multiblock vectors;
-- checkpoint-linked canonical mainnet block 62,517 with two real DNSSEC claim
-  witnesses, full raw body metrics, exact parent-header-time context, native
-  proof mutation/hardening rejection, native contextual mempool admission,
-  hash/name inventory, connected removal, disconnected-coinbase readmission,
-  and a byte-identical HSD fee-bearing claim coinbase;
-- checkpoint-linked mainnet replacement history spanning seven predecessor
-  blocks at heights 39,086-39,101 and the ten-claim replacement block 76,722,
-  with exact value preservation, commit advancement, native state replay, and
-  reverse disconnect;
-- checkpoint-linked `mylinksfree` claim-height 1→2→3 replay at blocks 55,798,
-  177,097, and 178,235, terminal `vcel` acceptance at 210,237, and exact
-  claim-period rejection at the canonical height-210,240 boundary;
-- build-checked libFuzzer targets for bounded Claim/TXT/ownership-proof and
-  airdrop key/proof decoding plus their derived hash, sanity, and Merkle paths;
-- signature-type encoding validity;
-- relative sequence-lock cases;
-- 56 HSD-executed witness-program cases spanning control flow, stack and
-  numeric operations, hashes, native `CHECKSIG`/`CHECKMULTISIG`, CLTV/CSV,
-  disabled/unknown opcodes, and policy flags with normalized HSD rejection
-  codes plus exact per-program sigop counts;
-- an HSD-executed full/historical validation-route matrix proving that
-  transaction start and candidate coinbase height remain checked under
-  checkpoints while contextual block sigops follow the full-input route, with
-  HSD-driven pre-start/boundary block-shape cases, native block-1 evidence, and
-  an atomic 80,020-sigop rejection;
-- 33 covenant-linkage accepted/rejected cases;
-- exact HSD `NameState` encoding vectors;
-- 28 exact HSD contextual name-transition cases: 15 accepted lifecycle,
-  historical-bypass, expiration, and hardening paths plus 13 targeted
-  rejections, with native linkage and byte-for-byte post-state checks;
-- incremental HSD Urkel roots with explicit header/pre-state and
-  resulting/post-state roots;
-- canonical HSD Urkel inclusion and non-inclusion proof bytes across dead-end,
-  short, collision, and exists terminals, plus malformed, wrong-root,
-  wrong-key, and trailing-byte cases;
-- materialized durable name-tree proof snapshots that remain root-pinned across
-  later commits, reproduce proof bytes after state-engine restart, and reject
-  corrupt durable root bindings;
-- content-addressed node-record parity against every pinned HSD proof, path-local
-  durable inclusion/non-inclusion reads, memory/RocksDB reopen stability, and
-  fail-closed missing/corrupt-node handling at proof, transition, and startup;
-- path-local immutable insert/replace/remove parity against pinned HSD
-  incremental roots and a 1,000-step deterministic mixed-mutation rebuild
-  oracle, plus retained historical proofs and read-your-writes multi-step
-  connect/disconnect;
-- network-interval snapshot-pin codec/connect/disconnect/restart invariants and
-  retained-root compaction that preserves current, retained-undo, and pinned
-  proof bytes while deleting roots whose pins and rollback authority expired;
-- no-op `BID`/`REDEEM` exclusion from new undo, bounded reconciliation of an
-  earlier under-counted interval accumulator without rewriting canonical undo,
-  restart verification, legacy disconnect, and mixed legacy/new undo
-  disconnect ordering;
-- malformed-pin and failed-compaction-commit cases that leave the complete node
-  set unchanged, followed by an idempotent successful retry;
-- startup compaction due/not-due scheduling, nonzero interval validation,
-  forced coordinator maintenance, checksummed checkpoint rejection, compaction
-  status introduced in API-v10 and retained in current API-v15, and unclean
-  RocksDB reopen with exact checkpoint/node-set agreement;
-- exact HSD undo-retention constants, steady/startup retirement, protected and
-  retained windows, atomic interval-pin retirement, scheduled non-empty root
-  compaction after undo expiry, checksummed checkpoint rejection, deep-reorg
-  rejection, and unclean RocksDB reopen;
-- reserved-name and lockup dataset checks;
-- renewal-commitment maturity/period boundary checks;
-- exact HNS frames, version packets, addresses, service normalization,
-  `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
-- byte-for-byte pinned-HSD SENDCMPCT, CMPCTBLOCK, GETBLOCKTXN, and BLOCKTXN
-  frames, including header/nonce-derived witness short IDs and differential
-  transaction indexes;
-- compact-block mempool filling, exact missing-index completion, duplicate-ID
-  rejection, and a managed-peer TCP request/reconstruction regression through
-  the normal validation path;
-- pinned HSD key-bearing fixed-seed/Brontide-port selection, bounded address admission and eviction,
-  unroutable/service/key/timestamp filtering, and failed discovered-target
-  rotation without displacement of explicit reconnect peers;
-- exact HSD address-group vectors for IPv4, IPv6, Hurricane Electric, 6to4,
-  Teredo, RFC6052, RFC6145, local, and unroutable addresses, plus unique
-  discovered selection/attempts and explicit-peer collision bypass;
-- versioned, checksummed, network-bound address-book codecs, HSD stale-entry
-  pruning, restored attempt/cooldown rotation, no-op clean flushes, compacted
-  generations, and exact RocksDB close/reopen retention;
-- HSD score-100 threshold crossing without subthreshold persistence, normalized
-  IP-wide disconnect, outbound and inbound pre-handshake rejection, exact
-  24-hour duration/expiry, discovery and relay filtering, bounded eviction,
-  checksummed/network-bound ban codecs, and exact RocksDB close/reopen retention;
-- a historical seed-only optimized mainnet replay with no explicit sockets: 20 DNS
-  endpoints, eight Ready peers after three failed-target rotations, 287 unique
-  learned addresses, active/stored progress from 7,232 to 7,416, and exact
-  best-header height agreement with the pinned HSD oracle;
-- maximum-size 2,000-header atomic protocol-batch import, including
-  late-invalid and failed-commit rollback;
-- canonical-header derivation of BIP9 threshold states, next-block signaling,
-  mandatory script/lock/name effects, and final-checkpoint historical policy;
-- durable invalid/invalid-child propagation, best-header fallback across
-  restart, body/header mismatch retry, and non-attribution of validator-worker
-  failures;
-- pruning-aware `notfound` failover without peer/block blame, rejection of
-  cross-peer `notfound` cancellation, and capacity reservations that survive
-  pending/inflight/validation transitions without duplicate work, plus an
-  orphan-horizon canonical queue bound and acceptance of an already-in-transit
-  response during post-timeout reassignment backoff;
-- canonical child-before-parent body storage while ordinary import fails closed,
-  contiguous progress remains at the gap, and the retained body survives a
-  RocksDB close/reopen;
-- bounded active-state restart resumption, eight-block cooperative direct
-  slices, full-bound atomic fork connection, contextual-invalid ancestor
-  persistence, and proof that local state faults do not poison stored branches
-  or grant shadow mining authority;
-- next-header committed-root material introduced in API-v10 and retained in
-  current API-v15, opaque runtime-instance exposure, and the external HSD
-  comparison self-test covering confirmed/provisional roots,
-  header-derived deployment/script-policy comparison, divergence,
-  restart/reorganization counters, hash normalization, and checksummed evidence
-  chaining;
-- HSD subsidy boundaries, deterministic ordinary coinbase bytes, and schema-v7
-  airdrop/claim entry size, rate, memory and weight policy plus exact special
-  coinbase bytes.
-
-## Native secp256k1 smoke gate
-
-```bash
-scripts/verify-hsrd-secp256k1.sh
-```
-
-This independently compiles the vendored C source with the same configuration
-as `hns-secp256k1`, then verifies the deterministic low-S signature fixture and
-rejects an altered message. It checks the pinned native dependency and ABI
-surface without depending on Cargo.
-
-## Cargo gates
-
-The standalone workspace is independently exercised:
-
-```bash
-cargo metadata --locked --manifest-path Cargo.toml --format-version 1
-cargo fmt --manifest-path Cargo.toml --all --check
-cargo clippy --locked --manifest-path Cargo.toml \
-  --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --manifest-path Cargo.toml \
-  --workspace --all-targets --all-features
-cargo test --locked --manifest-path Cargo.toml \
-  --workspace --all-targets --no-default-features
-cargo build --locked --release --manifest-path Cargo.toml \
-  --workspace --all-targets --all-features
-```
-
-The root and independent fuzz-workspace lockfiles are audited separately with
-pinned `cargo-audit`.
-
-## State and storage invariants
-
-Tests must cover:
-
-- empty-schema initialization with a zero root;
-- missing/malformed schema/profile/root/checkpoint markers;
-- markerless nonempty databases;
-- root versus materialized-state corruption;
-- pre-state block-header root timing;
-- atomic connect/disconnect root transitions;
-- multi-block staged root transitions;
-- interval-pin lifecycle and startup validation;
-- compaction reachability, malformed metadata, idempotence, atomic commit
-  failure, bounded streaming delete batches, and process exit after a synced
-  partial-delete chunk followed by exact RocksDB reopen/resume;
-- scheduled and forced compaction checkpoint agreement across unclean RocksDB
-  reopen;
-- equal-work branch stability and greater-work activation;
-- header-index memory publication only after durable commit;
-- failure before commit leaving every durable key unchanged;
-- true snapshot consistency during concurrent writes;
-- wallet index registration restart reads, checksum/key relocation failure,
-  bounded cursors, funding/spend disconnect restoration, authenticated
-  pre-current-block input resolution, ordinary same-block child handling, and
-  same-block tracked create/spend reversal;
-- same-address/different-term contract registrations, per-address candidate
-  caps, exact output selection, and startup topology/count validation;
-- never-confirmed contract retirement reclaiming shared-address and global
-  capacity, idempotent absence, exact re-registration with lifecycle-ABA
-  rejection, monotonic confirmation across disconnect/restart reads,
-  legacy-unknown refusal, profile-v1/v2-to-v3 downgrade fencing, exact
-  chain/tip/mempool-generation backend guards, the conservative zero-retained-
-  orphan gate, and exact funding-predicate rejection used by the immutable
-  accepted ordinary/airdrop scan;
-- completed-contract retirement rejecting a retained rollback horizon, active
-  funding, missing permanent-abandonment acknowledgement, reused historical
-  outpoints, matching current funding, and retained orphans; atomically
-  reclaiming active topology only after a bounded exact funding/spend walk;
-  preserving terminal branch evidence and every revealed preimage; committing
-  ordered event bytes plus min/max heights; refusing re-registration; exact
-  idempotent retries; and startup refusal for missing/regressed/non-canonical
-  pruning authority or corrupt tombstone topology;
-- contract-ID- and chain-epoch-bound funding/event continuations plus terminal-
-  page canonical-generation overlap rejection;
-- global sorted-script confirmed history/UTXO traversal, reverse index mapping,
-  script-set cursor binding, stale-chain-epoch rejection, collection admission,
-  256-prefix-examination empty-page continuation, and corrupt-cursor rejection;
-- frozen canonical-binary contract identities and Shakedex/HTLC script/address
-  vectors, exact Shakedex TRANSFER `0x84` fulfillment and `0x83` recovery,
-  direct-FINALIZE rejection, supported HTLC redemption/refund branches, public
-  serde preimage redaction with internal raw round-trip, and malformed
-  key/signature/witness rejection;
-- nonzero process-local mempool nonces, nonce preservation across clear/rebuild,
-  and restart-instance cursor rejection even when generation numbers coincide;
-- proof that a consensus-accepted but wallet-profile-unrecognized contract
-  spend is durably classified and never rejects optional-index block staging;
-- generation-stable combined transaction evidence, tree-root-bearing tips,
-  active-height hashes, and one-snapshot current/proof-state/owner name
-  evidence;
-- bounded aggregate RocksDB WAL retention across all column families;
-- WAL/sync restart points and fault-injected batch failure;
-- complete-state namespace schema/durability admission, exact revision-and-byte
-  CAS, nonzero fencing and exhaustion, maximum-size acceptance, reserved-key
-  rejection, corruption topology, unwind release, clone ownership, raw/archive
-  exclusion, durable-manifest reopen binding, and before/after-write RocksDB
-  recovery through both raw and archived backends.
-
-## Network and synchronization tests
-
-Tests and fault harnesses should cover:
-
-- exact frame boundary handling, wrong magic, unknown packet types, truncation,
-  oversized payloads, oversized collection counts, and partial large-frame
-  continuation across a ping maintenance tick;
-- inbound/outbound capacity races and duplicate-address registration;
-- process-local self-connection detection through the node's own listener;
-- handshake, idle, ping, pong, request, and reconnect timeouts;
-- corrupt/network-mismatched address-book rejection, HSD stale pruning, and
-  attempt/success metadata retention across RocksDB reopen;
-- exact HSD address-group keys, unique discovered target/attempt selection,
-  and explicit-peer collision bypass;
-- corrupt/network-mismatched ban-list rejection, bounded eviction, exact HSD
-  expiry boundaries, IP-wide admission races, and restart enforcement before
-  socket or VERSION work;
-- priority-lane isolation and queue saturation;
-- late-invalid header batches with full current-batch rollback;
-- known and unknown header/body ordering;
-- bounded pending/inflight/per-peer body requests and reassignment;
-- per-peer `GETDATA` batching, failed-admission retry rollback, HSD-aligned
-  header/block deadlines, and one disconnect action for a timed-out batch;
-- stateless validation result ordering despite out-of-order worker completion;
-- orphan count/byte eviction and local resubmission;
-- checkpoint corruption, stale checkpoint recovery, and `Validating` restart;
-- read-only bounded serving and slow-peer backpressure;
-- abnormal supervisor/channel/task termination leaving the database unclean;
-- proof that no shadow-network path can issue a `MiningAuthorityPermit`.
-
-## Mempool, template, and publication tests
-
-Tests and fault harnesses should cover:
-
-- hard accepted-transaction, byte, orphan, ancestor, descendant, package,
-  template-variant, and publication-intent bounds;
-- duplicate/conflict rejection, dependency indexes, deterministic package
-  order, orphan promotion, and oldest-first bounded orphan eviction;
-- explicit rejection when input or contextual verification is incomplete;
-- exact HSD native sigop derivation from resolved coins, 16,001-sigop policy
-  rejection, and sigop-adjusted minimum-fee accounting;
-- one-generation advancement for a block reconciliation and conservative
-  clearing on disconnect/reorganization;
-- native claim proof/time/deployment/state admission, shared ordinary-name
-  exclusion, fee-rate eviction after ordinary roots, and connected/disconnected
-  claim reconciliation;
-- deterministic package ranking by HSD sigop-adjusted policy size while actual
-  HNS weight independently controls block fit, plus sigops, OPEN, UPDATE,
-  RENEW, transaction-count, and exclusive-name limits;
-- atomic template-set replacement: any failed variant preserves the previous
-  complete cache;
-- activation rejection for stale chain generation, mempool generation, parent,
-  or next tree root;
-- publication-intent checksum, key/hash binding, capacity, idempotence, and
-  corrupted-record rejection;
-- proof that local candidate admission precedes every solved-block network
-  broadcast;
-- retry rejection for intents whose block is not a locally accepted active
-  record;
-- zero-peer publication remaining durable and pending after successful local
-  connection;
-- parallel critical fan-out isolation from ordinary block/transaction serving;
-- crash/restart points before intent commit, after intent commit, after local
-  connection, after the first completed peer socket write, and before intent deletion;
-- proof that observed templates and peer transactions cannot issue or bypass a
-  `MiningAuthorityPermit`.
-
-## Differential replay
-
-An exact pinned HSD checkout can export its complete upstream script corpus for
-the Rust differential verifier without adding machine-specific source paths to
-the committed fixture set:
-
-```bash
-NODE_BACKEND=js node hsd-oracle/generate-hsrd-script-fixtures.js \
-  --hsd-source /path/to/hsd \
-  --full-script-output /tmp/hsrd-hsd-script-corpus.json
-cargo run --locked --manifest-path Cargo.toml -p hns-consensus \
-  --example verify_hsd_script_corpus -- /tmp/hsrd-hsd-script-corpus.json
-```
-
-The exporter requires the exact pinned Git revision, reruns every declared HSD
-case through that checkout's script engine, and refuses source/result drift.
-The Rust verifier independently pins the oracle repository, revision, version,
-source description, exact 876-case count, and sequential case IDs; it also
-rechecks each transaction witness, SHA3 witness-script commitment, normalized
-success/rejection code, and HSD sigop count. Any mismatch exits nonzero.
-
-The committed deployment/checkpoint fixture is generated through HSD's own
-`Chain.getState`, `getDeployments`, `computeBlockVersion`, and historical
-boundary methods:
-
-```bash
-NODE_BACKEND=js npm run hsrd-deployment-fixtures --prefix hsd-oracle
-```
-
-It pins all network deployment parameters and mainnet checkpoint hashes, then
-checks compact synthetic histories across DEFINED, STARTED, LOCKED_IN, ACTIVE,
-FAILED, timeout, partial-period, and per-deployment window/threshold behavior.
-
-The committed canonical-mainnet fixture adds every completed 2,016-block
-deployment period through height 338,688. Its offline check replays each real
-median time and signal count through the pinned HSD `Chain` methods; the Rust
-test independently advances the same cached states and compares deployment
-effects, next-block versions, and the checkpoint-backed historical decision.
-It also carries canonical mainnet block 1 as an absolute-finality regression:
-HSD reports its only transaction as individually non-final because the
-coinbase uses locktime 1 and a non-final sequence, while contextual block
-validation accepts it because HSD applies transaction finality only after the
-coinbase. Rust decodes the same raw block and verifies both decisions.
-The compact deployment fixture also executes HSD's full-body versus
-commitments-only and verified-input versus historical-input routes, pinning the
-exact validation-stage plan on both sides of checkpoint height 258,026:
-
-```bash
-NODE_BACKEND=js npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
-```
-
-Node regressions decode HSD's real height-258,026 header and require both the
-candidate and the selected configured descendant checkpoint to occupy the same
-best validated header path before selecting the historical plan. They also
-prove that an exact intermediate checkpoint authorizes no later height and
-that an unconfigured checkpoint value fails closed. Consensus regressions split
-full body sanity from the historical commitment/name-limit stages and prove a
-malformed exclusive covenant returns an error rather than panicking. State
-regressions prove the BID/REDEEM NameState exception; coordinated maturity,
-sequence-lock, sigop, script, value, covenant-link, and reward assumptions; and
-the retained HSD special-proof sanity path, including a sane but
-cryptographically invalid airdrop, HSD's malformed-key hardening behavior, and
-a canonical ownership proof whose altered DNSSEC signature still passes the
-retained parent-time check. An altered partial plan is rejected. Missing,
-unverified, alternate-branch, post-checkpoint, and checkpoint-free-network cases
-all remain fail-closed.
-
-An operator with a synchronized mainnet HSD node can reproduce the compact
-fixture without embedding an API key or machine path:
-
-```bash
-NODE_BACKEND=js npm run refresh-hsrd-mainnet-deployment-history \
-  --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
-```
-
-This is deployment, historical-policy, and one exact historical finality-route
-case; it is not complete transaction, UTXO, covenant, name-root, or
-block-validity replay.
-
-The claim fixture is generated through HSD's `Claim` and `ownership` codecs:
-
-```bash
-NODE_BACKEND=js npm run hsrd-claim-fixtures --prefix hsd-oracle
-```
-
-It pins the bounded Claim envelope, blob-only identifier hash, all four network
-TXT prefixes, binary address/fee/commit fields, checksum behavior, strict
-decode failures, and HSD's complete four-file upstream ownership-proof corpus.
-Rust tests cover compression-free proof parsing, HSD sanity/window/weak
-classification, reserved-target lookup, current ICANN-anchor rejection, all
-five DS digest types, and successful end-to-end chain verification under both
-SHA-256 and legacy GOST94/CryptoPro historical anchors. State tests separately
-cover authenticated claim connect and disconnect semantics.
-
-The canonical mainnet claim-history fixture is checked offline through the
-pinned HSD implementation:
-
-```bash
-NODE_BACKEND=js npm run hsrd-mainnet-claim-history --prefix hsd-oracle
-```
-
-It pins block 62,517, its two real claims, the height-1 commit header, and the
-eleven headers needed for parent-time/MTP context. The native consensus test
-round-trips and validates the full block and both proofs, while the state test
-connects and disconnects the exact historical coinbase. A deliberately
-negative assertion proves that using MTP instead of HSD's exact parent block
-timestamp rejects both otherwise canonical proofs.
-
-An operator can refresh this fixture using a synchronized local mainnet HSD
-node. Refresh obtains the historical block bytes from the bounded archival
-endpoint recorded in the fixture, then requires a continuous locally queried
-header chain from HSD checkpoint 61,043 through the block before writing:
-
-```bash
-NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-history \
-  --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
-```
-
-The bounded replacement history is checked independently:
-
-```bash
-NODE_BACKEND=js npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
-```
-
-It pins 12 full raw claim blocks, the compact canonical boundary
-header/coinbase, checkpoint-linked parent-time contexts, commit headers 1/2/3,
-the existing 66 initial and ten replacement claims, the complete `mylinksfree`
-1→2→3 lineage, and terminal `vcel`. Native replay connects the seven original
-predecessor coinbases, verifies every replacement against its prior coin and
-`NameState`, replays and reverses both later `mylinksfree` generations, and
-proves the height-210,240 boundary rejects a mutated terminal proof. The
-mixed-size `.zone` DNSKEY RRset is a regression for RFC 4034/HSD canonical
-RDATA ordering.
-
-Refresh uses the same synchronized local HSD/header-chain requirement and
-bounded archival endpoint:
-
-```bash
-NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-replacements \
-  --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
-```
-
-These are bounded canonical initial, multi-generation, and terminal histories,
-not complete historical claim, UTXO, covenant, name-root, or reorganization
-replay.
-
-The contextual name-transition fixture is generated directly through the
-pinned HSD `Chain.verifyCovenants` implementation. Each case records the exact
-pre-state, raw transaction, resolved input covenant, active-chain renewal
-lookups, deployment-derived name flags, accept/reject result, and accepted
-post-state bytes:
-
-```bash
-NODE_BACKEND=js npm run hsrd-name-transition-fixtures --prefix hsd-oracle
-```
-
-It covers every non-claim covenant family and important negative boundaries,
-but remains deterministic regtest evidence rather than complete mainnet
-historical replay.
-
-For every mainnet block and mutation-corpus case, compare:
-
-- accept/reject and normalized reason;
-- best hash, height, bits, and chainwork;
-- UTXO additions/removals;
-- name transition and both inherited/resulting roots;
-- deployment state;
-- undo, disconnect, reconnect, and reorganization result;
-- candidate/template commitments where applicable.
-
-A mismatch fails closed and cannot become a silent compatibility exception.
-
-## Integration and fault tests
-
-- Multiple peers, parallel download, malicious/stalled peer replacement,
-  serving, orphan bounds, and reconnect.
-- Restart/crash at raw-block, validation, undo, state-batch, root-binding,
-  tip-promotion, sync-checkpoint, template, and publication boundaries.
-- Reorganizations across scripts, deployments, covenants, claims/airdrops,
-  name state, roots, and pruning.
-- A failed multi-step reorganization preserves every durable key, root, epoch,
-  and mining generation.
-- Mempool conflicts, dependencies, eviction, and template replacement.
-- Durable template snapshots recompute canonical parent MTP, deployment
-  version, and the time-dependent HSD target; stale time/version/bits rebuilds
-  fail atomically without replacing the prior template set, and non-reset
-  testnet jobs expire at HSD's timestamp-driven target-reset boundary.
-- Tip commit to job activation and candidate receipt to first accepted relay.
-- Priority isolation under sync, compaction, diagnostics, and slow-peer load.
-- Activation-overlay tests require repeated present and absent metadata,
-  header, UTXO, and name-state reads to reach the base snapshot once; name-tree
-  nodes retain their separate bounded cache.
-- Block-state tests require all existing-input and output-collision UTXO probes
-  to use one multi-get with no individual UTXO point reads.
-- Segment-store tests require canonical payload and locator-hint round trips,
-  checksum rejection for complete corruption, preservation of the last complete
-  frame across a torn tail, zero-copy payload decoding, duplicate-free page
-  plans for overlapping and page-spanning records, an exact checksummed durable
-  manifest tail, and rejection of a recovery boundary inside a frame.
-- Packed name-page tests require compact address round trips, zero-copy `O(1)`
-  slot reads, full-page checksum coverage, unique content keys, canonical
-  directory/payload layout, at least 500 average internal nodes per 64 KiB
-  page, sync-before-manifest publication, and recovery of complete or partial
-  uncommitted pages to an exact page boundary.
-- Bootstrap tests stream a legacy content-addressed tree through several
-  parallel post-order subtrees, reopen the resulting pages, validate every
-  reachable record and sampled proof, and reject a duplicated subtree before
-  any page is published.
-- Name-page generation tests stream one base tree and only the divergent nodes
-  of a nearby retained root, validate both roots after the atomic locator swap,
-  remove stale root locators, and prove reopen deletes both an unpublished
-  future generation and a restored superseded generation.
-- A one-page-cache regression cycles a single multi-get across several pages
-  repeatedly and requires exactly one physical page load per unique page,
-  proving that audit/path batches are coalesced by `(segment, page)`.
-- Block/undo archive qualification forces physical rotation at a reduced test
-  threshold, rolls back a newly created segment, reopens old and active
-  segments, rejects checksum corruption inside an authoritative manifest, and
-  proves bounded inline migration is transparent and idempotent.
-- Pruning qualification deletes raw blocks and undo together, upgrades a
-  version-1 undo-only checkpoint without rereading historical bodies, retains
-  the exact rollback horizon, rejects deeper activation before mutation, and
-  rewrites only live locators and retained name roots into fresh generations.
-  Reopen removes both unpublished future generations and superseded
-  predecessors.
-- Storage-rollout tests create a native RocksDB checkpoint, independently copy
-  external page/segment files, reopen the fallback, and prove later source-file
-  mutation cannot alter the backup. The exact offline marker is required, and
-  its presence blocks normal node startup.
-- Native-sync diagnostics distinguish activation planning, state commit, and
-  post-commit time, normalize commit cost by transactions, inputs, outputs, and
-  name actions, and expose peer-event and validation-result backlog during the
-  bounded writer slice.
-- Live diagnostic snapshots that preserve exact block-status counts without
-  materializing historical RPC payload collections.
-- Lock-held native status/authority/parity/mining diagnostics that return an
-  explicitly marked, timestamped cached snapshot within one second while
-  `getparentauthority` remains bound to coherent live state.
-
-## Fuzzing
-
-Fuzz P2P, header, transaction, block, witness/script, covenant, resource,
-`NameState`, Urkel, snapshot, checkpoint, diagnostics, and native
-MeshMine-boundary parsers. Allocation and execution bounds are part of the
-assertions. The current ten parser/manifest boundaries run through:
-
-```bash
-scripts/run-sustained-fuzz.sh \
-  --duration-seconds 1800 \
-  --output-dir /new/path/fuzz-evidence
-```
-
-Each selected target must complete and remain running for at least its declared
-per-target duration. The summary includes targets not run after an earlier
-failure, exact commit/tree/tool/configuration identities, start/end
-full-worktree digests, start/completion corpus inventories, and SHA-256 hashes
-for logs and crash artifacts. The start and completion worktree digests fail
-the campaign when a tracked or non-ignored untracked difference is present at
-either boundary. A transient mutation restored before completion is not
-reconstructible from those boundary digests, so release evidence also requires
-reviewed, exclusive trusted source-tree custody throughout the campaign. Weekly
-CI uses three minutes per target to keep the scheduled gate bounded; release
-campaigns may use a longer reviewed duration. Neither duration is a proof of
-parser completeness.
-The release orchestrator rejects a per-target duration below 30 minutes.
-
-## Performance evidence
-
-Report count, P50, P95, P99, maximum, failure count, and unavailable evidence
-for header/block validation, state/root mutation, reorganization commit,
-storage, peer handshake, IBD, tip-to-job, candidate validation, and each
-publication target. Mean throughput alone is not a release gate.
-
-The native runtime supplies two reproducible release-build entry points:
-
-```bash
-python3 scripts/measure-hsrd-native-sync.py --self-test
-cargo run --locked --release -p hns-node \
-  --bin hsrd-performance-gate -- \
-  --json-output /new/path/deterministic-performance.json
-```
-
-The live sampler consumes `/api/v1/native-sync` without an HSD runtime. Current
-bounded results and explicit exclusions are recorded in
-[`performance.md`](performance.md). WAN/load, physical-device, and long-soak
-measurements remain separate external release records.
+Smoke uses an in-memory regtest scenario; scheduled qualification uses persistent
+RocksDB with synchronous durability and saturated cache occupancy. Scheduled
+and release runs require a fully clean source tree and the pinned fuzz toolchain.
+Compare the exact configured workloads and thresholds described in
+[performance](performance.md) and [production assurance](production-assurance.md).
+
+Production release additionally requires complete mainnet synchronization,
+production-scale pruning, RocksDB fault injection, sustained reorganization and
+partition tests, WAN/load latency, physical gateway/ASIC testing where applicable,
+long-duration multi-peer operation, and mempool/template/publication differential
+qualification. Keep binary, configuration, and source identities consistent
+across the required qualification outputs. A passing local fixture or a callable
+harness does not establish production readiness.

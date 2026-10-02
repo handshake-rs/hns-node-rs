@@ -73,7 +73,7 @@ spent within one block is restored first and then removed, producing the exact
 pre-block state. Multi-block reorganizations use the staging overlay, so no
 consumer can observe a half-reversed swap history.
 
-## Startup profile checks and migrations
+## Startup profile checks
 
 The checksummed `wallet-index-profile/v1` record in `snapshots` binds the data
 directory to its built components. Startup fails closed when:
@@ -84,12 +84,9 @@ directory to its built components. Startup fails closed when:
 - a checksummed profile is corrupt;
 - `--wallet-index` would implicitly enable a transaction index after unindexed
   history already exists.
-- a version 1, 2, or 3 profile with the complete `wallet` component enabled has
-  any chain history or existing wallet-index keys. Profile version 4 adds
-  confirmed TRANSFER-recipient and exact source-inclusion metadata that those
-  wallet writers never built, so normal startup cannot truthfully backfill it.
-  Legacy history-only and spender-only profiles can update the profile fence
-  because they do not claim this state.
+- a complete wallet profile does not bind version-4 TRANSFER-recipient and
+  source-inclusion metadata for its entire indexed history. Startup does not
+  infer or backfill this evidence into populated stores.
 
 Once chain history or relevant index keys exist, effective transaction,
 history, spender, and wallet capabilities are immutable in both directions.
@@ -108,14 +105,11 @@ directory, use one of these explicit procedures:
 
 Do not copy `tx_index` keys between data directories. The active-chain binding,
 network identity, store schema, and profile record must move as one qualified
-backup. At this revision no online profile migration or resume checkpoint is
-claimed. In particular, a pruned version-3 database cannot in general recover
-the exact transaction ordinal and total source-output count required by
-version-4 TRANSFER evidence, even when its active UTXO still identifies the
-recipient covenant. Use a fresh version-4 data directory. A future offline
-migration may be used only after it verifies the network/genesis/canonical
-binding and reconstructs every active TRANSFER's exact canonical source
-inclusion from separately verified archive data.
+backup. Complete TRANSFER evidence requires exact canonical transaction
+ordinals and source-output counts. An active UTXO alone cannot reconstruct
+those facts. Use a fresh synchronized data root when the persisted profile
+cannot prove completeness; any offline reindex must be separately qualified
+against the exact storage schema and verified canonical archive inputs.
 
 Contract tracking does not require an index-profile migration for a store that
 already has `--wallet-index`: it adds versioned derivative keys under that
@@ -371,7 +365,7 @@ snapshot. The spending
 batch contains exactly one result per requested outpoint in request order and
 is capped at 4,096 entries internally (256 on wallet RPC). Confirmed inclusion
 contains an exact optional transaction position: retained block bytes make the
-position derivable, while pruned legacy transaction-index rows retain valid
+position derivable, while pruned transaction-index rows retain valid
 inclusion without an ordinal. No layer substitutes zero.
 
 A pruned data directory can therefore still return indexed confirmation and
@@ -510,7 +504,7 @@ canonical `encode_name_state` byte strings for both views. Projected
 adapter never reconstructs consensus bytes from projected fields. The wire exposes existing tracked-contract
 funding/spend classifications by opaque content ID only: it does not expose
 descriptor registration or raw revealed-preimage transport merely because
-exact crates.io `hns-rs` `=0.3.0` artifacts are now pinned. The exact wire
+exact crates.io `hns-rs` `=0.5.0` artifacts are pinned. The exact wire
 contract is in
 [`WALLET_RPC_V1.md`](WALLET_RPC_V1.md).
 
@@ -645,8 +639,7 @@ signatures must be valid compact low-S encodings and use the exact profile hash
 type (`0x84` for Shakedex fulfillment, `0x83` for Shakedex recovery, and `0x01`
 for HNS HTLC branches). Consensus admission authenticates the signature; the
 tracker additionally requires the exact hash type, witness script, and TRANSFER
-output shape. The previously invented direct FINALIZE/one-script shape is
-`Unrecognized`.
+output shape. Any unsupported FINALIZE or witness shape is `Unrecognized`.
 If consensus accepts a spend outside those pinned wallet shapes, the optional
 index records `Unrecognized` and removes the funding normally; it never rejects
 the canonical block or exposes a guessed preimage. This keeps the derivative
@@ -672,29 +665,7 @@ still keep it out of logs. Completed retirement carries every such value into
 the tombstone with its funding-outpoint and spending-transaction binding; it
 never drops an internally retained revealed preimage.
 
-## Remaining integration work
-
-This source implementation now has a bounded authenticated process transport,
-`hns-wallet-rs` has a concrete adapter boundary, and the mobile repository has
-fail-closed Android and iOS read projections. The code-bearing node candidate
-at `2b267ffe7fc6f9929063a18986a83b566d02ae6d` passed exact-revision CI,
-container, and CodeQL workflows. The remaining work is joined
-backend/authentication and mobile lifecycle qualification, live
-restart/reorganization and adversarial qualification, product enablement, and
-the released canonical `hns-swap` pin described above; initial adapter
-implementation is no longer the blocker.
-Completed-contract active-slot reclamation passed its four focused
-`production_next_` wallet-index tests at exact local revision
-`fd0c9b00114e3fa0a293972de7d4538dcd959ce0`; the test filter covered bounded
-retirement/reopen/idempotence/preimage evidence, startup rollback authority,
-reused-outpoint corruption, and the profile-version downgrade fence. It has
-not run a RocksDB reopen, live restart/reorg, adversarial topology, or full
-qualification gate. Its finite 65,536 tombstone quota and permanent-
-abandonment semantics are still production-availability constraints, so
-untrusted registration remains unavailable. Live subscription delivery remains outside
-this typed pull API. Durable encrypted workflow state, rebroadcast journals,
-matching decisions, transaction construction/signing, and secret preimages
-remain wallet responsibilities.
+## Runtime integration boundary
 
 The separate Shakescape cache is connected to the active peer transport through
 the typed name-market and cross-chain node adapter. The workspace pins exact

@@ -66,7 +66,7 @@ partial historical plans are rejected.
 ## Staged chain events
 
 - `CandidateTipSeen`: bounded header/parent evidence arrived; useful only to stop
-  obviously obsolete work, never to authorize a new job.
+  stale candidate work, never to authorize a new job.
 - `BlockSyntaxValidated`: the bounded full body stage, or the retained
   historical commitment/name-limit subset, passed preflight. It does not claim
   scripts, covenants, name state, or complete consensus.
@@ -228,7 +228,7 @@ retire only exact never-confirmed registrations after binding the caller's
 lifecycle revision, requiring zero retained transaction orphans, scanning the
 current immutable accepted ordinary/airdrop pool, and exact canonical-writer
 compare-and-commit. This reclaims active global and per-address slots without
-removing any descriptor needed by disconnect. Legacy-unknown and ever-confirmed
+removing any descriptor needed by disconnect. Unknown-provenance and ever-confirmed
 registrations fail closed on that path. The distinct completed transition
 requires a fully paired, fully spent bounded event history below the durable
 undo-pruned frontier and the same exact chain/tip/mempool authority. It replaces
@@ -254,8 +254,8 @@ Urkel/liburkel are comparison oracles, not runtime architectural dependencies.
 Ordinary VERSION/VERACK precedes the connection-local Shakescape Experimental V1
 registry exchange; typed HIP-76 `f0`/`f1` traffic is admitted only after that
 agreement and under separate requester/provider role policy. These extensions
-do not enter consensus or authority. The workspace now pins exact crates.io
-`hns-rs` `=0.3.0` artifacts from the published, non-yanked,
+do not enter consensus or authority. The workspace pins exact crates.io
+`hns-rs` `=0.5.0` artifacts from the published, non-yanked,
 provenance-verified 19-package cohort, while the active transport deliberately
 remains Shakescape V1.
 Marketplace roles stay locally bounded and wire-disabled until Shakescape V1

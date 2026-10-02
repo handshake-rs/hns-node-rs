@@ -125,14 +125,11 @@ does not grant authority. Solved-block staging, connection, and
 publication require the same private authority capability as the existing
 authoritative mining boundary.
 
-Current API-v15 retains the next-header interval-committed root introduced in
-API-v10 for external qualification. `compare-hsrd-hsd-shadow.py` reads that
-material and a pinned
-HSD node, but its observations and evidence checkpoint never enter the store,
-fork-choice logic, validation services, mining event hub, or authority permit.
-A match is evidence for an observed boundary, not a consensus input. Remote
-diagnostic reads require an explicit acknowledgement, and HSD/hsrd tip changes
-during a probe are retried rather than classified as divergence.
+API-v15 exposes the interval-committed root for external qualification.
+Independent comparison observations never enter the store, fork choice,
+validation services, mining event hub, or authority permit. A matching sample
+qualifies that boundary only. Use coherent snapshots at the same canonical
+height and distinguish a racing or unavailable observation from a divergence.
 
 The following remain hardening or assurance work; none is represented as a
 false source-readiness bit:
@@ -158,7 +155,7 @@ false source-readiness bit:
 ## Authority policy
 
 - `disabled`: no mining authority.
-- `shadow`: legacy diagnostic mode; staged state never grants authority.
+- `shadow`: diagnostic mode; staged state never grants authority.
 - `hsd-verified`: reserved until the independent HSD verifier boundary exists;
   configuration currently fails closed.
 - `native`: the default mainnet synchronization mode; mining remains fail
@@ -340,7 +337,7 @@ Fixtures are evidence, not authority.
   retirement requires the authoritative false state, caller-bound revision,
   empty confirmed prefixes, zero retained transaction orphans, a complete
   current immutable accepted ordinary/airdrop scan, and an exact canonical-
-  writer compare-and-commit. Legacy-unknown or ever-confirmed
+  writer compare-and-commit. Unknown-provenance or ever-confirmed
   state fails closed, so retirement cannot remove a descriptor required by a
   retained disconnect.
 - Completed retirement is a distinct irreversible transition. It requires a

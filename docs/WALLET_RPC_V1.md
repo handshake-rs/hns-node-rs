@@ -709,7 +709,7 @@ ordinal requires a separately designed storage migration, not a wire shortcut.
 
 The v1 boundary intentionally does not accept Shakedex or HNS-HTLC descriptor
 registrations. Those profiles are duplicated locally for derivative tracking.
-The workspace now consumes exact crates.io `hns-rs` `=0.3.0` artifacts from
+The workspace consumes exact crates.io `hns-rs` `=0.5.0` artifacts from
 the published, non-yanked, provenance-verified 19-package cohort. The trusted
 registration adapter is still not installed or qualified. The
 API exposes only evidence for registrations already admitted through a trusted
@@ -732,7 +732,7 @@ lifecycle/chain/mempool authority, require no retained transaction orphans,
 and scan the current accepted ordinary/airdrop generation. Completed retirement
 is an irreversible, separately bounded tombstone transition with explicit
 permanent-abandonment semantics; later matching outputs are deliberately
-untracked. Legacy-unknown registrations remain non-retirable, and the finite
+untracked. Unknown-provenance registrations remain non-retirable, and the finite
 tombstone quota keeps capacity exhaustion a production-availability blocker.
 Untrusted registration and every retirement mutation remain absent from this
 endpoint.

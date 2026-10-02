@@ -67,22 +67,20 @@ under that authenticated assignment. A winning reconstruction returns through
 a reserved candidate-validation and multi-target publication lane; DAG and
 settlement reconciliation never gate job activation or block broadcast.
 
-The native bridge now acquires only the authority-permitted event stream,
+The native bridge acquires only the authority-permitted event stream,
 persists exact generation/job bindings in the gateway store, activates signed
 assignments through the gateway, retires work on tip loss/change, and rechecks
-authority before publication. The qualified synchronized mainnet canary now
-permits native production authority without a live HSD process; the remaining
-operational campaigns below are explicit hardening work. That conditional
+authority before publication. Native mainnet authority requires the canary's
+current consensus, storage, and operational readiness conditions.
+That conditional
 runtime capability is separate from API-v15's release-stage diagnostic: the
 base snapshot starts at `pre-authority`, while the live mainnet canary RPC
 reports `mainnet-canary-gated`.
 
-## hsd removal gate
+## Production qualification
 
-`hsrd` progresses through fixture, historical replay, native synchronization,
-and authority stages. Historical replay, stopped-state, retained rollback, and
-invalid-corpus evidence now permit HSD to remain only a pinned offline oracle.
-The broader removal and operational-hardening standard continues to require:
+HSD is a pinned offline differential oracle. The running node obtains state
+and authority from native validation. Production qualification requires:
 
 1. identical accept/reject results for every historical mainnet block and the
    invalid/mutated corpus;
