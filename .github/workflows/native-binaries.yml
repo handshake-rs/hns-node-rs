@@ -297,6 +297,9 @@ jobs:
             cargo +1.97.1 test --locked --target "$TARGET" -p hns-node --lib \
               name_page 2>&1 |
               tee ../native-logs/name-page-tests.log
+            cargo +1.97.1 test --locked --target "$TARGET" -p hns-node --lib \
+              rollback_uncommitted_tail_removes_a_prepared_segment_seal 2>&1 |
+              tee ../native-logs/name-page-rollback-tests.log
           fi
 
       - name: Package native archive and per-target provenance

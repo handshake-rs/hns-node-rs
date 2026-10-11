@@ -73,3 +73,5 @@ jobs:
           set -euo pipefail
           cargo +1.97.1 test --locked --target x86_64-pc-windows-msvc \
             -p hns-node --lib name_page
+          cargo +1.97.1 test --locked --target x86_64-pc-windows-msvc \
+            -p hns-node --lib rollback_uncommitted_tail_removes_a_prepared_segment_seal
