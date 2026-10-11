@@ -7,12 +7,18 @@ on:
         description: Published release tag to build (for example v0.3.9)
         required: true
         type: string
+      target_group:
+        description: Native runner group to build
+        required: true
+        default: all
+        type: choice
+        options: [all, linux, macos, windows]
 
 permissions:
   contents: read
 
 concurrency:
-  group: native-hsrd-${{ inputs.release_tag }}
+  group: native-hsrd-${{ inputs.release_tag }}-${{ inputs.target_group }}
   cancel-in-progress: false
 
 jobs:
@@ -23,6 +29,7 @@ jobs:
       commit: ${{ steps.verify.outputs.commit }}
       tree: ${{ steps.verify.outputs.tree }}
       version: ${{ steps.verify.outputs.version }}
+      matrix: ${{ steps.verify.outputs.matrix }}
     steps:
       - name: Check out main and all tags
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -73,6 +80,17 @@ jobs:
             echo "tree=$tag_tree"
             echo "version=$version"
           } >> "$GITHUB_OUTPUT"
+          matrix_json='{"include":[{"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04","source":"published-container","binary":"hsrd","group":"linux"},{"target":"aarch64-apple-darwin","runner":"macos-15","source":"cargo","binary":"hsrd","group":"macos"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel","source":"cargo","binary":"hsrd","group":"macos"},{"target":"x86_64-pc-windows-msvc","runner":"windows-2025","source":"cargo","binary":"hsrd.exe","group":"windows"}]}'
+          selected_group='${{ inputs.target_group }}'
+          if [[ "$selected_group" != all ]]; then
+            matrix_json=$(jq -c --arg group "$selected_group" \
+              '{include: [.include[] | select(.group == $group)]}' <<< "$matrix_json")
+          fi
+          if ! jq -e '.include | length > 0' <<< "$matrix_json" >/dev/null; then
+            echo "No native build targets selected for $selected_group" >&2
+            exit 1
+          fi
+          echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build and qualify ${{ matrix.target }}
@@ -84,24 +102,7 @@ jobs:
       packages: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            source: published-container
-            binary: hsrd
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            source: cargo
-            binary: hsrd
-          - target: x86_64-apple-darwin
-            runner: macos-15-intel
-            source: cargo
-            binary: hsrd
-          - target: x86_64-pc-windows-msvc
-            runner: windows-2025
-            source: cargo
-            binary: hsrd.exe
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
@@ -208,10 +209,10 @@ jobs:
               image="ghcr.io/handshake-rs/hns-node-rs:$RELEASE_TAG"
               docker pull --platform linux/amd64 "$image"
             fi
-            test "$(docker image inspect "$image" --format '{{.Architecture}}')" = amd64
-            test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
-            test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
-            docker image inspect "$image" --format '{{index .RepoDigests 0}}'
+            test "$(docker image inspect --platform linux/amd64 "$image" --format '{{.Architecture}}')" = amd64
+            test "$(docker image inspect --platform linux/amd64 "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
+            test "$(docker image inspect --platform linux/amd64 "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$RELEASE_TAG"
+            docker image inspect --platform linux/amd64 "$image" --format '{{index .RepoDigests 0}}'
             container_id=$(docker create --platform linux/amd64 "$image")
             trap 'docker rm --force "$container_id" >/dev/null' EXIT
             docker cp "$container_id:/usr/local/bin/hsrd" ../native-bin/hsrd
@@ -283,7 +284,10 @@ jobs:
             tee ../native-logs/storage-tests.log
 
       - name: Package native archive and per-target provenance
-        if: always() && (steps.linux_binary.outcome == 'success' || steps.native_build.outcome == 'success')
+        if: >-
+          always() &&
+          (steps.linux_binary.outcome == 'success' || steps.native_build.outcome == 'success') &&
+          steps.smoke.outcome == 'success' && steps.storage.outcome == 'success'
         id: package
         continue-on-error: true
         shell: bash

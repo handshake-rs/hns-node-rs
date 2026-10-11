@@ -121,8 +121,9 @@ def main() -> None:
         f"release at {REPOSITORY}/releases/tag/{args.tag}. "
         "See THIRD_PARTY_NOTICES.md and the included licenses.\n\n"
         "Linux GNU builds use the Debian Bookworm glibc generation and link "
-        "against system OpenSSL 3, libstdc++, zlib, and zstd. macOS and "
-        "Windows builds use the native toolchains named by the target triple.\n"
+        "against system OpenSSL 3, libstdc++, zlib, and zstd. macOS builds "
+        "target macOS 13 or newer and link only Apple system libraries. "
+        "Windows builds use the native MSVC toolchain.\n"
     ).encode("utf-8")
     members = [(executable_name, binary.read_bytes(), 0o755), ("README.md", readme, 0o644)]
     for relative in NOTICE_PATHS:
