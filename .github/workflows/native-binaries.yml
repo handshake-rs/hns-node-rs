@@ -245,13 +245,23 @@ jobs:
                   *) echo "Non-system macOS dylib in release binary: $dylib" >&2; exit 1 ;;
                 esac
               done < <(otool -L "../native-bin/$BINARY_NAME" | awk 'NR > 1 {print $1}')
-              xcrun vtool -show-build "../native-bin/$BINARY_NAME" |
-                tee ../native-logs/macos-build-version.log
-              python3 - ../native-logs/macos-build-version.log <<'PY'
+              otool -l "../native-bin/$BINARY_NAME" |
+                tee ../native-logs/macos-load-commands.log
+              python3 - ../native-logs/macos-load-commands.log <<'PY'
           import pathlib, re, sys
-          build = pathlib.Path(sys.argv[1]).read_text()
-          minimums = re.findall(r"\bminos\s+(\d+)\.(\d+)", build)
-          if not minimums or any(tuple(map(int, version)) > (13, 0) for version in minimums):
+          commands = re.split(r"(?=^Load command \d+$)", pathlib.Path(sys.argv[1]).read_text(), flags=re.M)
+          minimums = []
+          for command in commands:
+              if re.search(r"^\s*cmd LC_BUILD_VERSION$", command, re.M):
+                  match = re.search(r"^\s*minos (\d+)\.(\d+)$", command, re.M)
+              elif re.search(r"^\s*cmd LC_VERSION_MIN_MACOSX$", command, re.M):
+                  match = re.search(r"^\s*version (\d+)\.(\d+)$", command, re.M)
+              else:
+                  continue
+              if match is None:
+                  raise SystemExit("macOS binary has a malformed minimum OS load command")
+              minimums.append(tuple(map(int, match.groups())))
+          if not minimums or any(version > (13, 0) for version in minimums):
               raise SystemExit("macOS binary requires newer than macOS 13 or lacks a minimum OS version")
           PY
             fi
