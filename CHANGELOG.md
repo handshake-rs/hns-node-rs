@@ -4,6 +4,16 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## 0.3.9 - 2026-10-10 (prerelease)
+
+- Federate signed ShakeScape name listings, direct HNS/BTC offers, cancellations,
+  and swap-session routing among rendezvous nodes. Board and session messages
+  retain their original signatures and expiry checks across federation links.
+- Discover and connect to other ShakeScape rendezvous nodes automatically from
+  `NETWORK | SHAKESCAPE` address gossip when the mobile rendezvous profile is
+  enabled. Reserve outbound capacity for those links while keeping optional
+  explicitly configured federation peers.
+
 ## 0.3.8 - 2026-09-28 (prerelease)
 
 - Consume the coherent `hns-rs 0.5.0` protocol graph. Route signed direct-offer
