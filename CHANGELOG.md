@@ -4,7 +4,7 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
-## 0.3.9 - 2026-10-10 (prerelease)
+## 0.3.9 - 2026-10-10
 
 - Federate signed ShakeScape name listings, direct HNS/BTC offers, cancellations,
   and swap-session routing among rendezvous nodes. Board and session messages
