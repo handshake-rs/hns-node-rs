@@ -1388,10 +1388,31 @@ fn remove_other_archive_generations(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<(), SegmentError> {
     File::open(directory)
         .and_then(|file| file.sync_all())
         .map_err(segment_io)
+}
+
+#[cfg(windows)]
+fn sync_directory(directory: &Path) -> Result<(), SegmentError> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .map_err(segment_io)?;
+    if !handle.metadata().map_err(segment_io)?.is_dir() {
+        return Err(segment_io(std::io::Error::from(ErrorKind::NotADirectory)));
+    }
+    // Windows has no supported directory fsync equivalent. Every new archive
+    // file is flushed with sync_data (FlushFileBuffers on Windows) before its
+    // locator is published in RocksDB. Removed files are non-authoritative;
+    // recovery can repeat their cleanup after a crash.
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2144,6 +2165,31 @@ mod tests {
         );
         drop(archive);
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fresh_archive_reopens_its_flushed_manifest() {
+        let directory = test_file();
+        let archive = SegmentArchive::create_new(directory.clone(), 1)
+            .expect("create archive in a fresh Windows directory");
+        let key = [0x5a; 32];
+        let payload = b"durable Windows archive frame";
+        let locator = prepare_and_publish(&archive, SegmentKind::Block, key, payload);
+        assert!(sync_directory(&archive_file_path(&directory, SegmentKind::Block, 1, 0)).is_err());
+        let (block, undo) = archive.manifests().expect("published manifests");
+        drop(archive);
+
+        let reopened = SegmentArchive::recover(directory.clone(), block, undo)
+            .expect("recover flushed archive files");
+        assert_eq!(
+            reopened
+                .resolve(SegmentKind::Block, &key, &locator.encode())
+                .expect("read committed frame"),
+            Some(payload.to_vec())
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).expect("remove archive fixture");
     }
 
     #[test]

@@ -8920,11 +8920,32 @@ fn name_page_generation_bytes(
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn sync_directory(directory: &std::path::Path) -> Result<()> {
     std::fs::File::open(directory)
         .with_context(|| format!("failed to open directory {}", directory.display()))?
         .sync_all()
         .with_context(|| format!("failed to sync directory {}", directory.display()))
+}
+
+#[cfg(windows)]
+fn sync_directory(directory: &std::path::Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)
+        .with_context(|| format!("failed to open directory {}", directory.display()))?;
+    if !handle.metadata()?.is_dir() {
+        anyhow::bail!("name-page path is not a directory: {}", directory.display());
+    }
+    // Windows has no supported directory fsync equivalent. New name-page
+    // files are flushed with sync_data (FlushFileBuffers on Windows) before
+    // their manifest is committed to RocksDB. Deleted files are not referenced
+    // by the committed manifest and startup recovery can clean them again.
+    Ok(())
 }
 
 fn load_name_page_root_record(
@@ -15577,6 +15598,29 @@ mod tests {
             store: store.clone(),
             directory,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_name_page_bootstrap_reopens_its_flushed_generation() {
+        let NodePageGenerationFixture {
+            live_state,
+            store,
+            directory,
+        } = build_test_node_page_generation(1);
+        let pages = live_state.name_pages.as_ref().expect("bootstrapped pages");
+        let expected = pages.state.clone();
+        assert!(expected.manifest.durable_bytes > 0);
+        assert!(sync_directory(&pages.file_path).is_err());
+        drop(live_state);
+
+        let reopened =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("reopen committed Windows name pages");
+        assert_eq!(reopened.state, expected);
+        drop(reopened);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove Windows page fixture");
     }
 
     #[test]

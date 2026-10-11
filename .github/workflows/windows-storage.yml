@@ -1,0 +1,75 @@
+name: Windows storage qualification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/hns-store/**
+      - crates/hns-node/**
+      - .github/workflows/windows-storage.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/hns-store/**
+      - crates/hns-node/**
+      - .github/workflows/windows-storage.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-storage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  storage:
+    name: Exercise Windows archive and name-page storage
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - name: Check out source under test
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Configure Windows native libraries
+        shell: pwsh
+        run: |
+          $llvmBin = Join-Path $env:ProgramFiles 'LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvmBin 'libclang.dll'))) {
+            throw 'The Windows runner is missing libclang.dll.'
+          }
+          $vcpkg = Join-Path $env:VCPKG_INSTALLATION_ROOT 'vcpkg.exe'
+          & $vcpkg install openssl:x64-windows-static
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg OpenSSL installation failed.' }
+          Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$llvmBin"
+          Add-Content $env:GITHUB_ENV "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT"
+          Add-Content $env:GITHUB_ENV 'VCPKGRS_TRIPLET=x64-windows-static'
+          Add-Content $env:GITHUB_ENV 'OPENSSL_STATIC=1'
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.97.1
+
+      - name: Exercise fresh, published, and recovered archive storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.97.1 test --locked --target x86_64-pc-windows-msvc -p hns-store
+
+      - name: Exercise name-page bootstrap and reopen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.97.1 test --locked --target x86_64-pc-windows-msvc \
+            -p hns-node --lib windows_name_page_bootstrap_reopens_its_flushed_generation

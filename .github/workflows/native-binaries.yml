@@ -283,6 +283,11 @@ jobs:
           set -euo pipefail
           cargo +1.97.1 test --locked --target "$TARGET" -p hns-store 2>&1 |
             tee ../native-logs/storage-tests.log
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cargo +1.97.1 test --locked --target "$TARGET" -p hns-node --lib \
+              windows_name_page_bootstrap_reopens_its_flushed_generation 2>&1 |
+              tee ../native-logs/name-page-tests.log
+          fi
 
       - name: Package native archive and per-target provenance
         if: >-
