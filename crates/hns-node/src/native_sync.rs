@@ -13837,7 +13837,7 @@ mod tests {
             assert!(addresses
                 .insert_discovered(keyless, now, timestamp)
                 .accepted());
-            assert!(reconnects.get(&address).is_none());
+            assert!(!reconnects.contains_key(&address));
         }
         assert_eq!(
             fill_node_discovery_slots(&addresses, &mut reconnects, &bans, 8, true, now, timestamp),
