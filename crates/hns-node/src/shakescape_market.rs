@@ -1,7 +1,7 @@
 //! Node-owned handle and typed name-market adapter for the bounded Shakescape relay.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -629,6 +629,23 @@ impl ShakescapeRelayHandle {
             .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         service.cross_chain.peers.insert(peer);
         service.cross_chain.federation_peers.insert(peer);
+        Ok(())
+    }
+
+    /// Retire discovered federation links that no longer occupy a selected
+    /// slot. Ordinary board peers remain connected and keep their own caps.
+    pub fn retain_federation_peers(
+        &self,
+        selected: &HashSet<PeerId>,
+    ) -> Result<(), ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        service
+            .cross_chain
+            .federation_peers
+            .retain(|peer| selected.contains(peer));
         Ok(())
     }
 

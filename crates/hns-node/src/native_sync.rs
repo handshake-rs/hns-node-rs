@@ -158,7 +158,9 @@ const ADDRESS_BOOK_FLUSH_INTERVAL: Duration = Duration::from_secs(120);
 const LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SHAKESCAPE_FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SHAKESCAPE_FEDERATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS: usize = 2;
+const MAX_SHAKESCAPE_FEDERATION_PEERS: usize = 8;
+const RESERVED_SHAKESCAPE_OUTBOUND_SLOTS: usize = 2;
+const MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS: usize = 8;
 const HSD_ADDRESS_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
 const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const HSD_ADDRESS_MAX_FAILURES: u32 = 10;
@@ -812,6 +814,8 @@ pub struct NativeSyncConfig {
     pub connect_keys: BTreeMap<SocketAddr, [u8; 33]>,
     /// Static keys of explicitly connected hsrd board-federation peers.
     pub federation_keys: Vec<[u8; 33]>,
+    /// Discover and federate with negotiated NETWORK | SHAKESCAPE peers.
+    pub federation_auto: bool,
     /// Bootstrap from HSD's key-bearing fixed seeds and learn bounded peers
     /// from GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
     pub discovery: bool,
@@ -869,6 +873,7 @@ impl Default for NativeSyncConfig {
             connect: Vec::new(),
             connect_keys: BTreeMap::new(),
             federation_keys: Vec::new(),
+            federation_auto: false,
             discovery: false,
             hip76_requester_override: None,
             odoh_requester: true,
@@ -979,7 +984,7 @@ impl NativeSyncConfig {
         {
             anyhow::bail!("native sync configured peer has an invalid compressed static key");
         }
-        if self.federation_keys.len() > 8
+        if self.federation_keys.len() > MAX_SHAKESCAPE_FEDERATION_PEERS
             || self
                 .federation_keys
                 .iter()
@@ -988,6 +993,9 @@ impl NativeSyncConfig {
             anyhow::bail!(
                 "Shakescape federation requires at most eight explicitly connected authenticated peers"
             );
+        }
+        if self.federation_auto && !self.discovery {
+            anyhow::bail!("automatic Shakescape federation requires P2P discovery");
         }
         if matches!(network, Network::Mainnet | Network::Testnet)
             && self
@@ -2027,6 +2035,7 @@ struct KnownPeerAddress {
 struct BoundedAddressBook {
     network: Network,
     listen: Option<SocketAddr>,
+    allow_keyless_shakescape: bool,
     maximum: usize,
     sequence: u64,
     durable_sequence: u64,
@@ -2047,6 +2056,7 @@ impl BoundedAddressBook {
         Ok(Self {
             network,
             listen,
+            allow_keyless_shakescape: false,
             maximum,
             sequence: 0,
             durable_sequence: 0,
@@ -2104,7 +2114,13 @@ impl BoundedAddressBook {
             return AddressAdmission::Rejected;
         };
         let transport_key_valid = match self.network {
-            Network::Mainnet | Network::Testnet => matches!(wire.key[0], 0x02 | 0x03),
+            Network::Mainnet | Network::Testnet => {
+                matches!(wire.key[0], 0x02 | 0x03)
+                    || (self.allow_keyless_shakescape
+                        && wire.key == [0; 33]
+                        && wire.services & (SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
+                            == SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
+            }
             Network::Regtest | Network::Simnet => {
                 wire.key == [0; 33] || matches!(wire.key[0], 0x02 | 0x03)
             }
@@ -2126,7 +2142,9 @@ impl BoundedAddressBook {
             let old_time = existing.wire.time;
             let old_key = existing.wire.key;
             existing.wire.services |= wire.services;
-            if wire.time > existing.wire.time {
+            if wire.time > existing.wire.time
+                && (wire.key != [0; 33] || existing.wire.key == [0; 33])
+            {
                 existing.wire.time = wire.time;
                 existing.wire.key = wire.key;
             }
@@ -2180,6 +2198,7 @@ impl BoundedAddressBook {
         now: Instant,
         timestamp: u64,
         maximum: usize,
+        shakescape_only: bool,
     ) -> Vec<SocketAddr> {
         if maximum == 0 {
             return Vec::new();
@@ -2203,6 +2222,10 @@ impl BoundedAddressBook {
                     && entry.eligible_at <= now
                     && !tracked.contains_key(address)
                     && !bans.is_banned(address.ip(), timestamp)
+                    && (!shakescape_only
+                        || entry.wire.services
+                            & (SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
+                            == SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
             })
             .map(|(address, entry)| {
                 (
@@ -2362,6 +2385,13 @@ impl BoundedAddressBook {
         record.entries.retain(|entry| {
             is_discoverable_address(self.network, self.listen, entry.address)
                 && entry.services & SERVICE_NETWORK != 0
+                && (matches!(self.network, Network::Regtest | Network::Simnet)
+                    || matches!(entry.key[0], 0x02 | 0x03)
+                    || (self.allow_keyless_shakescape
+                        && entry.key == [0; 33]
+                        && entry.services
+                            & (SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
+                            == SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value()))
                 && !persisted_address_is_stale(entry, timestamp)
         });
         record.entries.sort_by_key(|entry| {
@@ -2991,7 +3021,10 @@ impl NodeService {
             return self.run_rpc_until_shutdown(shutdown).await;
         }
 
-        let native_sync_config = self.config.native_sync.clone();
+        let mut native_sync_config = self.config.native_sync.clone();
+        if self.config.shakescape_mobile_rendezvous && native_sync_config.discovery {
+            native_sync_config.federation_auto = true;
+        }
         let rpc_bind = self.config.rpc_bind;
         let rpc_authorization = self.config.rpc_authorization.clone();
         let rpc_limits = self.config.rpc_limits;
@@ -3169,6 +3202,7 @@ impl NodeService {
             native_sync_config.listen,
             native_sync_config.maximum_known_addresses,
         )?;
+        address_book.allow_keyless_shakescape = native_sync_config.federation_auto;
         for address in &native_sync_config.connect {
             address_book.insert_configured(*address, address_now, address_timestamp)?;
             if let Some(key) = native_sync_config.connect_keys.get(address) {
@@ -3239,11 +3273,12 @@ impl NodeService {
             .copied()
             .map(|address| (address, ReconnectState::new(address_now, true)))
             .collect::<HashMap<_, _>>();
-        fill_discovery_slots(
+        fill_node_discovery_slots(
             &address_book,
             &mut reconnects,
             &ban_list,
             native_sync_config.maximum_outbound,
+            native_sync_config.federation_auto,
             address_now,
             address_timestamp,
         );
@@ -3479,11 +3514,12 @@ impl NodeService {
                         record_warning(format!("failed to persist HNSR runtime state: {error:#}"));
                     }
                 }
-                _ = federation_poll.tick(), if !native_sync_config.federation_keys.is_empty() => {
+                _ = federation_poll.tick(), if native_sync_config.federation_auto || !native_sync_config.federation_keys.is_empty() => {
                     refresh_shakescape_federation(
                         &peers,
                         &shakescape_relay,
                         &native_sync_config.federation_keys,
+                        native_sync_config.federation_auto,
                         &mut federation_last_sent,
                         Instant::now(),
                     ).await;
@@ -3932,11 +3968,12 @@ impl NodeService {
                     // must not starve peer bootstrap or reconnect scheduling.
                     let connection_now = Instant::now();
                     if native_sync_config.discovery {
-                        fill_discovery_slots(
+                        fill_node_discovery_slots(
                             &address_book,
                             &mut reconnects,
                             &ban_list,
                             native_sync_config.maximum_outbound,
+                            native_sync_config.federation_auto,
                             connection_now,
                             unix_time(),
                         );
@@ -4089,11 +4126,12 @@ impl NodeService {
                     )
                     .await;
                     if native_sync_config.discovery {
-                        fill_discovery_slots(
+                        fill_node_discovery_slots(
                             &address_book,
                             &mut reconnects,
                             &ban_list,
                             native_sync_config.maximum_outbound,
+                            native_sync_config.federation_auto,
                             Instant::now(),
                             unix_time(),
                         );
@@ -4139,11 +4177,12 @@ impl NodeService {
                         record_warning(format!("{error:#}"));
                     }
                     if native_sync_config.discovery {
-                        fill_discovery_slots(
+                        fill_node_discovery_slots(
                             &address_book,
                             &mut reconnects,
                             &ban_list,
                             native_sync_config.maximum_outbound,
+                            native_sync_config.federation_auto,
                             Instant::now(),
                             unix_time(),
                         );
@@ -6790,25 +6829,25 @@ async fn refresh_local_address_advertisement(
     }
 }
 
-/// Exchange only with operator-pinned, authenticated hsrd links. A periodic
-/// inventory repairs missed board frames and a fresh connection rebuilds the
-/// volatile offer owner and bilateral session route without trusting the relay
-/// as a signer or custodian.
+/// Exchange with configured Brontide peers and discovered, exactly negotiated
+/// NETWORK | SHAKESCAPE full nodes. Signed objects retain authority even when
+/// a discovered node uses the stock-HSD-compatible keyless listener.
 async fn refresh_shakescape_federation(
     peers: &LivePeerManager,
     relay: &ShakescapeRelayHandle,
     federation_keys: &[[u8; 33]],
+    auto_federation: bool,
     last_sent: &mut HashMap<PeerId, Instant>,
     now: Instant,
 ) {
-    let eligible = peers
+    let mut eligible = peers
         .snapshots()
         .await
         .into_iter()
         .filter(|snapshot| {
             snapshot.state == PeerState::Ready
                 && snapshot.shakescape.phase == hns_p2p::ShakescapePeerPhase::Negotiated
-                && snapshot
+                && (snapshot
                     .authenticated_remote_static
                     .as_ref()
                     .is_some_and(|key| {
@@ -6816,14 +6855,42 @@ async fn refresh_shakescape_federation(
                             .iter()
                             .any(|expected| key.as_bytes() == expected)
                     })
+                    || (auto_federation
+                        && snapshot.services
+                            & (SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
+                            == SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value()))
         })
         .collect::<Vec<_>>();
+    eligible.sort_by_key(|snapshot| {
+        let pinned = snapshot
+            .authenticated_remote_static
+            .as_ref()
+            .is_some_and(|key| {
+                federation_keys
+                    .iter()
+                    .any(|expected| key.as_bytes() == expected)
+            });
+        (
+            !pinned,
+            snapshot.direction != PeerDirection::Outbound,
+            snapshot.id,
+        )
+    });
+    eligible.truncate(MAX_SHAKESCAPE_FEDERATION_PEERS);
     let live = eligible
         .iter()
         .map(|snapshot| snapshot.id)
         .collect::<HashSet<_>>();
+    if let Err(error) = relay.retain_federation_peers(&live) {
+        tracing::warn!(%error, "failed to retire stale Shakescape federation links");
+        return;
+    }
     last_sent.retain(|peer, _| live.contains(peer));
     for snapshot in eligible {
+        if let Err(error) = relay.admit_federation_peer(snapshot.id) {
+            tracing::warn!(peer = ?snapshot.id, %error, "failed to admit Shakescape federation peer");
+            continue;
+        }
         if last_sent.get(&snapshot.id).is_some_and(|last| {
             now.duration_since(*last) < SHAKESCAPE_FEDERATION_RECONCILE_INTERVAL
         }) {
@@ -7081,15 +7148,15 @@ async fn handle_peer_event(
             request_id,
             message,
         } => {
-            if provenance
+            let pinned = provenance
                 .authenticated_remote_static
                 .as_ref()
                 .is_some_and(|key| {
                     federation_keys
                         .iter()
                         .any(|expected| key.as_bytes() == expected)
-                })
-            {
+                });
+            if pinned {
                 shakescape_relay.admit_federation_peer(provenance.peer)?;
             }
             match shakescape_relay.receive_cross_chain(
@@ -10121,7 +10188,8 @@ fn fill_discovery_slots(
         .filter(|address| !bans.is_banned(address.ip(), timestamp))
         .count();
     let available = maximum_outbound.saturating_sub(active_targets);
-    let candidates = addresses.connection_candidates(reconnects, bans, now, timestamp, available);
+    let candidates =
+        addresses.connection_candidates(reconnects, bans, now, timestamp, available, false);
     let added = candidates.len();
     for address in candidates {
         let mut state = ReconnectState::new(now, false);
@@ -10129,6 +10197,67 @@ fn fill_discovery_slots(
         reconnects.insert(address, state);
     }
     added
+}
+
+fn fill_auto_federation_slots(
+    addresses: &BoundedAddressBook,
+    reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    bans: &PeerBanBook,
+    maximum_outbound: usize,
+    now: Instant,
+    timestamp: u64,
+) -> usize {
+    let active_targets = reconnects
+        .keys()
+        .filter(|address| !bans.is_banned(address.ip(), timestamp))
+        .count();
+    let available = maximum_outbound.saturating_sub(active_targets);
+    let candidates =
+        addresses.connection_candidates(reconnects, bans, now, timestamp, available, true);
+    let added = candidates.len();
+    for address in candidates {
+        let mut state = ReconnectState::new(now, false);
+        state.failures = addresses.entries[&address].failures;
+        reconnects.insert(address, state);
+    }
+    added
+}
+
+fn fill_node_discovery_slots(
+    addresses: &BoundedAddressBook,
+    reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    bans: &PeerBanBook,
+    maximum_outbound: usize,
+    auto_federation: bool,
+    now: Instant,
+    timestamp: u64,
+) -> usize {
+    let reserved = if auto_federation {
+        RESERVED_SHAKESCAPE_OUTBOUND_SLOTS.min(maximum_outbound.saturating_sub(1))
+    } else {
+        0
+    };
+    let ordinary = fill_discovery_slots(
+        addresses,
+        reconnects,
+        bans,
+        maximum_outbound - reserved,
+        now,
+        timestamp,
+    );
+    ordinary
+        + if auto_federation {
+            fill_auto_federation_slots(
+                addresses,
+                reconnects,
+                bans,
+                maximum_outbound,
+                now,
+                timestamp,
+            )
+        } else {
+            0
+        }
 }
 
 fn note_reconnect_failure(
@@ -13157,6 +13286,9 @@ mod tests {
 
         advertiser.note_sent(PeerId(1));
         advertiser.note_sent(PeerId(2));
+        for id in 3..=MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS {
+            advertiser.note_sent(PeerId(id as u64));
+        }
         assert_eq!(
             advertiser.sent_to.len(),
             MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS
@@ -13631,6 +13763,16 @@ mod tests {
             addresses.insert_discovered(keyed, now, timestamp),
             AddressAdmission::Rejected
         );
+        let keyless_shakescape = hns_p2p::NetAddress::from_socket_addr(
+            second,
+            timestamp,
+            SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
+        );
+        assert_eq!(
+            addresses.insert_discovered(keyless_shakescape, now, timestamp),
+            AddressAdmission::Rejected,
+            "ordinary HNS nodes must not dial public keyless gossip"
+        );
 
         assert!(addresses
             .insert_discovered(
@@ -13652,6 +13794,57 @@ mod tests {
         assert!(addresses.entries.contains_key(&third));
         let bans = PeerBanBook::new(Network::Mainnet, 4).expect("bans");
         assert_eq!(addresses.advertised(1, &bans, timestamp).len(), 1);
+    }
+
+    #[test]
+    fn keyless_shakescape_gossip_is_admitted_and_fills_reserved_outbound_slots() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 12).unwrap();
+        addresses.allow_keyless_shakescape = true;
+        let mut reconnects = HashMap::new();
+        let bans = PeerBanBook::new(Network::Mainnet, 4).unwrap();
+        for octet in 1..=6 {
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(11 + octet, 1, 1, 1)), 12038);
+            assert!(addresses
+                .insert_discovered(
+                    keyed_net_address(address, timestamp, SERVICE_NETWORK),
+                    now,
+                    timestamp,
+                )
+                .accepted());
+        }
+        assert_eq!(
+            fill_node_discovery_slots(&addresses, &mut reconnects, &bans, 8, true, now, timestamp),
+            6
+        );
+        for octet in 1..=2 {
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(30 + octet, 1, 1, 1)), 12038);
+            let keyless = hns_p2p::NetAddress::from_socket_addr(
+                address,
+                timestamp,
+                SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
+            );
+            assert_eq!(keyless.key, [0; 33]);
+            assert!(addresses
+                .insert_discovered(keyless, now, timestamp)
+                .accepted());
+            assert!(reconnects.get(&address).is_none());
+        }
+        assert_eq!(
+            fill_node_discovery_slots(&addresses, &mut reconnects, &bans, 8, true, now, timestamp),
+            2
+        );
+        assert_eq!(reconnects.len(), 8);
+        let plain = hns_p2p::NetAddress::from_socket_addr(
+            "40.1.1.1:12038".parse().unwrap(),
+            timestamp,
+            SERVICE_NETWORK,
+        );
+        assert_eq!(
+            addresses.insert_discovered(plain, now, timestamp),
+            AddressAdmission::Rejected
+        );
     }
 
     #[test]

@@ -607,9 +607,9 @@ impl LivePeerManager {
             .await
     }
 
-    /// Connect to a key-bearing HSD network address. On Brontide networks the
-    /// advertised static key authenticates the remote endpoint; plaintext mode
-    /// accepts the socket portion for local development compatibility.
+    /// Connect to a discovered HSD network address. A valid static key selects
+    /// Brontide on public networks; an explicitly enabled, keyless
+    /// NETWORK | SHAKESCAPE address uses the compatible plaintext listener.
     pub async fn connect_net_address(&self, peer: &NetAddress) -> Result<PeerId, P2pError> {
         let address = peer.socket_addr().ok_or_else(|| {
             P2pError::Configuration("peer network address is not an IP endpoint".to_owned())
@@ -617,13 +617,36 @@ impl LivePeerManager {
         match &self.config.transport {
             PeerTransport::Plaintext => self.connect(address).await,
             PeerTransport::Brontide(identity) => {
-                self.ensure_capacity(PeerDirection::Outbound, address, None)
-                    .await?;
+                // Stock HSD accepts ShakeScape rendezvous ADDR records only
+                // without a static key. Such records use the compatible
+                // plaintext listener; all other public peers stay Brontide.
+                if peer.key == [0; 33]
+                    && peer.services & (SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value())
+                        == SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value()
+                    && self.config.allow_public_plaintext_shakescape
+                {
+                    self.ensure_capacity(PeerDirection::Outbound, address, None)
+                        .await?;
+                    let stream = tokio::time::timeout(
+                        self.config.connect_timeout,
+                        TcpStream::connect(address),
+                    )
+                    .await
+                    .map_err(|_| {
+                        P2pError::Timeout(format!("connection to {address} timed out"))
+                    })??;
+                    stream.set_nodelay(true)?;
+                    return self
+                        .register_stream(stream, address, PeerDirection::Outbound, None)
+                        .await;
+                }
                 if !matches!(peer.key[0], 0x02 | 0x03) {
                     return Err(P2pError::Configuration(format!(
                         "Brontide peer {address} has no valid compressed static key"
                     )));
                 }
+                self.ensure_capacity(PeerDirection::Outbound, address, None)
+                    .await?;
                 let mut stream =
                     tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(address))
                         .await
@@ -3197,6 +3220,77 @@ mod tests {
             .expect("plaintext peer snapshot");
         assert_eq!(snapshot.transport, PeerTransportKind::Plaintext);
         assert!(snapshot.authenticated_remote_static.is_none());
+    }
+
+    #[tokio::test]
+    async fn gossiped_keyless_shakescape_address_dials_plaintext_only_with_opt_in() {
+        let mut server_config = LivePeerConfig::for_network(Network::Mainnet);
+        server_config.allow_public_plaintext_shakescape = true;
+        let (server_manager, mut server_events) =
+            LivePeerManager::new(server_config).expect("server");
+        let mut client_config = LivePeerConfig::for_network(Network::Mainnet);
+        client_config.allow_public_plaintext_shakescape = true;
+        let (client_manager, mut client_events) =
+            LivePeerManager::new(client_config).expect("client");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = {
+            let manager = server_manager.clone();
+            tokio::spawn(async move {
+                let (stream, remote) = listener.accept().await.expect("accept");
+                manager
+                    .accept_compatible_stream(stream, remote)
+                    .await
+                    .expect("keyless ingress")
+            })
+        };
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        let discovered = NetAddress::from_socket_addr(address, unix_time(), services);
+        let client_peer = client_manager
+            .connect_net_address(&discovered)
+            .await
+            .expect("keyless gossip dial");
+        let server_peer = server.await.expect("server task");
+        await_ready(&mut client_events, client_peer).await;
+        await_ready(&mut server_events, server_peer).await;
+        let snapshot = client_manager
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.id == client_peer)
+            .unwrap();
+        assert_eq!(snapshot.transport, PeerTransportKind::Plaintext);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let negotiated = client_manager
+                    .snapshots()
+                    .await
+                    .into_iter()
+                    .any(|snapshot| {
+                        snapshot.id == client_peer
+                            && snapshot.shakescape.phase == crate::ShakescapePeerPhase::Negotiated
+                    });
+                if negotiated {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("keyless relay negotiates ShakeScape V1");
+
+        let mut without_service = discovered.clone();
+        without_service.services = SERVICE_NETWORK;
+        assert!(matches!(
+            client_manager.connect_net_address(&without_service).await,
+            Err(P2pError::Configuration(_))
+        ));
+        let (unconfigured, _) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Mainnet)).unwrap();
+        assert!(matches!(
+            unconfigured.connect_net_address(&discovered).await,
+            Err(P2pError::Configuration(_))
+        ));
     }
 
     #[tokio::test]

@@ -469,6 +469,7 @@ impl Cli {
                 connect,
                 connect_keys,
                 federation_keys,
+                federation_auto: self.shakescape_mobile_rendezvous && p2p_discovery,
                 discovery: p2p_discovery,
                 hip76_requester_override: if self.hip76_requester {
                     Some(true)
@@ -1030,6 +1031,7 @@ mod tests {
         .expect("mobile rendezvous config");
 
         assert!(config.shakescape_mobile_rendezvous);
+        assert!(config.native_sync.federation_auto);
         assert_eq!(config.native_sync.maximum_inbound, 32);
         assert_eq!(config.native_sync.reserved_shakescape_inbound, 8);
         assert!(config

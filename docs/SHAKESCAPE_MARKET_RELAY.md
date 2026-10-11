@@ -114,7 +114,7 @@ zero-port, or otherwise unroutable mainnet/testnet advertised or relay address
 is rejected by `--check-config` before storage or networking starts.
 
 On each advertisement epoch the node sends one ordinary `ADDR` record to at
-most two ready outbound peers. The record contains the current timestamp,
+most eight ready outbound peers. The record contains the current timestamp,
 `NETWORK | SHAKESCAPE`, the verified public IP and port, and a zero key. It
 refreshes every 30 minutes. Stock HSD rejects keyed `ADDR` entries, so the
 public listener accepts standard keyless Handshake framing as well as
@@ -160,14 +160,22 @@ inferred from the bind wildcard.
 
 ## Federation between rendezvous nodes
 
-Operators can connect up to eight known `hsrd` rendezvous nodes with
+With `--shakescape-mobile-rendezvous` and the default P2P discovery setting,
+federation is on automatically. The address book accepts public
+`NETWORK | SHAKESCAPE` gossip, including the keyless form that stock HSD
+relays. The node reserves up to two of its outbound slots for these candidates,
+connects to their compatible raw-TCP listener, and federates only after the
+ShakeScape V1 registry and network have negotiated. Keyless discovery is a
+capability claim rather than an authenticated operator identity; signed offer,
+cancellation, and swap messages still undergo their normal verification and
+the shared board limits remain in force. Up to eight live peers participate in
+federation at once. `--no-p2p-discovery` disables automatic federation.
+
+Operators may also pin a known node with
 `--shakescape-federation-peer KEYHEX@IP:PORT` (repeat the flag for each node).
-The flag pins an outbound Brontide connection and allows federation only when
-the remote static key was authenticated and the ShakeScape V1 registry was
-negotiated. Each operator should configure the other's key and reachable raw
-TCP listener. A plain `--connect` peer does not become a federation peer.
-Run `--shakescape-mobile-rendezvous` on each node; `--check-config` rejects a
-federation peer without that profile or without a static key.
+This uses an authenticated Brontide link and takes priority within the eight
+federation slots. It is useful when gossip is slow or an operator wants a
+specific route; no manual peer list is needed for the default profile.
 
 Federated nodes exchange active signed name listings, HNS/BTC direct offers,
 and signed cancellations. A fresh link synchronizes both boards; a five-minute
@@ -179,9 +187,9 @@ that receives an acceptance routes the signed swap proposal, hello, and
 subsequent signed status messages through the link that supplied the offer,
 back to its owner. Recovery proposals can also traverse federation links.
 
-Federation does not discover other relay operators automatically. These links
-are an operator trust and availability choice, while offer and session
-authority remains with the wallet signatures. Board and session routes remain
+Gossip discovers ShakeScape-capable full nodes, not a formally attested relay
+operator role. Offer and session authority remains with the wallet signatures.
+Board and session routes remain
 process-local: after restart or disconnection, peers must reconnect and
 reconcile before a live offer can be taken through that node. Wallets should
 retain and replay their own signed offer and swap state until settlement.

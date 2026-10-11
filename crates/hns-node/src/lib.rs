@@ -1690,6 +1690,9 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     if !config.native_sync.federation_keys.is_empty() && !config.shakescape_mobile_rendezvous {
         anyhow::bail!("Shakescape federation requires --shakescape-mobile-rendezvous");
     }
+    if config.native_sync.federation_auto && !config.shakescape_mobile_rendezvous {
+        anyhow::bail!("automatic Shakescape federation requires --shakescape-mobile-rendezvous");
+    }
 
     if config.shakescape_mobile_rendezvous {
         let persistent_data_dir = config.data_dir.as_ref().is_some_and(|path| {
