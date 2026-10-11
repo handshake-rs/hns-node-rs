@@ -656,9 +656,9 @@ dependencies = [
 
 [[package]]
 name = "hns-chain"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "hns-store",
  "serde",
  "thiserror",
@@ -681,10 +681,10 @@ dependencies = [
 
 [[package]]
 name = "hns-consensus"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "hns-goosig",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "hns-secp256k1",
  "openssl",
  "serde",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "hns-goosig"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "cc",
  "thiserror",
@@ -781,10 +781,10 @@ dependencies = [
 
 [[package]]
 name = "hns-mempool"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "hns-consensus",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "rand",
  "serde",
  "thiserror",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "hns-p2p"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "chacha20poly1305",
  "hns-consensus",
@@ -818,7 +818,7 @@ dependencies = [
  "hns-marketplace-protocol",
  "hns-odoh-protocol",
  "hns-p2p-experimental",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "hns-secp256k1",
  "rand",
  "serde",
@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "hns-primitives"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "blake2",
  "serde",
@@ -863,11 +863,11 @@ dependencies = [
 
 [[package]]
 name = "hns-rpc"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "hns-chain",
  "hns-mempool",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "serde",
  "serde_json",
  "thiserror",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "hns-secp256k1"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "cc",
  "thiserror",
@@ -916,10 +916,10 @@ dependencies = [
 
 [[package]]
 name = "hns-store"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "fs4",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "hns-urkel",
  "rocksdb",
  "serde",
@@ -946,9 +946,9 @@ dependencies = [
 
 [[package]]
 name = "hns-testkit"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "serde",
  "serde_json",
  "thiserror",
@@ -969,10 +969,10 @@ dependencies = [
 
 [[package]]
 name = "hns-urkel"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "ahash",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "serde",
  "thiserror",
 ]
@@ -1000,7 +1000,7 @@ name = "hsrd-fuzz"
 version = "0.0.0"
 dependencies = [
  "hns-p2p",
- "hns-primitives 0.3.9",
+ "hns-primitives 0.3.10",
  "hns-rpc",
  "hns-testkit",
  "libfuzzer-sys",

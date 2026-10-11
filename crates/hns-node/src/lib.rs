@@ -15610,7 +15610,11 @@ mod tests {
         } = build_test_node_page_generation(1);
         let pages = live_state.name_pages.as_ref().expect("bootstrapped pages");
         let expected = pages.state.clone();
-        assert!(expected.manifest.durable_bytes > 0);
+        // The fixture seals its first populated segment and leaves an empty
+        // active successor, so the active manifest alone can have zero bytes.
+        let expected_generation_bytes = pages.generation_bytes;
+        assert!(expected_generation_bytes > 0);
+        assert!(expected.root_locator().is_some());
         assert!(sync_directory(&pages.file_path).is_err());
         drop(live_state);
 
@@ -15618,6 +15622,18 @@ mod tests {
             NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
                 .expect("reopen committed Windows name pages");
         assert_eq!(reopened.state, expected);
+        assert_eq!(reopened.generation_bytes, expected_generation_bytes);
+        let snapshot = store.snapshot().expect("reopened page snapshot");
+        let (reader, legacy) = reopened
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
+            .expect("reopened page reader");
+        assert!(!legacy);
+        assert!(reader
+            .load(expected.root)
+            .expect("read reopened root page")
+            .is_some());
+        drop(reader);
+        drop(snapshot);
         drop(reopened);
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove Windows page fixture");

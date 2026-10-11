@@ -4,6 +4,12 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## 0.3.10 - 2026-10-11
+
+- Open Windows storage directories with the directory-handle flag so native
+  `hsrd` can validate and recover persisted segment and name-page state. Reject
+  missing capacity-check paths on Windows before querying their volume.
+
 ## 0.3.9 - 2026-10-10
 
 - Federate signed ShakeScape name listings, direct HNS/BTC offers, cancellations,
