@@ -242,8 +242,13 @@ pub struct ShakescapeCrossChainDispatch {
 
 #[derive(Clone, Debug)]
 enum NameMarketRecordState {
-    Active { listing: FixedPriceListing },
-    Cancelled { cancellation: ListingCancellation },
+    Active {
+        listing: FixedPriceListing,
+    },
+    Cancelled {
+        listing: FixedPriceListing,
+        cancellation: ListingCancellation,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +330,9 @@ impl ShakescapeNameMarketState {
             .filter_map(|(identity, record)| {
                 let expires_at = match &record.state {
                     NameMarketRecordState::Active { listing } => listing.expires_at,
-                    NameMarketRecordState::Cancelled { cancellation } => cancellation.expires_at,
+                    NameMarketRecordState::Cancelled { cancellation, .. } => {
+                        cancellation.expires_at
+                    }
                 };
                 (expires_at <= now).then_some(*identity)
             })
@@ -381,6 +388,8 @@ struct CrossChainOfferRecord {
 struct PendingCrossChainCancellation {
     cancellation: DirectOfferCancellation,
     source: PeerId,
+    /// An exact offer was available and its signing key was verified.
+    verified: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -416,6 +425,7 @@ struct ShakescapeCrossChainState {
     sessions: BTreeMap<[u8; 32], CrossChainSessionRoute>,
     recovery_sessions: BTreeMap<[u8; 32], CrossChainSessionRecoveryRoute>,
     peers: BTreeSet<PeerId>,
+    federation_peers: BTreeSet<PeerId>,
     pending: HashMap<(PeerId, u64), ([u8; 32], u64)>,
     next_request_id: u64,
 }
@@ -430,6 +440,7 @@ impl ShakescapeCrossChainState {
             sessions: BTreeMap::new(),
             recovery_sessions: BTreeMap::new(),
             peers: BTreeSet::new(),
+            federation_peers: BTreeSet::new(),
             pending: HashMap::new(),
             next_request_id: 1,
         }
@@ -530,6 +541,95 @@ impl ShakescapeRelayHandle {
                 acceptance_signer,
             })),
         })
+    }
+
+    /// Begin the typed name-board exchange with an operator-pinned hsrd peer.
+    /// The ordinary hello handler then requests its inventory in both directions.
+    pub fn federation_name_market_hello(
+        &self,
+    ) -> Result<NameMarketMessage, ShakescapeRelayHandleError> {
+        let service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        Ok(NameMarketMessage::Hello(local_market_hello(
+            &service.name_market,
+        )))
+    }
+
+    /// Replay the exact listing before its signed cancellation so a relay
+    /// joining late can verify the tombstone without trusting a bare hash.
+    pub fn federation_name_market_cancellations(
+        &self,
+        now: u64,
+    ) -> Result<Vec<NameMarketMessage>, ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        service.name_market.expire_records(now)?;
+        let mut messages = Vec::new();
+        for record in service.name_market.records.values() {
+            if let NameMarketRecordState::Cancelled {
+                listing,
+                cancellation,
+            } = &record.state
+            {
+                if listing.expires_at > now {
+                    messages.push(NameMarketMessage::Offer(listing.clone()));
+                    messages.push(NameMarketMessage::Cancel(cancellation.clone()));
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Reconcile signed cross-chain offers and verified tombstones over one
+    /// authenticated relay link. Request ID zero marks a relay inventory push:
+    /// receivers fetch missing offers but do not echo another inventory back.
+    pub fn federation_cross_chain_snapshot(
+        &self,
+        peer: PeerId,
+        now: u64,
+    ) -> Result<ShakescapeCrossChainDispatch, ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        let state = &mut service.cross_chain;
+        state.expire(now);
+        state.peers.insert(peer);
+        state.federation_peers.insert(peer);
+        let mut sends = vec![ShakescapeCrossChainSend {
+            peer,
+            request_id: 0,
+            message: CrossChainMessage::DirectOfferInventory(cross_chain_inventory(state, now)),
+        }];
+        sends.extend(
+            state
+                .cancellations
+                .values()
+                .flatten()
+                .filter(|candidate| candidate.verified)
+                .map(|candidate| ShakescapeCrossChainSend {
+                    peer,
+                    request_id: 0,
+                    message: CrossChainMessage::CancelDirectOffer(candidate.cancellation.clone()),
+                }),
+        );
+        Ok(ShakescapeCrossChainDispatch { sends })
+    }
+
+    /// Mark an incoming connection whose authenticated static key appears in
+    /// the operator's federation allowlist before applying peer offer limits.
+    pub fn admit_federation_peer(&self, peer: PeerId) -> Result<(), ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        service.cross_chain.peers.insert(peer);
+        service.cross_chain.federation_peers.insert(peer);
+        Ok(())
     }
 
     /// Admit one hash-first announcement.
@@ -927,12 +1027,15 @@ impl ShakescapeRelayHandle {
         let mut dispatch = ShakescapeCrossChainDispatch::default();
         match message {
             CrossChainMessage::DirectOfferInventory(offer_ids) => {
-                let active = cross_chain_inventory(state, now);
-                dispatch.sends.push(ShakescapeCrossChainSend {
-                    peer,
-                    request_id,
-                    message: CrossChainMessage::DirectOfferInventory(active),
-                });
+                if request_id != 0 {
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer,
+                        request_id,
+                        message: CrossChainMessage::DirectOfferInventory(cross_chain_inventory(
+                            state, now,
+                        )),
+                    });
+                }
                 for offer_id in offer_ids {
                     let needs_owner = state
                         .offers
@@ -997,7 +1100,11 @@ impl ShakescapeRelayHandle {
                         .values()
                         .filter(|record| record.source == peer)
                         .count()
-                        >= MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER
+                        >= if state.federation_peers.contains(&peer) {
+                            MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS
+                        } else {
+                            MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER
+                        }
                 {
                     return Err(ShakescapeRelayHandleError::CrossChain(
                         "cross-chain offer peer capacity reached",
@@ -1028,6 +1135,7 @@ impl ShakescapeRelayHandle {
                             state,
                             tombstone.cancellation,
                             tombstone.source,
+                            true,
                         );
                         return Ok(dispatch);
                     }
@@ -1043,7 +1151,7 @@ impl ShakescapeRelayHandle {
                 for target in state.peers.iter().copied().filter(|target| *target != peer) {
                     dispatch.sends.push(ShakescapeCrossChainSend {
                         peer: target,
-                        request_id,
+                        request_id: 0,
                         message: CrossChainMessage::DirectOfferInventory(vec![offer_id]),
                     });
                 }
@@ -1055,14 +1163,9 @@ impl ShakescapeRelayHandle {
                     // restarted or newly joined relay converges. Preserve the
                     // independently signed, bounded candidate until the exact
                     // offer is available for full binding verification.
-                    remember_cross_chain_cancellation(state, cancellation, peer);
+                    remember_cross_chain_cancellation(state, cancellation, peer, false);
                     return Ok(dispatch);
                 };
-                if record.owner != Some(peer) {
-                    return Err(ShakescapeRelayHandleError::CrossChain(
-                        "direct offer cancellation came from a non-owner peer",
-                    ));
-                }
                 cancellation
                     .verify_for_offer(&record.offer, record.offer.header.network, now)
                     .map_err(|_| {
@@ -1072,7 +1175,7 @@ impl ShakescapeRelayHandle {
                 state
                     .sessions
                     .retain(|_, route| route.offer_id != cancellation.offer_id);
-                remember_cross_chain_cancellation(state, cancellation.clone(), peer);
+                remember_cross_chain_cancellation(state, cancellation.clone(), peer, true);
                 for target in state.peers.iter().copied().filter(|target| *target != peer) {
                     dispatch.sends.push(ShakescapeCrossChainSend {
                         peer: target,
@@ -1165,10 +1268,15 @@ impl ShakescapeRelayHandle {
                 } else {
                     validate_recovery_proposal(state, &proposal, now)?;
                     if let Some(route) = state.recovery_sessions.get(&session_id) {
-                        if route.maker != peer || route.proposal != proposal {
+                        if route.proposal != proposal {
                             return Err(ShakescapeRelayHandleError::CrossChain(
                                 "swap recovery proposal conflicts with the current maker route",
                             ));
+                        }
+                        // A second relay may replay the same signed proposal.
+                        // Keep the first live return path and avoid a gossip loop.
+                        if route.maker != peer {
+                            return Ok(dispatch);
                         }
                     } else {
                         if state
@@ -1197,10 +1305,22 @@ impl ShakescapeRelayHandle {
                             CrossChainSessionRecoveryRoute {
                                 maker: peer,
                                 taker: None,
-                                proposal,
+                                proposal: proposal.clone(),
                                 hello: None,
                             },
                         );
+                        for target in state
+                            .federation_peers
+                            .iter()
+                            .copied()
+                            .filter(|target| *target != peer)
+                        {
+                            dispatch.sends.push(ShakescapeCrossChainSend {
+                                peer: target,
+                                request_id,
+                                message: CrossChainMessage::SwapSessionProposal(proposal.clone()),
+                            });
+                        }
                     }
                 }
             }
@@ -1347,6 +1467,7 @@ impl ShakescapeRelayHandle {
             .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         let state = &mut service.cross_chain;
         state.peers.remove(&peer);
+        state.federation_peers.remove(&peer);
         state
             .pending
             .retain(|(pending_peer, _), _| *pending_peer != peer);
@@ -1471,7 +1592,7 @@ impl ShakescapeRelayHandle {
                     NameMarketRecordState::Active { .. } => {
                         (ShakescapeNameMarketEventKind::Offer, record.listing_hash)
                     }
-                    NameMarketRecordState::Cancelled { cancellation } => {
+                    NameMarketRecordState::Cancelled { cancellation, .. } => {
                         let cancellation_hash = cancellation.cancellation_hash().map_err(|_| {
                             ShakescapeRelayHandleError::NameMarket(
                                 "retained name-market cancellation identity is invalid",
@@ -1553,17 +1674,18 @@ fn remember_cross_chain_cancellation(
     state: &mut ShakescapeCrossChainState,
     cancellation: DirectOfferCancellation,
     source: PeerId,
+    verified: bool,
 ) {
-    let already_retained =
-        state
-            .cancellations
-            .get(&cancellation.offer_id)
-            .is_some_and(|candidates| {
-                candidates
-                    .iter()
-                    .any(|candidate| candidate.cancellation == cancellation)
-            });
-    if already_retained {
+    if let Some(existing) = state
+        .cancellations
+        .get_mut(&cancellation.offer_id)
+        .and_then(|candidates| {
+            candidates
+                .iter_mut()
+                .find(|candidate| candidate.cancellation == cancellation)
+        })
+    {
+        existing.verified |= verified;
         return;
     }
     let retained_total = state.cancellations.values().map(Vec::len).sum::<usize>();
@@ -1578,7 +1700,12 @@ fn remember_cross_chain_cancellation(
         .get(&cancellation.offer_id)
         .map_or(0, Vec::len);
     if retained_total >= MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS
-        || retained_for_source >= MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_PEER
+        || retained_for_source
+            >= if state.federation_peers.contains(&source) {
+                MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS
+            } else {
+                MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_PEER
+            }
         || retained_for_offer >= MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_OFFER
     {
         return;
@@ -1590,6 +1717,7 @@ fn remember_cross_chain_cancellation(
         .push(PendingCrossChainCancellation {
             cancellation,
             source,
+            verified,
         });
 }
 
@@ -1877,9 +2005,7 @@ fn admit_listing(
         .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing identity"))?;
     let identity = listing_identity(&listing)?;
     if let Some(existing) = service.name_market.records.get(&identity) {
-        if existing.listing_hash == listing_hash
-            && matches!(existing.state, NameMarketRecordState::Active { .. })
-        {
+        if existing.listing_hash == listing_hash {
             return Ok(ShakescapeNameMarketAdmission {
                 revision: service.name_market.revision,
                 kind: ShakescapeNameMarketEventKind::Offer,
@@ -2001,6 +2127,7 @@ fn admit_cancellation(
         NameMarketRecordState::Active { listing, .. } => listing.clone(),
         NameMarketRecordState::Cancelled {
             cancellation: durable,
+            ..
         } => {
             let durable_hash = durable.cancellation_hash().map_err(|_| {
                 ShakescapeRelayHandleError::NameMarket("invalid retained cancellation")
@@ -2055,6 +2182,7 @@ fn admit_cancellation(
             listing_hash: cancellation.listing_hash,
             sequence: cancellation.sequence,
             state: NameMarketRecordState::Cancelled {
+                listing,
                 cancellation: cancellation.clone(),
             },
             envelope_bytes: envelope_bytes.clone(),
@@ -2355,6 +2483,7 @@ mod cross_chain_tests {
     #[test]
     fn expired_name_market_rows_release_typed_capacity_and_force_snapshot() {
         let mut state = ShakescapeNameMarketState::new(MAGIC, GENESIS);
+        let listing = fixed_price_listing(1, NOW);
         state.revision = 7;
         state.events.push_back(ShakescapeNameMarketEvent {
             revision: 7,
@@ -2390,7 +2519,10 @@ mod cross_chain_tests {
                 NameMarketRecord {
                     listing_hash,
                     sequence: 2,
-                    state: NameMarketRecordState::Cancelled { cancellation },
+                    state: NameMarketRecordState::Cancelled {
+                        listing: listing.clone(),
+                        cancellation,
+                    },
                     envelope_bytes: vec![2],
                 },
             );
@@ -3102,6 +3234,249 @@ mod cross_chain_tests {
         assert!(matches!(
             error,
             ShakescapeRelayHandleError::Uncorrelated("direct offer owner is currently unavailable")
+        ));
+    }
+
+    #[test]
+    fn two_federated_relays_route_offer_session_and_cancellation() {
+        let first = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let second = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let first_wallet = PeerId(1);
+        let first_link = PeerId(2);
+        let second_link = PeerId(3);
+        let second_wallet = PeerId(4);
+        let offer = offer();
+
+        first
+            .federation_cross_chain_snapshot(first_link, NOW)
+            .unwrap();
+        second
+            .federation_cross_chain_snapshot(second_link, NOW)
+            .unwrap();
+        second
+            .receive_cross_chain(
+                second_wallet,
+                1,
+                CrossChainMessage::DirectOfferInventory(Vec::new()),
+                NOW,
+            )
+            .unwrap();
+        let requested = first
+            .receive_cross_chain(
+                first_wallet,
+                2,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        let fetch = requested
+            .sends
+            .into_iter()
+            .find(|send| matches!(send.message, CrossChainMessage::GetDirectOffer(_)))
+            .unwrap();
+        let broadcast = first
+            .receive_cross_chain(
+                first_wallet,
+                fetch.request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .unwrap();
+        let announcement = broadcast
+            .sends
+            .into_iter()
+            .find(|send| send.peer == first_link)
+            .unwrap();
+        assert_eq!(announcement.request_id, 0);
+        let requested = second
+            .receive_cross_chain(
+                second_link,
+                announcement.request_id,
+                announcement.message,
+                NOW,
+            )
+            .unwrap();
+        assert!(requested
+            .sends
+            .iter()
+            .all(|send| { !matches!(send.message, CrossChainMessage::DirectOfferInventory(_)) }));
+        let fetch = requested
+            .sends
+            .into_iter()
+            .find(|send| matches!(send.message, CrossChainMessage::GetDirectOffer(_)))
+            .unwrap();
+        let response = first
+            .receive_cross_chain(first_link, fetch.request_id, fetch.message, NOW)
+            .unwrap();
+        let delivery = response.sends.into_iter().next().unwrap();
+        second
+            .receive_cross_chain(second_link, delivery.request_id, delivery.message, NOW)
+            .unwrap();
+
+        // A restarted transport drops route authority. The next inventory
+        // must fetch the exact signed offer again before an acceptance works.
+        second.cross_chain_peer_disconnected(second_link).unwrap();
+        second
+            .federation_cross_chain_snapshot(second_link, NOW)
+            .unwrap();
+        let announcement = first
+            .federation_cross_chain_snapshot(first_link, NOW)
+            .unwrap()
+            .sends
+            .into_iter()
+            .next()
+            .unwrap();
+        let fetch = second
+            .receive_cross_chain(second_link, 0, announcement.message, NOW)
+            .unwrap()
+            .sends
+            .into_iter()
+            .find(|send| matches!(send.message, CrossChainMessage::GetDirectOffer(_)))
+            .unwrap();
+        let delivery = first
+            .receive_cross_chain(first_link, fetch.request_id, fetch.message, NOW)
+            .unwrap()
+            .sends
+            .into_iter()
+            .next()
+            .unwrap();
+        second
+            .receive_cross_chain(second_link, delivery.request_id, delivery.message, NOW)
+            .unwrap();
+
+        let acceptance = acceptance(&offer);
+        let (proposal, hello) = accepted_session(&offer, &acceptance);
+        let to_first = second
+            .receive_cross_chain(
+                second_wallet,
+                10,
+                CrossChainMessage::AcceptDirectOffer(acceptance),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(to_first.sends[0].peer, second_link);
+        let to_wallet = first
+            .receive_cross_chain(first_link, 10, to_first.sends[0].message.clone(), NOW)
+            .unwrap();
+        assert_eq!(to_wallet.sends[0].peer, first_wallet);
+
+        let to_first = second
+            .receive_cross_chain(
+                second_wallet,
+                11,
+                CrossChainMessage::SwapSessionProposal(proposal),
+                NOW,
+            )
+            .unwrap();
+        let to_wallet = first
+            .receive_cross_chain(first_link, 11, to_first.sends[0].message.clone(), NOW)
+            .unwrap();
+        assert_eq!(to_wallet.sends[0].peer, first_wallet);
+        let to_second = first
+            .receive_cross_chain(
+                first_wallet,
+                12,
+                CrossChainMessage::SwapSessionHello(hello),
+                NOW,
+            )
+            .unwrap();
+        let to_wallet = second
+            .receive_cross_chain(second_link, 12, to_second.sends[0].message.clone(), NOW)
+            .unwrap();
+        assert_eq!(to_wallet.sends[0].peer, second_wallet);
+
+        let cancellation = cancellation(&offer);
+        let to_second = first
+            .receive_cross_chain(
+                first_wallet,
+                13,
+                CrossChainMessage::CancelDirectOffer(cancellation.clone()),
+                NOW,
+            )
+            .unwrap();
+        let forwarded = to_second
+            .sends
+            .into_iter()
+            .find(|send| send.peer == first_link)
+            .unwrap();
+        second
+            .receive_cross_chain(second_link, forwarded.request_id, forwarded.message, NOW)
+            .unwrap();
+        let snapshot = second
+            .federation_cross_chain_snapshot(second_link, NOW)
+            .unwrap();
+        assert!(snapshot.sends.iter().any(|send| {
+            matches!(&send.message, CrossChainMessage::CancelDirectOffer(value) if value == &cancellation)
+        }));
+    }
+
+    #[test]
+    fn federated_name_cancellation_replays_without_resurrecting_listing() {
+        let first = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let second = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let listing = fixed_price_listing(1, NOW + 600);
+        let mut cancellation =
+            ListingCancellation::for_listing(&listing, NOW, NOW + 700, 2).unwrap();
+        cancellation
+            .sign(&SigningKey::from_slice(&[0x31; 32]).unwrap())
+            .unwrap();
+        {
+            let mut service = first.inner.lock().unwrap();
+            admit_listing(&mut service, [1; 32], listing.clone(), 1, NOW).unwrap();
+            admit_cancellation(&mut service, [1; 32], cancellation.clone(), 2, NOW).unwrap();
+        }
+        let link = PeerId(9);
+        second
+            .receive_name_market(
+                [9; 32],
+                link,
+                1,
+                first.federation_name_market_hello().unwrap(),
+                NOW,
+            )
+            .unwrap();
+        let replay = first.federation_name_market_cancellations(NOW).unwrap();
+        assert_eq!(replay.len(), 2);
+        for _ in 0..2 {
+            for message in replay.iter().cloned() {
+                second
+                    .receive_name_market([9; 32], link, 2, message, NOW)
+                    .unwrap();
+            }
+        }
+        let service = second.inner.lock().unwrap();
+        let identity = listing_identity(&listing).unwrap();
+        assert!(matches!(
+            service.name_market.records.get(&identity).unwrap().state,
+            NameMarketRecordState::Cancelled { .. }
         ));
     }
 }

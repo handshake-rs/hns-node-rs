@@ -214,6 +214,11 @@ struct Cli {
     #[arg(long = "connect")]
     p2p_connect: Vec<P2pConnectArg>,
 
+    /// Authenticated hsrd peer with which this rendezvous exchanges signed
+    /// ShakeScape boards. Also establishes a pinned outbound P2P connection.
+    #[arg(long = "shakescape-federation-peer")]
+    shakescape_federation_peers: Vec<P2pConnectArg>,
+
     /// Reaffirm default fixed-seed bootstrap and GETADDR/ADDR peer discovery.
     #[arg(long, action = ArgAction::SetTrue)]
     p2p_discovery: bool,
@@ -359,13 +364,24 @@ impl Cli {
         let connect = self
             .p2p_connect
             .iter()
+            .chain(&self.shakescape_federation_peers)
             .map(|peer| peer.address)
             .collect::<Vec<_>>();
         let connect_keys = self
             .p2p_connect
             .iter()
+            .chain(&self.shakescape_federation_peers)
             .filter_map(|peer| peer.key.map(|key| (peer.address, key)))
             .collect::<BTreeMap<_, _>>();
+        let federation_keys = self
+            .shakescape_federation_peers
+            .iter()
+            .map(|peer| {
+                peer.key.ok_or_else(|| {
+                    anyhow::anyhow!("Shakescape federation peers require KEYHEX@IP:PORT")
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let rpc_authorization = self
             .rpc_authorization_header_file
             .as_deref()
@@ -452,6 +468,7 @@ impl Cli {
                 accept_keyless_shakescape: self.p2p_accept_keyless_shakescape,
                 connect,
                 connect_keys,
+                federation_keys,
                 discovery: p2p_discovery,
                 hip76_requester_override: if self.hip76_requester {
                     Some(true)

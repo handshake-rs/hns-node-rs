@@ -156,6 +156,8 @@ impl fmt::Display for PeerHeaderBatchLimit {
 impl Error for PeerHeaderBatchLimit {}
 const ADDRESS_BOOK_FLUSH_INTERVAL: Duration = Duration::from_secs(120);
 const LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const SHAKESCAPE_FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SHAKESCAPE_FEDERATION_RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS: usize = 2;
 const HSD_ADDRESS_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
 const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -808,6 +810,8 @@ pub struct NativeSyncConfig {
     pub connect: Vec<SocketAddr>,
     /// Authenticated remote static keys for configured public-network peers.
     pub connect_keys: BTreeMap<SocketAddr, [u8; 33]>,
+    /// Static keys of explicitly connected hsrd board-federation peers.
+    pub federation_keys: Vec<[u8; 33]>,
     /// Bootstrap from HSD's key-bearing fixed seeds and learn bounded peers
     /// from GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
     pub discovery: bool,
@@ -864,6 +868,7 @@ impl Default for NativeSyncConfig {
             accept_keyless_shakescape: false,
             connect: Vec::new(),
             connect_keys: BTreeMap::new(),
+            federation_keys: Vec::new(),
             discovery: false,
             hip76_requester_override: None,
             odoh_requester: true,
@@ -973,6 +978,16 @@ impl NativeSyncConfig {
             .any(|key| !matches!(key[0], 0x02 | 0x03))
         {
             anyhow::bail!("native sync configured peer has an invalid compressed static key");
+        }
+        if self.federation_keys.len() > 8
+            || self
+                .federation_keys
+                .iter()
+                .any(|key| !self.connect_keys.values().any(|connected| connected == key))
+        {
+            anyhow::bail!(
+                "Shakescape federation requires at most eight explicitly connected authenticated peers"
+            );
         }
         if matches!(network, Network::Mainnet | Network::Testnet)
             && self
@@ -3412,6 +3427,10 @@ impl NodeService {
         let mut peer_state_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
         peer_state_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         peer_state_flush.tick().await;
+        let mut federation_poll = tokio::time::interval(SHAKESCAPE_FEDERATION_POLL_INTERVAL);
+        federation_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        federation_poll.tick().await;
+        let mut federation_last_sent = HashMap::new();
         let mut served_getaddr = HashSet::new();
         let mut compact_peers = HashSet::new();
         let mut pending_compact_blocks = HashMap::new();
@@ -3459,6 +3478,15 @@ impl NodeService {
                     if let Err(error) = flush_hnsr_state(&store, &peers).await {
                         record_warning(format!("failed to persist HNSR runtime state: {error:#}"));
                     }
+                }
+                _ = federation_poll.tick(), if !native_sync_config.federation_keys.is_empty() => {
+                    refresh_shakescape_federation(
+                        &peers,
+                        &shakescape_relay,
+                        &native_sync_config.federation_keys,
+                        &mut federation_last_sent,
+                        Instant::now(),
+                    ).await;
                 }
                 // Peer and validator queues are independently bounded and
                 // continue draining while this task prepares a slice. Once a
@@ -4089,6 +4117,7 @@ impl NodeService {
                             &writer,
                             &peers,
                             &shakescape_relay,
+                            &native_sync_config.federation_keys,
                             &validation,
                             &mut scheduler,
                             &mut reconnects,
@@ -6761,6 +6790,108 @@ async fn refresh_local_address_advertisement(
     }
 }
 
+/// Exchange only with operator-pinned, authenticated hsrd links. A periodic
+/// inventory repairs missed board frames and a fresh connection rebuilds the
+/// volatile offer owner and bilateral session route without trusting the relay
+/// as a signer or custodian.
+async fn refresh_shakescape_federation(
+    peers: &LivePeerManager,
+    relay: &ShakescapeRelayHandle,
+    federation_keys: &[[u8; 33]],
+    last_sent: &mut HashMap<PeerId, Instant>,
+    now: Instant,
+) {
+    let eligible = peers
+        .snapshots()
+        .await
+        .into_iter()
+        .filter(|snapshot| {
+            snapshot.state == PeerState::Ready
+                && snapshot.shakescape.phase == hns_p2p::ShakescapePeerPhase::Negotiated
+                && snapshot
+                    .authenticated_remote_static
+                    .as_ref()
+                    .is_some_and(|key| {
+                        federation_keys
+                            .iter()
+                            .any(|expected| key.as_bytes() == expected)
+                    })
+        })
+        .collect::<Vec<_>>();
+    let live = eligible
+        .iter()
+        .map(|snapshot| snapshot.id)
+        .collect::<HashSet<_>>();
+    last_sent.retain(|peer, _| live.contains(peer));
+    for snapshot in eligible {
+        if last_sent.get(&snapshot.id).is_some_and(|last| {
+            now.duration_since(*last) < SHAKESCAPE_FEDERATION_RECONCILE_INTERVAL
+        }) {
+            continue;
+        }
+        let name_message = if last_sent.contains_key(&snapshot.id) {
+            hns_marketplace_protocol::NameMarketMessage::GetOfferInventory
+        } else {
+            match relay.federation_name_market_hello() {
+                Ok(hello) => hello,
+                Err(error) => {
+                    tracing::warn!(peer = ?snapshot.id, %error, "failed to prepare Shakescape federation hello");
+                    continue;
+                }
+            }
+        };
+        if let Err(error) = peers
+            .send_shakescape_name_market(snapshot.id, unix_time().max(1), &name_message)
+            .await
+        {
+            tracing::debug!(peer = ?snapshot.id, %error, "Shakescape federation name inventory was not delivered");
+            continue;
+        }
+        let name_cancellations = match relay.federation_name_market_cancellations(unix_time()) {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(peer = ?snapshot.id, %error, "failed to prepare Shakescape name cancellations");
+                continue;
+            }
+        };
+        let mut name_delivered = true;
+        for message in name_cancellations {
+            if let Err(error) = peers
+                .send_shakescape_name_market(snapshot.id, unix_time().max(1), &message)
+                .await
+            {
+                tracing::debug!(peer = ?snapshot.id, %error, "Shakescape federation name cancellation was not delivered");
+                name_delivered = false;
+                break;
+            }
+        }
+        if !name_delivered {
+            continue;
+        }
+        let inventory = match relay.federation_cross_chain_snapshot(snapshot.id, unix_time()) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                tracing::warn!(peer = ?snapshot.id, %error, "failed to prepare Shakescape federation inventory");
+                continue;
+            }
+        };
+        let mut delivered = true;
+        for send in inventory.sends {
+            if let Err(error) = peers
+                .send_shakescape_cross_chain(send.peer, send.request_id, &send.message)
+                .await
+            {
+                tracing::debug!(peer = ?send.peer, %error, "Shakescape federation inventory was not delivered");
+                delivered = false;
+                break;
+            }
+        }
+        if delivered {
+            last_sent.insert(snapshot.id, now);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_peer_event(
     event: PeerEvent,
@@ -6768,6 +6899,7 @@ async fn handle_peer_event(
     writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     shakescape_relay: &ShakescapeRelayHandle,
+    federation_keys: &[[u8; 33]],
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
@@ -6949,6 +7081,17 @@ async fn handle_peer_event(
             request_id,
             message,
         } => {
+            if provenance
+                .authenticated_remote_static
+                .as_ref()
+                .is_some_and(|key| {
+                    federation_keys
+                        .iter()
+                        .any(|expected| key.as_bytes() == expected)
+                })
+            {
+                shakescape_relay.admit_federation_peer(provenance.peer)?;
+            }
             match shakescape_relay.receive_cross_chain(
                 provenance.peer,
                 request_id,

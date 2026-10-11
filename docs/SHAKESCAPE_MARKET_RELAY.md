@@ -158,6 +158,34 @@ Set `PUBLIC_IP` to the actual public IPv4 address routed to the listener (or
 pass a bracketed public IPv6 socket directly). The advertised address is never
 inferred from the bind wildcard.
 
+## Federation between rendezvous nodes
+
+Operators can connect up to eight known `hsrd` rendezvous nodes with
+`--shakescape-federation-peer KEYHEX@IP:PORT` (repeat the flag for each node).
+The flag pins an outbound Brontide connection and allows federation only when
+the remote static key was authenticated and the ShakeScape V1 registry was
+negotiated. Each operator should configure the other's key and reachable raw
+TCP listener. A plain `--connect` peer does not become a federation peer.
+Run `--shakescape-mobile-rendezvous` on each node; `--check-config` rejects a
+federation peer without that profile or without a static key.
+
+Federated nodes exchange active signed name listings, HNS/BTC direct offers,
+and signed cancellations. A fresh link synchronizes both boards; a five-minute
+reconciliation repairs missed announcements. The name board replays the
+original signed listing with each retained cancellation so a newly joined
+node can verify the tombstone. The direct-offer board fetches exact missing
+offers and forwards only cancellations verified against their offers. A node
+that receives an acceptance routes the signed swap proposal, hello, and
+subsequent signed status messages through the link that supplied the offer,
+back to its owner. Recovery proposals can also traverse federation links.
+
+Federation does not discover other relay operators automatically. These links
+are an operator trust and availability choice, while offer and session
+authority remains with the wallet signatures. Board and session routes remain
+process-local: after restart or disconnection, peers must reconnect and
+reconcile before a live offer can be taken through that node. Wallets should
+retain and replay their own signed offer and swap state until settlement.
+
 The independently enabled HIP-78 opaque relay advertises the canonical
 Shakescape swap circuit profile (`0x0004`) alongside Node, Web, and Chat. That
 profile permits two authenticated endpoints to carry bounded encrypted swap

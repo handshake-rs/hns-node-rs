@@ -1687,6 +1687,10 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
 
+    if !config.native_sync.federation_keys.is_empty() && !config.shakescape_mobile_rendezvous {
+        anyhow::bail!("Shakescape federation requires --shakescape-mobile-rendezvous");
+    }
+
     if config.shakescape_mobile_rendezvous {
         let persistent_data_dir = config.data_dir.as_ref().is_some_and(|path| {
             path.is_absolute()
