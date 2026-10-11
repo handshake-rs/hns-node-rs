@@ -209,15 +209,16 @@ jobs:
               image="ghcr.io/handshake-rs/hns-node-rs:$RELEASE_TAG"
               docker pull --platform linux/amd64 "$image"
             fi
-            test "$(docker image inspect --platform linux/amd64 "$image" --format '{{.Architecture}}')" = amd64
-            test "$(docker image inspect --platform linux/amd64 "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
-            test "$(docker image inspect --platform linux/amd64 "$image" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$RELEASE_TAG"
-            docker image inspect --platform linux/amd64 "$image" --format '{{index .RepoDigests 0}}'
             container_id=$(docker create --platform linux/amd64 "$image")
             trap 'docker rm --force "$container_id" >/dev/null' EXIT
+            test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
+            test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$RELEASE_TAG"
+            test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = 'https://github.com/handshake-rs/hns-node-rs'
+            docker inspect "$container_id" --format '{{.Image}}'
             docker cp "$container_id:/usr/local/bin/hsrd" ../native-bin/hsrd
             chmod 755 ../native-bin/hsrd
             file ../native-bin/hsrd
+            file -b ../native-bin/hsrd | grep -F 'x86-64'
             ldd ../native-bin/hsrd
             if ldd ../native-bin/hsrd | grep -q 'not found'; then
               echo 'The extracted Linux binary has unresolved shared libraries.' >&2
