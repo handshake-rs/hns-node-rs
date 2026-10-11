@@ -257,7 +257,7 @@ jobs:
                 dispatch_floating_candidate=true
                 while IFS= read -r -d '' changed_path; do
                   case "$changed_path" in
-                    .github/workflows/container.yml|.github/workflows/native-binaries.yml|README.md|docs/docker.md) ;;
+                    .github/workflows/container.yml|.github/workflows/native-binaries.yml|scripts/package-native-binary.py|README.md|docs/docker.md) ;;
                     *)
                       echo "source changed after $RELEASE_TAG: $changed_path; floating tags disabled"
                       dispatch_floating_candidate=false
@@ -294,11 +294,12 @@ jobs:
                 and .head_branch == $tag
                 and .path == ".github/workflows/container.yml"
                 and .status == "completed"
-                and (.conclusion == "failure" or .conclusion == "cancelled")
+                and (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled")
               ' "$recovery_run_file" >/dev/null; then
-              echo "run $RELEASE_RUN_ID is not a failed exact-tag container release run" >&2
+              echo "run $RELEASE_RUN_ID is not a completed exact-tag container release run" >&2
               exit 1
             fi
+            recovery_run_conclusion=$(jq -er '.conclusion' "$recovery_run_file")
 
             recovery_jobs_file="$RUNNER_TEMP/recovery-jobs.json"
             gh api \
@@ -409,6 +410,10 @@ jobs:
             else error("release prerelease flag is not boolean")
             end
           ' "$release_file")
+          if [[ -n "$RELEASE_RUN_ID" && "${recovery_run_conclusion:-}" == success && "$release_prerelease" != false ]]; then
+            echo 'a successful release run may be reused only to promote its published release to stable' >&2
+            exit 1
+          fi
           if ! jq -e --arg tag "$RELEASE_TAG" '
             .tag_name == $tag and .draft == false and (.published_at | type == "string")
           ' "$release_file" >/dev/null; then
