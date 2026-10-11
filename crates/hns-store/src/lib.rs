@@ -224,6 +224,14 @@ pub struct StoreConfig {
 /// creating output and before its authoritative database publication; a
 /// preflight observation is not a reservation.
 pub fn filesystem_available_bytes(path: &Path) -> Result<u64, StoreError> {
+    // On Windows fs4 resolves the volume from the path without requiring the
+    // path itself to exist. A missing data directory must fail closed.
+    std::fs::metadata(path).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to query available filesystem bytes for {}: {error}",
+            path.display()
+        ))
+    })?;
     fs4::available_space(path).map_err(|error| {
         StoreError::Io(format!(
             "failed to query available filesystem bytes for {}: {error}",
