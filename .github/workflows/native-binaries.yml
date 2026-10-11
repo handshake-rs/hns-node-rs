@@ -165,6 +165,7 @@ jobs:
             echo "LIBCLANG_PATH=$llvm_prefix/lib"
             echo "OPENSSL_DIR=$(brew --prefix openssl@3)"
             echo 'OPENSSL_STATIC=1'
+            echo 'MACOSX_DEPLOYMENT_TARGET=13.0'
           } >> "$GITHUB_ENV"
 
       - name: Configure Windows native libraries
@@ -236,6 +237,21 @@ jobs:
             cp "target/$TARGET/release/$BINARY_NAME" "../native-bin/$BINARY_NAME"
             if [[ "$RUNNER_OS" == macOS ]]; then
               otool -L "../native-bin/$BINARY_NAME"
+              while IFS= read -r dylib; do
+                case "$dylib" in
+                  /usr/lib/*|/System/Library/*) ;;
+                  *) echo "Non-system macOS dylib in release binary: $dylib" >&2; exit 1 ;;
+                esac
+              done < <(otool -L "../native-bin/$BINARY_NAME" | awk 'NR > 1 {print $1}')
+              xcrun vtool -show-build "../native-bin/$BINARY_NAME" |
+                tee ../native-logs/macos-build-version.log
+              python3 - ../native-logs/macos-build-version.log <<'PY'
+          import pathlib, re, sys
+          build = pathlib.Path(sys.argv[1]).read_text()
+          minimums = re.findall(r"\bminos\s+(\d+)\.(\d+)", build)
+          if not minimums or any(tuple(map(int, version)) > (13, 0) for version in minimums):
+              raise SystemExit("macOS binary requires newer than macOS 13 or lacks a minimum OS version")
+          PY
             fi
           } 2>&1 | tee ../native-logs/build.log
 
