@@ -361,6 +361,11 @@ impl Cli {
         }
         let native_sync = self.native_sync || !self.no_native_sync;
         let p2p_discovery = self.p2p_discovery || !self.no_p2p_discovery;
+        let complete_shakescape_relay = self.shakescape_mobile_rendezvous
+            || (self.shakescape_name_market_relay
+                && self.shakescape_cross_chain_relay
+                && self.shakescape_rendezvous_relay
+                && self.shakescape_swap_status_relay);
         let connect = self
             .p2p_connect
             .iter()
@@ -469,7 +474,7 @@ impl Cli {
                 connect,
                 connect_keys,
                 federation_keys,
-                federation_auto: self.shakescape_mobile_rendezvous && p2p_discovery,
+                federation_auto: complete_shakescape_relay && p2p_discovery,
                 discovery: p2p_discovery,
                 hip76_requester_override: if self.hip76_requester {
                     Some(true)
@@ -1070,6 +1075,36 @@ mod tests {
         .expect("tuned mobile rendezvous config");
         assert_eq!(tuned.native_sync.reserved_shakescape_inbound, 4);
         validate_node_config(&tuned).expect("tuned reservation validates");
+    }
+
+    #[test]
+    fn complete_legacy_relay_flags_enable_federation_without_hnsr() {
+        let config = Cli::try_parse_from([
+            "hsrd",
+            "--data-dir",
+            "/var/lib/hsrd/mainnet-relay",
+            "--p2p-listen",
+            "0.0.0.0:12048",
+            "--p2p-advertise",
+            "8.8.8.8:12048",
+            "--shakescape-name-market-relay",
+            "--shakescape-cross-chain-relay",
+            "--shakescape-rendezvous-relay",
+            "--shakescape-swap-status-relay",
+            "--no-hnsr-relay",
+        ])
+        .expect("complete relay CLI")
+        .into_config()
+        .expect("complete relay config");
+        assert!(config.native_sync.federation_auto);
+        assert!(!config.shakescape_mobile_rendezvous);
+        validate_node_config(&config).expect("complete relay config validates");
+
+        let partial = Cli::try_parse_from(["hsrd", "--shakescape-rendezvous-relay"])
+            .expect("partial relay CLI")
+            .into_config()
+            .expect("partial relay config");
+        assert!(!partial.native_sync.federation_auto);
     }
 
     #[test]

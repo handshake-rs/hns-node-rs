@@ -93,7 +93,7 @@ use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
     HSD_BAN_TIME_SECONDS, MAX_PEER_BANS,
 };
-use crate::{ShakescapeRelayHandle, ShakescapeRelayHandleError};
+use crate::{ShakescapeRelayHandle, ShakescapeRelayHandleError, ShakescapeRelayKind};
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
 const MAX_ACTIVE_STATE_STAGED_EFFECT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -3022,7 +3022,15 @@ impl NodeService {
         }
 
         let mut native_sync_config = self.config.native_sync.clone();
-        if self.config.shakescape_mobile_rendezvous && native_sync_config.discovery {
+        let complete_shakescape_relay = [
+            ShakescapeRelayKind::NameMarket,
+            ShakescapeRelayKind::CrossChainMarket,
+            ShakescapeRelayKind::Rendezvous,
+            ShakescapeRelayKind::SwapStatus,
+        ]
+        .into_iter()
+        .all(|kind| self.config.shakescape_relay_roles.contains(kind));
+        if complete_shakescape_relay && native_sync_config.discovery {
             native_sync_config.federation_auto = true;
         }
         let rpc_bind = self.config.rpc_bind;

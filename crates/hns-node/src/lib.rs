@@ -1687,11 +1687,18 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
 
-    if !config.native_sync.federation_keys.is_empty() && !config.shakescape_mobile_rendezvous {
-        anyhow::bail!("Shakescape federation requires --shakescape-mobile-rendezvous");
-    }
-    if config.native_sync.federation_auto && !config.shakescape_mobile_rendezvous {
-        anyhow::bail!("automatic Shakescape federation requires --shakescape-mobile-rendezvous");
+    let complete_shakescape_relay = [
+        ShakescapeRelayKind::NameMarket,
+        ShakescapeRelayKind::CrossChainMarket,
+        ShakescapeRelayKind::Rendezvous,
+        ShakescapeRelayKind::SwapStatus,
+    ]
+    .into_iter()
+    .all(|kind| config.shakescape_relay_roles.contains(kind));
+    if (config.native_sync.federation_auto || !config.native_sync.federation_keys.is_empty())
+        && !complete_shakescape_relay
+    {
+        anyhow::bail!("Shakescape federation requires the name-market, cross-chain, rendezvous, and swap-status relay roles");
     }
 
     if config.shakescape_mobile_rendezvous {

@@ -10,8 +10,9 @@ qualification or authorize deployment.
   and swap-session routing among rendezvous nodes. Board and session messages
   retain their original signatures and expiry checks across federation links.
 - Discover and connect to other ShakeScape rendezvous nodes automatically from
-  `NETWORK | SHAKESCAPE` address gossip when the mobile rendezvous profile is
-  enabled. Reserve outbound capacity for those links while keeping optional
+  `NETWORK | SHAKESCAPE` address gossip when the complete ShakeScape relay
+  roles are enabled, including the existing individually configured relay
+  profile. Reserve outbound capacity for those links while keeping optional
   explicitly configured federation peers.
 
 ## 0.3.8 - 2026-09-28 (prerelease)

@@ -160,8 +160,11 @@ inferred from the bind wildcard.
 
 ## Federation between rendezvous nodes
 
-With `--shakescape-mobile-rendezvous` and the default P2P discovery setting,
-federation is on automatically. The address book accepts public
+With `--shakescape-mobile-rendezvous` or all four typed relay flags
+(`--shakescape-name-market-relay`, `--shakescape-cross-chain-relay`,
+`--shakescape-rendezvous-relay`, and `--shakescape-swap-status-relay`), federation
+is on automatically when P2P discovery is enabled. The individually configured
+relay profile does not need to enable HNSR. The address book accepts public
 `NETWORK | SHAKESCAPE` gossip, including the keyless form that stock HSD
 relays. The node reserves up to two of its outbound slots for these candidates,
 connects to their compatible raw-TCP listener, and federates only after the
