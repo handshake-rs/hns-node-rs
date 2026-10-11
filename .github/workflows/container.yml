@@ -257,7 +257,7 @@ jobs:
                 dispatch_floating_candidate=true
                 while IFS= read -r -d '' changed_path; do
                   case "$changed_path" in
-                    .github/workflows/container.yml|.github/workflows/native-binaries.yml|scripts/package-native-binary.py|scripts/aggregate-native-release-assets.py|README.md|docs/docker.md) ;;
+                    .github/workflows/container.yml|.github/workflows/native-binaries.yml|.github/workflows/windows-storage.yml|scripts/package-native-binary.py|scripts/aggregate-native-release-assets.py|README.md|docs/docker.md) ;;
                     *)
                       echo "source changed after $RELEASE_TAG: $changed_path; floating tags disabled"
                       dispatch_floating_candidate=false
