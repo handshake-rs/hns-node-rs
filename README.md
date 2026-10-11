@@ -18,7 +18,7 @@ default.
 ## Current compatibility
 
 - Node source line: `0.3.9`
-- Latest prerelease: [`v0.3.9`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.9),
+- Latest release: [`v0.3.9`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.9),
   with an ARM64 Linux binary, offline relinking source bundle, build provenance,
   and SHA-256 checksums
 - Rust toolchain: `1.97.1`

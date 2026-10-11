@@ -214,8 +214,13 @@ jobs:
 
           tag_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
           head_commit=$(git rev-parse --verify HEAD)
+          tag_tree=$(git rev-parse --verify 'HEAD^{tree}')
           if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ || "$head_commit" != "$tag_commit" ]]; then
             echo 'checked-out HEAD does not equal the full peeled tag commit' >&2
+            exit 1
+          fi
+          if [[ ! "$tag_tree" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'checked-out source tree is not a full Git tree ID' >&2
             exit 1
           fi
           if ! git show-ref --verify --quiet refs/remotes/origin/main; then
@@ -224,6 +229,7 @@ jobs:
           fi
           main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
           publish_floating_tags=false
+          dispatch_floating_candidate=false
           case "$RELEASE_TRIGGER" in
             release)
               if [[ ! "$RELEASE_EVENT_SHA" =~ ^[0-9a-f]{40}$ || "$RELEASE_EVENT_SHA" != "$tag_commit" ]]; then
@@ -237,12 +243,27 @@ jobs:
               publish_floating_tags=true
               ;;
             workflow_dispatch)
+              if [[ "$GITHUB_REF" != 'refs/heads/main' || "$GITHUB_SHA" != "$main_commit" ]]; then
+                echo 'release dispatch must run the current main workflow definition' >&2
+                exit 1
+              fi
               if ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
                 echo "resumed release commit $tag_commit is not an ancestor of origin/main" >&2
                 exit 1
               fi
               if [[ "$tag_commit" == "$main_commit" ]]; then
-                publish_floating_tags=true
+                dispatch_floating_candidate=true
+              else
+                dispatch_floating_candidate=true
+                while IFS= read -r -d '' changed_path; do
+                  case "$changed_path" in
+                    .github/workflows/container.yml|.github/workflows/native-binaries.yml|README.md|docs/docker.md) ;;
+                    *)
+                      echo "source changed after $RELEASE_TAG: $changed_path; floating tags disabled"
+                      dispatch_floating_candidate=false
+                      ;;
+                  esac
+                done < <(git diff --name-only -z "$tag_commit" "$main_commit")
               fi
               ;;
             *)
@@ -398,16 +419,39 @@ jobs:
             echo "release event ID $RELEASE_ID does not equal API release ID $release_id" >&2
             exit 1
           fi
+          if [[ "$dispatch_floating_candidate" == true && "$release_prerelease" == false ]]; then
+            latest_release_file="$RUNNER_TEMP/latest-release.json"
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/releases/latest" \
+              > "$latest_release_file"
+            if jq -e --argjson id "$release_id" --arg tag "$RELEASE_TAG" '
+              .id == $id and .tag_name == $tag and .draft == false and .prerelease == false
+            ' "$latest_release_file" >/dev/null; then
+              publish_floating_tags=true
+            else
+              echo "$RELEASE_TAG is not the latest stable published release; floating tags disabled"
+            fi
+          fi
 
           binary_name="hsrd-v${workspace_version}-aarch64-unknown-linux-gnu.tar.gz"
           source_name="hsrd-v${workspace_version}-lgpl-relink-source.tar.gz"
           checksum_name='SHA256SUMS'
           provenance_name='BUILD-PROVENANCE.json'
+          native_checksum_name='NATIVE-SHA256SUMS'
+          native_provenance_name='NATIVE-BUILD-PROVENANCE.json'
           required_assets=(
             "$binary_name"
             "$source_name"
             "$checksum_name"
             "$provenance_name"
+          )
+          native_archives=(
+            "hsrd-v${workspace_version}-x86_64-unknown-linux-gnu.tar.gz"
+            "hsrd-v${workspace_version}-aarch64-apple-darwin.tar.gz"
+            "hsrd-v${workspace_version}-x86_64-apple-darwin.tar.gz"
+            "hsrd-v${workspace_version}-x86_64-pc-windows-msvc.zip"
           )
           assets_file="$RUNNER_TEMP/release-assets.json"
           gh api \
@@ -415,16 +459,36 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
             > "$assets_file"
-          if ! jq -e --argjson expected "${#required_assets[@]}" \
-            'type == "array" and length == $expected' "$assets_file" >/dev/null; then
-            echo "release must contain exactly ${#required_assets[@]} uploaded assets" >&2
+          if ! jq -e 'type == "array"' "$assets_file" >/dev/null; then
+            echo 'release assets response is not an array' >&2
+            exit 1
+          fi
+
+          present_native_archives=()
+          for asset_name in "${native_archives[@]}"; do
+            asset_count=$(jq --arg name "$asset_name" '[.[] | select(.name == $name)] | length' "$assets_file")
+            if [[ "$asset_count" -gt 1 ]]; then
+              echo "release contains duplicate native asset $asset_name" >&2
+              exit 1
+            fi
+            if [[ "$asset_count" == 1 ]]; then
+              present_native_archives+=("$asset_name")
+            fi
+          done
+          expected_assets=("${required_assets[@]}")
+          if [[ "${#present_native_archives[@]}" -gt 0 ]]; then
+            expected_assets+=("${present_native_archives[@]}" "$native_checksum_name" "$native_provenance_name")
+          fi
+          if ! jq -e --argjson expected "${#expected_assets[@]}" \
+            'length == $expected' "$assets_file" >/dev/null; then
+            echo "release must contain exactly the required assets and their declared native supplements (${#expected_assets[@]} total)" >&2
             exit 1
           fi
 
           asset_dir="$RUNNER_TEMP/release-assets"
           mkdir -p "$asset_dir"
           declare -A asset_urls=()
-          for asset_name in "${required_assets[@]}"; do
+          for asset_name in "${expected_assets[@]}"; do
             asset_count=$(jq --arg name "$asset_name" '[.[] | select(.name == $name)] | length' "$assets_file")
             if [[ "$asset_count" != 1 ]]; then
               echo "release must contain exactly one $asset_name asset; found $asset_count" >&2
@@ -496,6 +560,7 @@ jobs:
             --arg source_name "$source_name" \
             --arg source_sha256 "${expected_sha256[$source_name]}" \
             --arg tag "$RELEASE_TAG" \
+            --arg tree "$tag_tree" \
             --arg version "$workspace_version" '
               type == "object"
               and .schema_version == 1
@@ -505,6 +570,7 @@ jobs:
               and .source.repository == $repository
               and .source.commit == $commit
               and .source.tag == $tag
+              and .source.tree == $tree
               and .binary.target == "aarch64-unknown-linux-gnu"
               and (.binary.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
               and .artifacts.binary_archive.name == $binary_name
@@ -512,6 +578,92 @@ jobs:
               and .artifacts.source_archive.name == $source_name
               and .artifacts.source_archive.sha256 == $source_sha256
             ' "$asset_dir/$provenance_name" >/dev/null
+
+          if [[ "${#present_native_archives[@]}" -gt 0 ]]; then
+            declare -A native_expected_sha256=()
+            declare -A present_native_archive_set=()
+            for asset_name in "${present_native_archives[@]}"; do
+              present_native_archive_set["$asset_name"]=1
+            done
+            native_checksum_entries=0
+            while read -r checksum filename extra; do
+              if [[ -z "${checksum:-}" ]]; then
+                continue
+              fi
+              filename=${filename#\*}
+              if [[ -n "${extra:-}" || ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+                echo 'NATIVE-SHA256SUMS contains a malformed entry' >&2
+                exit 1
+              fi
+              if [[ "$filename" != "$native_provenance_name" && \
+                    -z "${present_native_archive_set[$filename]+present}" ]]; then
+                echo "NATIVE-SHA256SUMS contains an unexpected entry: $filename" >&2
+                exit 1
+              fi
+              if [[ -n "${native_expected_sha256[$filename]+present}" ]]; then
+                echo "NATIVE-SHA256SUMS contains a duplicate entry: $filename" >&2
+                exit 1
+              fi
+              native_expected_sha256["$filename"]="$checksum"
+              native_checksum_entries=$((native_checksum_entries + 1))
+            done < "$asset_dir/$native_checksum_name"
+            if [[ "$native_checksum_entries" -ne "$((${#present_native_archives[@]} + 1))" ]]; then
+              echo 'NATIVE-SHA256SUMS must cover each native archive and its provenance exactly once' >&2
+              exit 1
+            fi
+            for asset_name in "${present_native_archives[@]}" "$native_provenance_name"; do
+              actual_sha256=$(sha256sum "$asset_dir/$asset_name" | cut -d ' ' -f 1)
+              if [[ "${native_expected_sha256[$asset_name]:-missing}" != "$actual_sha256" ]]; then
+                echo "checksum mismatch for $asset_name" >&2
+                exit 1
+              fi
+            done
+
+            native_archive_names_json=$(jq -n '$ARGS.positional' --args "${present_native_archives[@]}")
+            native_checksums_json=$(
+              for asset_name in "${present_native_archives[@]}"; do
+                printf '%s\t%s\n' "$asset_name" "${native_expected_sha256[$asset_name]}"
+              done | jq -Rn '[inputs | split("\t") | {key: .[0], value: .[1]}] | from_entries'
+            )
+            jq -e \
+              --arg commit "$tag_commit" \
+              --arg repository "$repository_url" \
+              --arg tag "$RELEASE_TAG" \
+              --arg tree "$tag_tree" \
+              --arg version "$workspace_version" \
+              --argjson archive_names "$native_archive_names_json" \
+              --argjson checksums "$native_checksums_json" '
+                type == "object"
+                and .schema_version == 1
+                and .project == "hns-node-rs"
+                and .program == "hsrd"
+                and .version == $version
+                and .source.repository == $repository
+                and .source.commit == $commit
+                and .source.tag == $tag
+                and .source.tree == $tree
+                and (.binaries | type == "array" and length == ($archive_names | length))
+                and ([.binaries[].archive.name] | sort) == ($archive_names | sort)
+                and ([.binaries[].target] | unique | length) == ($archive_names | length)
+                and all(.binaries[];
+                  .target as $target
+                  | ($target == "x86_64-unknown-linux-gnu"
+                     or $target == "aarch64-apple-darwin"
+                     or $target == "x86_64-apple-darwin"
+                     or $target == "x86_64-pc-windows-msvc")
+                    and .archive.name == (
+                      "hsrd-v" + $version + "-" + $target
+                      + (if $target == "x86_64-pc-windows-msvc" then ".zip" else ".tar.gz" end)
+                    )
+                    and .archive.sha256 == $checksums[.archive.name]
+                    and (.binary.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+                    and .binary.version_output == ("hsrd " + $version)
+                )
+              ' "$asset_dir/$native_provenance_name" >/dev/null || {
+                echo 'native build provenance does not match release identity and native archives' >&2
+                exit 1
+              }
+          fi
 
           {
             echo "commit=$tag_commit"
@@ -699,6 +851,7 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY_IMAGE }}
+          flavor: latest=false
           tags: |
             type=raw,value=canary-v${{ needs.release-preflight.outputs.version }},enable=${{ needs.release-preflight.outputs.prerelease == 'true' }}
             type=semver,pattern={{version}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ needs.release-preflight.outputs.prerelease == 'false' }}
