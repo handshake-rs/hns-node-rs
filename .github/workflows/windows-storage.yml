@@ -67,9 +67,9 @@ jobs:
           set -euo pipefail
           cargo +1.97.1 test --locked --target x86_64-pc-windows-msvc -p hns-store
 
-      - name: Exercise name-page bootstrap and reopen
+      - name: Exercise name-page bootstrap, recovery, and compaction
         shell: bash
         run: |
           set -euo pipefail
           cargo +1.97.1 test --locked --target x86_64-pc-windows-msvc \
-            -p hns-node --lib windows_name_page_bootstrap_reopens_its_flushed_generation
+            -p hns-node --lib name_page
