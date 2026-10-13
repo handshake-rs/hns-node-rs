@@ -375,8 +375,9 @@ headers-only operation retain full-block behavior.
 Active-state connection is the native-sync default and is bounded to 288
 connected blocks per atomic reorganization by default, matching
 mainnet's retained reorganization window (hard maximum 1,024). Straight-line
-IBD progress is limited to eight connected blocks per state transaction so
-RPC, peer work, and shutdown are polled between small atomic commits. A valid
+IBD progress is limited to 288 connected blocks per state transaction by
+default, subject to the configured maximum and staged-effect budget. RPC,
+peer work, and shutdown are polled between atomic commits. A valid
 body completion is durably sequenced without recursively entering the state
 writer. Network maintenance retains its configured polling cadence. A separate
 10 ms minimum activation cadence connects exactly one slice per scheduler turn
@@ -402,11 +403,11 @@ cargo run --locked -p hns-node -- \
 
 On restart and every supervisor tick, the connector compares the active tip
 with the highest contiguous stored canonical body. Direct progress advances in
-at-most-eight-block atomic slices even when the configured bound is larger. A
-best-work fork is disconnected and connected atomically once its bounded
-replacement prefix exceeds active chainwork; it may use the full configured
-bound because yielding partway through a reorganization would violate the
-single-commit invariant. Shutdown therefore returns between direct slices but
+atomic slices of at most 288 blocks, subject to the configured bound and
+staged-effect budget. A best-work fork is disconnected and connected atomically
+once its bounded replacement prefix exceeds active chainwork. A reorganization
+may use the full configured bound to preserve the single-commit invariant.
+Shutdown therefore returns between direct slices but
 waits for an already staged reorganization commit. Deep replacements that
 cannot exceed the active tip within the configured batch fail closed and
 require an operator-selected larger bound.
