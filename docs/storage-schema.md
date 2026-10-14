@@ -35,7 +35,7 @@ publication schema plus the optimized storage tiers:
   authenticated 4 KiB record subpages, bounded path-local subpage reuse, and
   monotonic physical seals every 360 heights without changing consensus-root
   timing. Pruned mode rewrites the reachable union into a fresh generation
-  after sixteen sealed segments. Legacy schema-18 pages remain readable in
+  after sixteen sealed segments. Pages written by schema 18 remain readable in
   place;
 - checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
   compact locators and authoritative manifests; inline values remain

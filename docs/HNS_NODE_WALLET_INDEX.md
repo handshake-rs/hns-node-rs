@@ -115,7 +115,7 @@ Contract tracking does not require an index-profile migration for a store that
 already has `--wallet-index`: it adds versioned derivative keys under that
 existing profile. Registrations are immutable and must be committed through
 `register_tracked_contract` before funding is broadcast. Registration after a
-funding confirmation does not pretend to backfill history; rescan/reindex or a
+funding confirmation does not backfill history; rescan/reindex or a
 new funding outpoint is required.
 
 ## Disk and indexing cost
