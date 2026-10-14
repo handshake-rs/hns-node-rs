@@ -694,11 +694,11 @@ into append-only pages; unchanged child locators can point into sealed older
 segments. Proof reads traverse only the requested path and rehash every loaded
 canonical record.
 
-Startup still performs the independent O(N) rebuild from materialized
-`NameState` and validates every node reachable from the bound root. The rebuild
-also remains a differential-test oracle; it is no longer the steady-state root
-construction path. Pinned HSD incremental roots and canonical proof bytes match
-the path-local implementation, including multi-name history and reverse undo.
+Startup performs an independent O(N) rebuild from materialized `NameState` and
+validates every node reachable from the bound root. The rebuild also serves as
+a differential-test oracle. Runtime root construction uses path-local mutation.
+Pinned HSD incremental roots and canonical proof bytes match the path-local
+implementation, including multi-name history and reverse undo.
 
 Active connects write a versioned, checksummed root pin whenever the height is
 divisible by the network's HSD `treeInterval`; disconnect removes the exact

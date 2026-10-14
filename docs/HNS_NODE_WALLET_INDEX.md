@@ -474,7 +474,7 @@ tokens, not secrets or authenticated capabilities. The additive
 `chain_snapshot` method projects epoch and exact tip from one immutable
 typed-backend read and takes no parameters. Together with a bound height-zero
 `block_hash` read, it establishes chain and network identity before the first
-script query. The older `chain_tip` result remains unchanged. Confirmed
+script query. `chain_tip` returns tip-only data. Confirmed
 responses preserve chain epoch, tip, and script-set binding; mempool responses
 preserve the chain epoch/tip plus explicit process instance nonce, generation,
 and query binding. Mempool requests supply their confirmed restore epoch, and
@@ -673,5 +673,4 @@ crates.io `hns-rs =0.5.0` artifacts containing the generated Shakescape V1
 registry assignments and typed envelopes. Messages reach the adapter only after
 exact Shakescape V1 registry/network/genesis admission; no sibling path or
 unassigned message ID is permitted. Joined public multi-node/mobile canary
-qualification remains open, but source availability and adapter installation
-are no longer blockers.
+qualification remains open.

@@ -171,9 +171,8 @@ tracked-contract pages require `expected_chain_epoch`. A mismatch is rejected
 before wire projection. The active-name-owner comparison occurs before its
 NameState, UTXO, or transaction-index authority reads. Every response retains
 the complete captured tip so the adapter can also require exact tip equality.
-Confirmed restoration still returns the same binding on every page and rejects
-a pre-scan reorganization; it no longer needs to be the first request that
-reveals the epoch.
+Confirmed restoration returns the same binding on every page and rejects a
+pre-scan reorganization.
 
 Every non-null `tip` object contains `hash`, `height`, `median_time_past`, and
 `tree_root`. `median_time_past` is the median timestamp of the active tip and up

@@ -203,9 +203,9 @@ Network maintenance retains its configured polling cadence, while active-state
 work has a separate 10 ms minimum cadence. The activation branch connects
 exactly one atomic slice per scheduler turn and uses delay-on-missed-tick
 semantics, guaranteeing an inter-slice opportunity for peer events, validation
-results, and shutdown. Ordered validation completion no longer recursively
-invokes another state slice. This removes both the immediate slice-to-slice
-feedback loop and the general polling interval as a replay throughput ceiling.
+results, and shutdown. Ordered validation completion returns to the scheduler
+between state slices. The separate active-state cadence avoids making the
+general polling interval a replay throughput ceiling.
 
 A new slice is admitted only when no validated result is waiting and the peer
 event receiver is at or below its 32-event low-water mark. Events may continue

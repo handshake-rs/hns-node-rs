@@ -143,7 +143,7 @@ Before any script-set read, the backend can capture the durable chain epoch and
 complete tip together in one immutable point read. This script-free snapshot,
 followed by a height-zero hash read under the same epoch, lets an external wallet
 validate its selected network without first disclosing derived script
-identities. The older tip-only read remains an unchanged compatibility surface.
+identities. `chain_tip` remains available for tip-only reads.
 
 Active-height hash lookup and ordered, bounded outpoint-spend batches carry one
 immutable chain epoch/tip binding. Confirmed history carries optional canonical
