@@ -39,6 +39,10 @@ const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS: usize = 4_096;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER: usize = 64;
 const MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS: usize = 1_024;
+const MAX_CROSS_CHAIN_CANDIDATES_PER_OFFER: usize = 32;
+const MAX_CROSS_CHAIN_CANDIDATES_PER_PEER: usize = 32;
+const MAX_CANDIDATE_FRAMES_PER_PEER_MINUTE: u32 = 128;
+const MAX_CANDIDATE_FRAMES_PER_FEDERATION_MINUTE: u32 = 1_024;
 const MAX_SHAKESCAPE_CROSS_CHAIN_PENDING_REQUESTS: usize = 4_096;
 const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS: usize = 4_096;
 const MAX_SHAKESCAPE_CROSS_CHAIN_CANCELLATIONS_PER_OFFER: usize = 4;
@@ -399,6 +403,7 @@ struct CrossChainSessionRoute {
     taker: PeerId,
     acceptance: DirectOfferAcceptance,
     hello: Option<SwapSessionHello>,
+    received_at_unix: u64,
 }
 
 /// A previously countersigned swap can outlive both its public offer and this
@@ -423,10 +428,14 @@ struct ShakescapeCrossChainState {
     /// `verify_for_offer` succeeds against the exact offer.
     cancellations: BTreeMap<[u8; 32], Vec<PendingCrossChainCancellation>>,
     sessions: BTreeMap<[u8; 32], CrossChainSessionRoute>,
+    /// An acceptance is only a candidate. The offer setter's countersigned
+    /// hello selects exactly one route for funding and subsequent status.
+    candidates: BTreeMap<([u8; 32], [u8; 33]), CrossChainSessionRoute>,
     recovery_sessions: BTreeMap<[u8; 32], CrossChainSessionRecoveryRoute>,
     peers: BTreeSet<PeerId>,
     federation_peers: BTreeSet<PeerId>,
     pending: HashMap<(PeerId, u64), ([u8; 32], u64)>,
+    candidate_frame_budget: HashMap<PeerId, (u64, u32)>,
     next_request_id: u64,
 }
 
@@ -438,10 +447,12 @@ impl ShakescapeCrossChainState {
             offers: BTreeMap::new(),
             cancellations: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            candidates: BTreeMap::new(),
             recovery_sessions: BTreeMap::new(),
             peers: BTreeSet::new(),
             federation_peers: BTreeSet::new(),
             pending: HashMap::new(),
+            candidate_frame_budget: HashMap::new(),
             next_request_id: 1,
         }
     }
@@ -454,6 +465,8 @@ impl ShakescapeCrossChainState {
 
     fn expire(&mut self, now: u64) {
         self.pending.retain(|_, (_, expires_at)| *expires_at > now);
+        self.candidate_frame_budget
+            .retain(|_, (started, _)| started.saturating_add(60) > now);
         self.offers
             .retain(|_, record| record.offer.header.expires_at > now);
         self.cancellations.retain(|_, candidates| {
@@ -461,6 +474,9 @@ impl ShakescapeCrossChainState {
             !candidates.is_empty()
         });
         self.sessions.retain(|_, route| {
+            self.offers.contains_key(&route.offer_id) && route.acceptance.header.expires_at > now
+        });
+        self.candidates.retain(|_, route| {
             self.offers.contains_key(&route.offer_id) && route.acceptance.header.expires_at > now
         });
         self.recovery_sessions
@@ -1009,8 +1025,8 @@ impl ShakescapeRelayHandle {
     }
 
     /// Consume one canonical direct HNS/BTC message. Board inventory is shared
-    /// among admitted peers, while acceptance/proposal/hello/status traffic is
-    /// routed only across the pair established by the signed offer acceptance.
+    /// among admitted peers. Signed responses may coexist; the offer setter's
+    /// countersigned hello selects the pair used for funding/status traffic.
     pub fn receive_cross_chain(
         &self,
         peer: PeerId,
@@ -1041,6 +1057,23 @@ impl ShakescapeRelayHandle {
         let state = &mut service.cross_chain;
         state.expire(now);
         state.peers.insert(peer);
+        if matches!(
+            message,
+            CrossChainMessage::AcceptDirectOffer(_) | CrossChainMessage::SwapSessionProposal(_)
+        ) {
+            let limit = if state.federation_peers.contains(&peer) {
+                MAX_CANDIDATE_FRAMES_PER_FEDERATION_MINUTE
+            } else {
+                MAX_CANDIDATE_FRAMES_PER_PEER_MINUTE
+            };
+            let budget = state.candidate_frame_budget.entry(peer).or_insert((now, 0));
+            budget.1 = budget.1.saturating_add(1);
+            if budget.1 > limit {
+                return Err(ShakescapeRelayHandleError::CrossChain(
+                    "candidate message rate exceeded",
+                ));
+            }
+        }
         let mut dispatch = ShakescapeCrossChainDispatch::default();
         match message {
             CrossChainMessage::DirectOfferInventory(offer_ids) => {
@@ -1192,6 +1225,9 @@ impl ShakescapeRelayHandle {
                 state
                     .sessions
                     .retain(|_, route| route.offer_id != cancellation.offer_id);
+                state
+                    .candidates
+                    .retain(|_, route| route.offer_id != cancellation.offer_id);
                 remember_cross_chain_cancellation(state, cancellation.clone(), peer, true);
                 for target in state.peers.iter().copied().filter(|target| *target != peer) {
                     dispatch.sends.push(ShakescapeCrossChainSend {
@@ -1222,27 +1258,81 @@ impl ShakescapeRelayHandle {
                     .map_err(|_| {
                         ShakescapeRelayHandleError::CrossChain("invalid direct offer acceptance")
                     })?;
+                let candidate_key = (
+                    acceptance.swap_session_id,
+                    acceptance.header.signer_public_key,
+                );
                 if let Some(route) = state.sessions.get(&acceptance.swap_session_id) {
                     if route.maker != peer || route.taker != taker || route.acceptance != acceptance
                     {
                         return Err(ShakescapeRelayHandleError::CrossChain(
-                            "swap session route conflicts with an existing acceptance",
+                            "offer already has a countersigned responder",
+                        ));
+                    }
+                } else if let Some(route) = state.candidates.get(&candidate_key) {
+                    if route.maker != peer || route.taker != taker || route.acceptance != acceptance
+                    {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "responder changed its signed acceptance",
                         ));
                     }
                 } else {
-                    if state.sessions.len() >= MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS {
+                    if state
+                        .candidates
+                        .values()
+                        .filter(|route| route.maker == peer)
+                        .count()
+                        >= MAX_CROSS_CHAIN_CANDIDATES_PER_PEER
+                    {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "peer candidate capacity reached",
+                        ));
+                    }
+                    if state
+                        .candidates
+                        .values()
+                        .filter(|route| route.offer_id == acceptance.offer_id)
+                        .count()
+                        >= MAX_CROSS_CHAIN_CANDIDATES_PER_OFFER
+                    {
+                        let oldest = state
+                            .candidates
+                            .iter()
+                            .filter(|(_, route)| route.offer_id == acceptance.offer_id)
+                            .min_by_key(|(_, route)| route.received_at_unix)
+                            .map(|(key, _)| *key);
+                        if let Some(oldest) = oldest {
+                            state.candidates.remove(&oldest);
+                        }
+                    }
+                    if state.sessions.len().saturating_add(state.candidates.len())
+                        >= MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS
+                    {
+                        let oldest = state
+                            .candidates
+                            .iter()
+                            .min_by_key(|(_, route)| route.received_at_unix)
+                            .map(|(key, _)| *key);
+                        if let Some(oldest) = oldest {
+                            state.candidates.remove(&oldest);
+                        }
+                    }
+                    if state.sessions.len().saturating_add(state.candidates.len())
+                        >= MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS
+                    {
                         return Err(ShakescapeRelayHandleError::CrossChain(
                             "cross-chain session capacity reached",
                         ));
                     }
-                    state.sessions.insert(
-                        acceptance.swap_session_id,
+                    state.candidates.insert(
+                        candidate_key,
                         CrossChainSessionRoute {
                             offer_id: acceptance.offer_id,
                             maker: peer,
                             taker,
                             acceptance: acceptance.clone(),
                             hello: None,
+                            received_at_unix: now,
                         },
                     );
                 }
@@ -1254,7 +1344,13 @@ impl ShakescapeRelayHandle {
             }
             CrossChainMessage::SwapSessionProposal(proposal) => {
                 let session_id = proposal.terms().swap_session_id;
-                if let Some(route) = state.sessions.get(&session_id).cloned() {
+                let candidate_key = (session_id, proposal.terms().header.signer_public_key);
+                if let Some(route) = state
+                    .candidates
+                    .get(&candidate_key)
+                    .or_else(|| state.sessions.get(&session_id))
+                    .cloned()
+                {
                     if peer != route.maker {
                         return Err(ShakescapeRelayHandleError::CrossChain(
                             "swap proposal came from the non-maker peer",
@@ -1342,7 +1438,13 @@ impl ShakescapeRelayHandle {
                 }
             }
             CrossChainMessage::SwapSessionHello(hello) => {
-                if let Some(route) = state.sessions.get(&hello.swap_session_id).cloned() {
+                let candidate_key = (hello.swap_session_id, hello.header.signer_public_key);
+                if let Some(route) = state
+                    .sessions
+                    .get(&hello.swap_session_id)
+                    .or_else(|| state.candidates.get(&candidate_key))
+                    .cloned()
+                {
                     if peer != route.taker {
                         return Err(ShakescapeRelayHandleError::CrossChain(
                             "swap hello came from the non-taker peer",
@@ -1365,11 +1467,16 @@ impl ShakescapeRelayHandle {
                         .map_err(|_| {
                             ShakescapeRelayHandleError::CrossChain("invalid swap hello")
                         })?;
+                    state.sessions.insert(
+                        hello.swap_session_id,
+                        CrossChainSessionRoute {
+                            hello: Some(hello.clone()),
+                            ..route.clone()
+                        },
+                    );
                     state
-                        .sessions
-                        .get_mut(&hello.swap_session_id)
-                        .expect("validated session route remains present")
-                        .hello = Some(hello.clone());
+                        .candidates
+                        .retain(|(session_id, _), _| *session_id != hello.swap_session_id);
                     dispatch.sends.push(ShakescapeCrossChainSend {
                         peer: route.maker,
                         request_id,
@@ -1484,6 +1591,7 @@ impl ShakescapeRelayHandle {
             .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         let state = &mut service.cross_chain;
         state.peers.remove(&peer);
+        state.candidate_frame_budget.remove(&peer);
         state.federation_peers.remove(&peer);
         state
             .pending
@@ -1495,6 +1603,9 @@ impl ShakescapeRelayHandle {
         }
         state
             .sessions
+            .retain(|_, route| route.maker != peer && route.taker != peer);
+        state
+            .candidates
             .retain(|_, route| route.maker != peer && route.taker != peer);
         state.recovery_sessions.retain(|_, route| {
             route.maker != peer && route.taker.is_none_or(|taker| taker != peer)
@@ -2378,6 +2489,98 @@ mod cross_chain_tests {
         };
         acceptance.sign(&[10; 32]).unwrap();
         acceptance
+    }
+
+    #[test]
+    fn competing_responses_remain_candidates_until_one_hello_is_countersigned() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let owner = PeerId(41);
+        let first = PeerId(42);
+        let second = PeerId(43);
+        let offer = offer();
+        let requested = relay
+            .receive_cross_chain(
+                owner,
+                1,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        let request_id = requested
+            .sends
+            .iter()
+            .find_map(|send| match send.message {
+                CrossChainMessage::GetDirectOffer(id) if id == offer.offer_id => {
+                    Some(send.request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        relay
+            .receive_cross_chain(
+                owner,
+                request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .unwrap();
+        let first_acceptance = acceptance(&offer);
+        let mut second_acceptance = first_acceptance.clone();
+        second_acceptance.header.signer_public_key = [0; 33];
+        second_acceptance.responding_maker_settlement_public_key = public_key([13; 32]);
+        second_acceptance.sign(&[12; 32]).unwrap();
+        for (peer, acceptance) in [
+            (first, first_acceptance.clone()),
+            (second, second_acceptance.clone()),
+        ] {
+            let routed = relay
+                .receive_cross_chain(
+                    peer,
+                    2,
+                    CrossChainMessage::AcceptDirectOffer(acceptance),
+                    NOW,
+                )
+                .unwrap();
+            assert_eq!(routed.sends.len(), 1);
+            assert_eq!(routed.sends[0].peer, owner);
+        }
+        let (proposal, hello) = accepted_session(&offer, &first_acceptance);
+        assert_eq!(
+            relay
+                .receive_cross_chain(
+                    first,
+                    3,
+                    CrossChainMessage::SwapSessionProposal(proposal),
+                    NOW
+                )
+                .unwrap()
+                .sends[0]
+                .peer,
+            owner
+        );
+        assert_eq!(
+            relay
+                .receive_cross_chain(owner, 4, CrossChainMessage::SwapSessionHello(hello), NOW)
+                .unwrap()
+                .sends[0]
+                .peer,
+            first
+        );
+        assert!(relay
+            .receive_cross_chain(
+                second,
+                5,
+                CrossChainMessage::AcceptDirectOffer(second_acceptance),
+                NOW
+            )
+            .is_err());
     }
 
     fn cancellation(offer: &DirectOffer) -> DirectOfferCancellation {
