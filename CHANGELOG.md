@@ -13,6 +13,8 @@ qualification or authorize deployment.
   countersigns a session, so a stalled first responder cannot reserve an offer.
 - Refresh the locked Tokio and serde_json dependencies used by the board HTTP
   endpoint within their existing compatible version ranges.
+- Update the locked Hickory resolver family to `0.26.3`, addressing the
+  published resolver advisories affecting the separate `hns-resolverd` binary.
 
 ## 0.3.10 - 2026-10-11
 
