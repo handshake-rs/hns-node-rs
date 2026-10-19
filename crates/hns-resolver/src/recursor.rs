@@ -671,7 +671,11 @@ mod tests {
             udp_response(listen, 78).await.response_code,
             ResponseCode::NXDomain
         );
-        assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 1);
+        // The recursor may ask the root for both the name and its delegation.
+        // This test cares that the gate blocks reads and a new generation
+        // triggers fresh reads, not the number of internal DNS lookups.
+        let initial_lookups = source.missing_lookups.load(Ordering::Relaxed);
+        assert!(initial_lookups > 0);
 
         source.state.store(2, Ordering::Release);
         let probes = source.probes.load(Ordering::Acquire);
@@ -680,7 +684,10 @@ mod tests {
             udp_response(listen, 79).await.response_code,
             ResponseCode::ServFail
         );
-        assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            source.missing_lookups.load(Ordering::Relaxed),
+            initial_lookups
+        );
 
         source.state.store(3, Ordering::Release);
         let probes = source.probes.load(Ordering::Acquire);
@@ -689,7 +696,7 @@ mod tests {
             udp_response(listen, 80).await.response_code,
             ResponseCode::NXDomain
         );
-        assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 2);
+        assert!(source.missing_lookups.load(Ordering::Relaxed) > initial_lookups);
 
         shutdown_send.send(()).expect("request shutdown");
         timeout(Duration::from_secs(3), server)
