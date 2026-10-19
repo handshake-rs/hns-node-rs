@@ -23425,11 +23425,12 @@ mod tests {
             shakescape_relay_roles: ShakescapeRelayRoles::new(false, true, false, false, false),
             native_sync: NativeSyncConfig {
                 enabled: true,
+                listen: Some("127.0.0.1:12038".parse().unwrap()),
                 ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         };
-        assert!(validate_node_config(&config).is_ok());
+        validate_node_config(&config).expect("valid loopback board listener with native P2P");
         config.shakescape_board_http_bind = Some("0.0.0.0:12039".parse().unwrap());
         assert!(validate_node_config(&config).is_err());
         config.shakescape_board_http_bind = Some(config.rpc_bind);
