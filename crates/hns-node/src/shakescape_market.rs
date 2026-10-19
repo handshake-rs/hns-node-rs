@@ -37,6 +37,8 @@ pub const MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE: usize = 256;
 const MAX_SHAKESCAPE_NAME_MARKET_PENDING_REQUESTS: usize = 1_024;
 const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS: usize = 4_096;
+/// Maximum direct offers exposed by one public read-only board snapshot.
+pub const MAX_SHAKESCAPE_PUBLIC_DIRECT_OFFERS: usize = 100;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER: usize = 64;
 const MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS: usize = 1_024;
 const MAX_CROSS_CHAIN_CANDIDATES_PER_OFFER: usize = 32;
@@ -634,6 +636,34 @@ impl ShakescapeRelayHandle {
                 }),
         );
         Ok(ShakescapeCrossChainDispatch { sends })
+    }
+
+    /// Return a bounded copy of currently reachable, signed direct offers.
+    /// Cancellations have already removed their offers from this typed board.
+    /// The caller must treat the result as advertisement, never settlement
+    /// authority, and the wallet must re-fetch the offer before acceptance.
+    pub fn public_direct_offers(
+        &self,
+        now: u64,
+    ) -> Result<Vec<DirectOffer>, ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        let state = &mut service.cross_chain;
+        state.expire(now);
+        Ok(state
+            .offers
+            .values()
+            .filter(|record| {
+                record.offer.header.expires_at > now
+                    && record
+                        .owner
+                        .is_some_and(|owner| state.peers.contains(&owner))
+            })
+            .take(MAX_SHAKESCAPE_PUBLIC_DIRECT_OFFERS)
+            .map(|record| record.offer.clone())
+            .collect())
     }
 
     /// Mark an incoming connection whose authenticated static key appears in
@@ -2489,6 +2519,97 @@ mod cross_chain_tests {
         };
         acceptance.sign(&[10; 32]).unwrap();
         acceptance
+    }
+
+    #[test]
+    fn public_snapshot_only_advertises_reachable_uncancelled_direct_offers() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let owner = PeerId(41);
+        let offer = offer();
+        assert!(relay.public_direct_offers(NOW).unwrap().is_empty());
+
+        let requested = relay
+            .receive_cross_chain(
+                owner,
+                1,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        let request_id = requested
+            .sends
+            .iter()
+            .find_map(|send| match send.message {
+                CrossChainMessage::GetDirectOffer(id) if id == offer.offer_id => {
+                    Some(send.request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        relay
+            .receive_cross_chain(
+                owner,
+                request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            relay.public_direct_offers(NOW).unwrap(),
+            vec![offer.clone()]
+        );
+
+        relay.cross_chain_peer_disconnected(owner).unwrap();
+        assert!(relay.public_direct_offers(NOW).unwrap().is_empty());
+
+        let requested_again = relay
+            .receive_cross_chain(
+                owner,
+                2,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        assert!(relay.public_direct_offers(NOW).unwrap().is_empty());
+        let request_id = requested_again
+            .sends
+            .iter()
+            .find_map(|send| match send.message {
+                CrossChainMessage::GetDirectOffer(id) if id == offer.offer_id => {
+                    Some(send.request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        relay
+            .receive_cross_chain(
+                owner,
+                request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            relay.public_direct_offers(NOW).unwrap(),
+            vec![offer.clone()]
+        );
+
+        relay
+            .receive_cross_chain(
+                owner,
+                3,
+                CrossChainMessage::CancelDirectOffer(cancellation(&offer)),
+                NOW,
+            )
+            .unwrap();
+        assert!(relay.public_direct_offers(NOW).unwrap().is_empty());
     }
 
     #[test]

@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, State},
+    http::{header, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post},
@@ -32,6 +33,7 @@ use hns_consensus::{
     validate_transaction_start, ConsensusError, ConsensusParams, DeploymentState, HeaderConsensus,
     HeaderParent, HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
+use hns_marketplace_protocol::AssetId;
 use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
     generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
@@ -3034,6 +3036,7 @@ impl NodeService {
             native_sync_config.federation_auto = true;
         }
         let rpc_bind = self.config.rpc_bind;
+        let shakescape_board_http_bind = self.config.shakescape_board_http_bind;
         let rpc_authorization = self.config.rpc_authorization.clone();
         let rpc_limits = self.config.rpc_limits;
         let network = self.config.network;
@@ -3355,6 +3358,14 @@ impl NodeService {
         let rpc_listener = TcpListener::bind(rpc_bind)
             .await
             .with_context(|| format!("failed to bind RPC listener on {rpc_bind}"))?;
+        let board_listener = match shakescape_board_http_bind {
+            Some(bind) => Some(
+                TcpListener::bind(bind)
+                    .await
+                    .with_context(|| format!("failed to bind Shakescape board HTTP on {bind}"))?,
+            ),
+            None => None,
+        };
         let rpc_state = NativeSyncHttpState {
             node: node.clone(),
             diagnostics: Arc::clone(&diagnostics),
@@ -3372,6 +3383,17 @@ impl NodeService {
             rpc_authorization,
             shutdown_rx.clone(),
         ));
+        let board_task = board_listener.map(|listener| {
+            tokio::spawn(serve_shakescape_board_http(
+                listener,
+                ShakescapeBoardHttpState {
+                    relay: shakescape_relay.clone(),
+                    network,
+                },
+                rpc_limits,
+                shutdown_rx.clone(),
+            ))
+        });
         let mut active_state_batch_tuner =
             ActiveStateBatchTuner::new(native_sync_config.active_state_connect_batch);
 
@@ -3409,6 +3431,9 @@ impl NodeService {
                 Err(error) => {
                     let _ = shutdown_tx.send(true);
                     let _ = rpc_task.await;
+                    if let Some(task) = board_task {
+                        let _ = task.await;
+                    }
                     return Err(error);
                 }
             };
@@ -3861,6 +3886,12 @@ impl NodeService {
                 NativeSupervisorEvent::Maintenance => {
                     if rpc_task.is_finished() {
                         let message = "Native sync RPC task terminated unexpectedly".to_owned();
+                        record_error(&diagnostics, message.clone()).await;
+                        terminal_error = Some(anyhow::anyhow!(message));
+                        break;
+                    }
+                    if board_task.as_ref().is_some_and(|task| task.is_finished()) {
+                        let message = "Shakescape board HTTP task terminated unexpectedly".to_owned();
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
@@ -4566,12 +4597,17 @@ impl NodeService {
         peers.disconnect_all().await;
 
         let rpc_result = await_task("RPC", rpc_task).await;
+        let board_result = match board_task {
+            Some(task) => await_task("Shakescape board HTTP", task).await,
+            None => Ok(()),
+        };
         let listener_result = match listener_task {
             Some(task) => await_p2p_task("P2P listener", task).await,
             None => Ok(()),
         };
         let clean_shutdown_eligible = terminal_error.is_none()
             && rpc_result.is_ok()
+            && board_result.is_ok()
             && listener_result.is_ok()
             && extension_result.is_ok();
         let writer_result = shutdown_native_runtime(runtime, clean_shutdown_eligible).await;
@@ -4579,6 +4615,7 @@ impl NodeService {
             return Err(error);
         }
         rpc_result?;
+        board_result?;
         listener_result?;
         extension_result?;
         writer_result?;
@@ -6215,6 +6252,91 @@ struct NativeSyncHttpState {
     wallet_rpc_authenticated: bool,
     wallet_rpc_profile_enabled: bool,
     limits: RpcLimits,
+}
+
+#[derive(Clone)]
+struct ShakescapeBoardHttpState {
+    relay: ShakescapeRelayHandle,
+    network: Network,
+}
+
+async fn serve_shakescape_board_http(
+    listener: TcpListener,
+    state: ShakescapeBoardHttpState,
+    limits: RpcLimits,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    limits.validate()?;
+    let app = Router::new()
+        .route(
+            "/api/v1/shakescape/direct-offers",
+            get(handle_shakescape_direct_offers),
+        )
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(0))
+        .layer(middleware::from_fn_with_state(
+            RpcRuntimeLimits::new(limits),
+            enforce_rpc_resource_limits,
+        ));
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await
+        .context("Shakescape board HTTP server failed")
+}
+
+async fn handle_shakescape_direct_offers(
+    State(state): State<ShakescapeBoardHttpState>,
+) -> impl IntoResponse {
+    let now = unix_time();
+    let offers = match state.relay.public_direct_offers(now) {
+        Ok(offers) => offers,
+        Err(error) => {
+            tracing::warn!(%error, "Shakescape direct-offer snapshot unavailable");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({ "status": "unavailable" })),
+            )
+                .into_response();
+        }
+    };
+    let mut revision_bytes = Vec::with_capacity(offers.len() * 32);
+    let rows = offers
+        .iter()
+        .map(|offer| {
+            revision_bytes.extend_from_slice(&offer.offer_id);
+            let asset_name = |asset| match asset {
+                AssetId::HNS => "HNS",
+                AssetId::BTC => "BTC",
+                _ => "unknown",
+            };
+            serde_json::json!({
+                "offer_id": hex::encode(offer.offer_id),
+                "signer_public_key": hex::encode(offer.header.signer_public_key),
+                "offered_asset": asset_name(offer.offered_asset),
+                "offered_amount_base_units": offer.offered_amount.get().to_string(),
+                "received_asset": asset_name(offer.received_asset),
+                "received_amount_base_units": offer.received_amount.get().to_string(),
+                "created_at": offer.header.created_at,
+                "expires_at": offer.header.expires_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "schema_version": 1,
+            "network": state.network.to_string(),
+            "revision": hex::encode(blake2b_256(&revision_bytes)),
+            "generated_at": now,
+            "expires_at": now.saturating_add(20),
+            "offers": rows,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Clone)]

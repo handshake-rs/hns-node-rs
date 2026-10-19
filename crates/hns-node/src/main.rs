@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:12037")]
     rpc_bind: SocketAddr,
 
+    /// Optional loopback-only HTTP listener for public, read-only Shakescape
+    /// direct-offer snapshots. Never exposes the node RPC router.
+    #[arg(long = "shakescape-board-http-bind")]
+    shakescape_board_http_bind: Option<SocketAddr>,
+
     /// Read the exact required HTTP Authorization value from a mode-0600 file.
     #[arg(long)]
     rpc_authorization_header_file: Option<PathBuf>,
@@ -418,6 +423,7 @@ impl Cli {
             network: self.network.into(),
             data_dir: self.data_dir,
             rpc_bind: self.rpc_bind,
+            shakescape_board_http_bind: self.shakescape_board_http_bind,
             rpc_authorization,
             rpc_limits: RpcLimits {
                 maximum_request_bytes: self.rpc_max_request_bytes,

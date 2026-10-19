@@ -158,6 +158,32 @@ Set `PUBLIC_IP` to the actual public IPv4 address routed to the listener (or
 pass a bracketed public IPv6 socket directly). The advertised address is never
 inferred from the bind wildcard.
 
+## Read-only direct-offer HTTP snapshot
+
+`--shakescape-board-http-bind 127.0.0.1:12039` optionally starts a separate
+loopback-only listener with one route:
+
+```text
+GET /api/v1/shakescape/direct-offers
+```
+
+The flag requires native sync and the cross-chain relay role. It rejects a
+non-loopback or zero port and cannot share the broad RPC listener's address.
+The listener defaults off. It does not mount JSON-RPC, wallet RPC, offer
+publication, acceptance, or swap-session routes. Its bounded v1 JSON response
+contains at most 100 currently reachable, unexpired, uncancelled signed HNS/BTC
+direct offers, their exact base-unit amounts, a network name, a revision digest,
+and a 20-second feed horizon. Its `Cache-Control` is `no-store`; clients must
+check both the feed and each offer expiry. After a relay restart or owner
+disconnect, an offer does not reappear until an owner re-proves it. The wallet
+still re-fetches the exact signed offer before any acceptance.
+
+For a same-machine site preview, point its server-side reader to
+`http://127.0.0.1:12039/api/v1/shakescape/direct-offers`. For a different
+host, publish only this path through a bounded HTTPS reverse proxy; keep the
+node RPC private. The ordinary ShakeScape P2P listener remains raw TCP and is
+not an HTTP upstream.
+
 ## Federation between rendezvous nodes
 
 With `--shakescape-mobile-rendezvous` or all four typed relay flags

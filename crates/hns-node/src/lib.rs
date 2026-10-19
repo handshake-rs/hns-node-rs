@@ -1567,6 +1567,8 @@ pub struct NodeConfig {
     pub network: Network,
     pub data_dir: Option<PathBuf>,
     pub rpc_bind: SocketAddr,
+    /// Separate loopback-only HTTP listener for read-only direct-offer snapshots.
+    pub shakescape_board_http_bind: Option<SocketAddr>,
     pub rpc_authorization: Option<RpcAuthorizationHeader>,
     pub rpc_limits: RpcLimits,
     pub log_filter: String,
@@ -1608,6 +1610,7 @@ impl Default for NodeConfig {
             network: Network::Mainnet,
             data_dir: None,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 12037)),
+            shakescape_board_http_bind: None,
             rpc_authorization: None,
             rpc_limits: RpcLimits::default(),
             log_filter: "info".to_owned(),
@@ -1686,6 +1689,19 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
+
+    if let Some(bind) = config.shakescape_board_http_bind {
+        if !bind.ip().is_loopback()
+            || bind.port() == 0
+            || bind == config.rpc_bind
+            || !config.native_sync.enabled
+            || !config
+                .shakescape_relay_roles
+                .contains(ShakescapeRelayKind::CrossChainMarket)
+        {
+            anyhow::bail!("Shakescape board HTTP requires a distinct nonzero loopback port, native sync, and the cross-chain relay role");
+        }
+    }
 
     let complete_shakescape_relay = [
         ShakescapeRelayKind::NameMarket,
@@ -23399,6 +23415,28 @@ mod tests {
                 .map(|bytes| decode_u64(&bytes).expect("decode")),
             Some(1)
         );
+    }
+
+    #[test]
+    fn public_board_listener_requires_loopback_and_cross_chain_relay() {
+        let mut config = NodeConfig {
+            network: Network::Regtest,
+            shakescape_board_http_bind: Some("127.0.0.1:12039".parse().unwrap()),
+            shakescape_relay_roles: ShakescapeRelayRoles::new(false, true, false, false, false),
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        assert!(validate_node_config(&config).is_ok());
+        config.shakescape_board_http_bind = Some("0.0.0.0:12039".parse().unwrap());
+        assert!(validate_node_config(&config).is_err());
+        config.shakescape_board_http_bind = Some(config.rpc_bind);
+        assert!(validate_node_config(&config).is_err());
+        config.shakescape_board_http_bind = Some("127.0.0.1:12039".parse().unwrap());
+        config.shakescape_relay_roles = ShakescapeRelayRoles::NONE;
+        assert!(validate_node_config(&config).is_err());
     }
 
     #[test]

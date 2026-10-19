@@ -17,8 +17,8 @@ default.
 
 ## Current compatibility
 
-- Node source line: `0.3.10`
-- Latest release: [`v0.3.10`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.10),
+- Node source line: `0.3.11`
+- Latest release: [`v0.3.11`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.11),
   with Linux ARM64 and AMD64, macOS Apple Silicon and Intel, and Windows x64
   native `hsrd` archives, an offline relinking source bundle, build provenance,
   and SHA-256 checksums

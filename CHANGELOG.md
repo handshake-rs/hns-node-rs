@@ -4,6 +4,16 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## 0.3.11 - 2026-10-19
+
+- Add an optional loopback-only, read-only HTTP snapshot of reachable signed
+  ShakeScape direct HNS/BTC offers for a separately hosted offer board. Keep
+  the existing node RPC listener and swap routing separate from this feed.
+- Continue accepting competing direct-offer responses until the publisher
+  countersigns a session, so a stalled first responder cannot reserve an offer.
+- Refresh the locked Tokio and serde_json dependencies used by the board HTTP
+  endpoint within their existing compatible version ranges.
+
 ## 0.3.10 - 2026-10-11
 
 - Open Windows storage directories with the directory-handle flag so native
