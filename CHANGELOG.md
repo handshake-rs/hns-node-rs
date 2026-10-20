@@ -4,6 +4,12 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## 0.3.12 - 2026-10-19
+
+- Accept a validated replay of a canonical active block whose raw body was
+  intentionally pruned, while still rejecting missing raw bodies for retained
+  blocks or records that do not match the canonical header and pruning checkpoint.
+
 ## 0.3.11 - 2026-10-19
 
 - Add an optional loopback-only, read-only HTTP snapshot of reachable signed
