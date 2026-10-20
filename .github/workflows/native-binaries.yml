@@ -206,13 +206,13 @@ jobs:
             printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
             image="ghcr.io/handshake-rs/hns-node-rs:canary-$RELEASE_TAG"
             if ! docker pull --platform linux/amd64 "$image"; then
-              image="ghcr.io/handshake-rs/hns-node-rs:$RELEASE_TAG"
+              image="ghcr.io/handshake-rs/hns-node-rs:$VERSION"
               docker pull --platform linux/amd64 "$image"
             fi
             container_id=$(docker create --platform linux/amd64 "$image")
             trap 'docker rm --force "$container_id" >/dev/null' EXIT
             test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
-            test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$RELEASE_TAG"
+            test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$VERSION"
             test "$(docker inspect "$container_id" --format '{{index .Config.Labels "org.opencontainers.image.source"}}')" = 'https://github.com/handshake-rs/hns-node-rs'
             docker inspect "$container_id" --format '{{.Image}}'
             docker cp "$container_id:/usr/local/bin/hsrd" ../native-bin/hsrd
