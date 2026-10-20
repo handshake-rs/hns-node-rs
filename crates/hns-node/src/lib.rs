@@ -11377,7 +11377,38 @@ impl NodeState {
         for (request, validated) in candidates {
             let block_hash = request.block.hash();
             if let Some(existing) = load_block_index_record(&staged, &block_hash)? {
-                let stored = load_block(&staged, &block_hash)?.ok_or_else(|| {
+                let stored = load_block(&staged, &block_hash)?;
+                if stored.is_none()
+                    && !existing.status.body_present
+                    && existing.status.active_chain
+                    && existing.height == request.height
+                    && existing.prev_hash == request.block.header.prev_block
+                    && existing.chainwork == validated.chainwork
+                    && usize::try_from(existing.tx_count).ok()
+                        == Some(request.block.transactions.len())
+                    && self
+                        .undo_retention_policy
+                        .is_some_and(|policy| existing.height > policy.prune_after_height)
+                    && load_undo_pruning_checkpoint(&staged)?.is_some_and(|checkpoint| {
+                        existing.height <= checkpoint.blocks_pruned_through
+                    })
+                    && read_canonical_hash(&staged, existing.height)? == Some(block_hash)
+                    && load_header_record(&staged, &block_hash)?.is_some_and(|header| {
+                        header.header == request.block.header
+                            && header.height == existing.height
+                            && header.chainwork == existing.chainwork
+                            && header.status == existing.status
+                    })
+                {
+                    // Pruned active blocks retain their validated index and
+                    // header, but intentionally have no raw body to compare.
+                    mutations.push(StoredBlockMutation {
+                        record: existing,
+                        already_known: true,
+                    });
+                    continue;
+                }
+                let stored = stored.ok_or_else(|| {
                     anyhow::anyhow!("known block {} has no raw body", block_hash.to_hex())
                 })?;
                 if stored.encode() != request.block.encode() {
@@ -20542,6 +20573,9 @@ mod tests {
 
         let mut records = connect_fixture_chain(&mut node, 195, Some(195));
         let snapshot = store.snapshot().expect("pre-prune snapshot");
+        let replayed_block = load_block(&snapshot, &records[195].hash)
+            .expect("load pre-prune block")
+            .expect("height-195 body is retained before pruning");
         let expired_pin = load_name_tree_snapshot_pins(&snapshot)
             .expect("pins")
             .into_iter()
@@ -20684,6 +20718,20 @@ mod tests {
             .header
             .tree_root;
         drop(snapshot);
+
+        let replay = NodeBlockImport::fixture(replayed_block, 195, 196);
+        let validated = node
+            .state()
+            .validate_import(&replay)
+            .expect("validate duplicate of pruned active block");
+        let known = node
+            .state_mut()
+            .store_validated_alternate(replay, validated)
+            .expect("pruned active duplicate is already known");
+        assert!(known.already_known);
+        assert_eq!(known.record.hash, records[195].hash);
+        assert!(!known.record.status.body_present);
+
         let unreachable = put_unreachable_name_node(&store, 0x73);
 
         node.config.undo_retention.prune_history = true;
@@ -20824,6 +20872,32 @@ mod tests {
 
         NodeState::from_store_for_network_with_undo_policy(store, Network::Regtest, Some(policy))
             .expect("pruned state reopens with the rejected alternate retained");
+    }
+
+    #[test]
+    fn missing_retained_known_block_body_is_rejected() {
+        let store = StoreHandle::memory();
+        let mut state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let block = block_with_commitments(vec![coinbase_transaction_with_address(62, 50)]);
+        let request = NodeBlockImport::fixture(block, 0, 1);
+        let hash = request.block.hash();
+        let validated = state.validate_import(&request).expect("validate block");
+        state
+            .store_validated_alternate(request.clone(), validated)
+            .expect("store body");
+
+        let mut batch = store.batch();
+        batch
+            .delete(ColumnFamily::Blocks, hash.as_bytes())
+            .expect("delete raw body");
+        store.commit(batch).expect("commit missing body fixture");
+
+        let validated = state.validate_import(&request).expect("validate duplicate");
+        let error = state
+            .store_validated_alternate(request, validated)
+            .expect_err("retained body absence is an error");
+        assert!(error.to_string().contains("has no raw body"), "{error}");
     }
 
     #[test]
