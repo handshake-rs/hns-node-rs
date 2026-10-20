@@ -4,6 +4,12 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## 0.3.13 - 2026-10-19
+
+- Publish Linux release binaries and container images with source-bound OCI
+  version and revision labels. Node consensus and ShakeScape behavior remain
+  the same as 0.3.12.
+
 ## 0.3.12 - 2026-10-19
 
 - Accept a validated replay of a canonical active block whose raw body was

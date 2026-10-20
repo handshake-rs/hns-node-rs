@@ -17,11 +17,10 @@ default.
 
 ## Current compatibility
 
-- Node source line: `0.3.12`
-- Latest release: [`v0.3.12`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.12),
-  with Linux ARM64 and AMD64, macOS Apple Silicon and Intel, and Windows x64
-  native `hsrd` archives, an offline relinking source bundle, build provenance,
-  and SHA-256 checksums
+- Node source line: `0.3.13`
+- Latest release: [`v0.3.13`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.13),
+  with Linux ARM64 and AMD64 native `hsrd` archives, an offline relinking source
+  bundle, build provenance, and SHA-256 checksums
 - Rust toolchain: `1.97.1`
 - Handshake protocol crates: exact `hns-rs 0.5.0`
 - ShakeScape Experimental V1 registry fingerprint:

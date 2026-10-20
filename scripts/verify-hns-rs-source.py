@@ -59,11 +59,11 @@ FUZZ_CLOSURE = {
     ('hns-transaction', '0.5.0'),
 }
 ROOT_LOCAL_NAME_COLLISIONS = {
-    "hns-mining": "0.3.12",
-    "hns-primitives": "0.3.12",
+    "hns-mining": "0.3.13",
+    "hns-primitives": "0.3.13",
 }
 FUZZ_LOCAL_NAME_COLLISIONS = {
-    "hns-primitives": "0.3.12",
+    "hns-primitives": "0.3.13",
 }
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 ALLOWED_PACKAGE_ALIASES = {
