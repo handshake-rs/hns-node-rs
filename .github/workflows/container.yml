@@ -746,6 +746,8 @@ jobs:
           images: ${{ matrix.registry_image }}
           labels: |
             org.opencontainers.image.source=https://github.com/handshake-rs/hns-node-rs
+            org.opencontainers.image.version=${{ needs.release-preflight.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.release-preflight.outputs.commit }}
 
       - name: Build and push platform image by digest
         id: build
@@ -769,10 +771,14 @@ jobs:
           COMPONENT: ${{ matrix.component }}
           PLATFORM_DIGEST: ${{ steps.build.outputs.digest }}
           REGISTRY_IMAGE: ${{ matrix.registry_image }}
+          RELEASE_COMMIT: ${{ needs.release-preflight.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.release-preflight.outputs.version }}
         run: |
           set -euo pipefail
           docker pull "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}"
           test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{.Architecture}}')" = "${{ matrix.suffix == 'amd64' && 'amd64' || 'arm64' }}"
+          test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$RELEASE_VERSION"
+          test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$RELEASE_COMMIT"
           docker run --rm "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --version
           if [[ "$COMPONENT" == hsrd ]]; then
             docker run --rm "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" \
