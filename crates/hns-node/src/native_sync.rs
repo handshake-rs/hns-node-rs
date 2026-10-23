@@ -6272,6 +6272,10 @@ async fn serve_shakescape_board_http(
             "/api/v1/shakescape/direct-offers",
             get(handle_shakescape_direct_offers),
         )
+        .route(
+            "/api/v1/shakescape/name-offers",
+            get(handle_shakescape_name_offers),
+        )
         .with_state(state)
         .layer(DefaultBodyLimit::max(0))
         .layer(middleware::from_fn_with_state(
@@ -6321,6 +6325,53 @@ async fn handle_shakescape_direct_offers(
                 "received_amount_base_units": offer.received_amount.get().to_string(),
                 "created_at": offer.header.created_at,
                 "expires_at": offer.header.expires_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "schema_version": 1,
+            "network": state.network.to_string(),
+            "revision": hex::encode(blake2b_256(&revision_bytes)),
+            "generated_at": now,
+            "expires_at": now.saturating_add(20),
+            "offers": rows,
+        })),
+    )
+        .into_response()
+}
+
+async fn handle_shakescape_name_offers(
+    State(state): State<ShakescapeBoardHttpState>,
+) -> impl IntoResponse {
+    let now = unix_time();
+    let offers = match state.relay.public_name_offers(now) {
+        Ok(offers) => offers,
+        Err(error) => {
+            tracing::warn!(%error, "Shakescape name-offer snapshot unavailable");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({ "status": "unavailable" })),
+            )
+                .into_response();
+        }
+    };
+    let mut revision_bytes = Vec::with_capacity(offers.len() * 32);
+    let rows = offers
+        .iter()
+        .map(|(listing_hash, listing)| {
+            revision_bytes.extend_from_slice(listing_hash);
+            serde_json::json!({
+                "offer_id": hex::encode(listing_hash),
+                "seller_public_key": hex::encode(listing.seller_public_key()),
+                "name": String::from_utf8_lossy(&listing.proof.name),
+                "price_base_units": listing.proof.price.get().to_string(),
+                "marketplace_fee_base_units": listing.proof.fee.get().to_string(),
+                "created_at": listing.created_at,
+                "expires_at": listing.expires_at,
             })
         })
         .collect::<Vec<_>>();

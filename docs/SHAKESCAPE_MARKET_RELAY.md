@@ -158,13 +158,14 @@ Set `PUBLIC_IP` to the actual public IPv4 address routed to the listener (or
 pass a bracketed public IPv6 socket directly). The advertised address is never
 inferred from the bind wildcard.
 
-## Read-only direct-offer HTTP snapshot
+## Read-only offer-board HTTP snapshots
 
 `--shakescape-board-http-bind 127.0.0.1:12039` optionally starts a separate
-loopback-only listener with one route:
+loopback-only listener with two routes:
 
 ```text
 GET /api/v1/shakescape/direct-offers
+GET /api/v1/shakescape/name-offers
 ```
 
 The flag requires native sync and the cross-chain relay role. It rejects a
@@ -178,9 +179,18 @@ check both the feed and each offer expiry. After a relay restart or owner
 disconnect, an offer does not reappear until an owner re-proves it. The wallet
 still re-fetches the exact signed offer before any acceptance.
 
+The name route returns at most 100 unexpired, uncancelled, signed fixed-price
+name listings from the existing name-market adapter, with listing ID, seller
+key, canonical name, HNS price and marketplace fee in base units, and creation
+and expiry times. It does not read a wallet index or expose the broad RPC.
+The snapshot is an advertisement; a buyer wallet must verify the current
+locked name coin against the signed HIP-0001 proof before purchase. It uses
+the same 20-second feed horizon and `no-store` response policy. An exact-path
+HTTPS proxy may expose both routes when the site runs on another host.
+
 For a same-machine site preview, point its server-side reader to
 `http://127.0.0.1:12039/api/v1/shakescape/direct-offers`. For a different
-host, publish only this path through a bounded HTTPS reverse proxy; keep the
+host, publish only the required board paths through a bounded HTTPS reverse proxy; keep the
 node RPC private. The ordinary ShakeScape P2P listener remains raw TCP and is
 not an HTTP upstream.
 

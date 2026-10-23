@@ -39,6 +39,8 @@ const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS: usize = 4_096;
 /// Maximum direct offers exposed by one public read-only board snapshot.
 pub const MAX_SHAKESCAPE_PUBLIC_DIRECT_OFFERS: usize = 100;
+/// Maximum signed name listings exposed by one public read-only board snapshot.
+pub const MAX_SHAKESCAPE_PUBLIC_NAME_OFFERS: usize = 100;
 const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS_PER_PEER: usize = 64;
 const MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS: usize = 1_024;
 const MAX_CROSS_CHAIN_CANDIDATES_PER_OFFER: usize = 32;
@@ -664,6 +666,47 @@ impl ShakescapeRelayHandle {
             .take(MAX_SHAKESCAPE_PUBLIC_DIRECT_OFFERS)
             .map(|record| record.offer.clone())
             .collect())
+    }
+
+    /// Return current signed name advertisements from the typed adapter.
+    /// This is discovery metadata: the buyer wallet must still verify the
+    /// listing against its current chain coin before preparing a purchase.
+    pub fn public_name_offers(
+        &self,
+        now: u64,
+    ) -> Result<Vec<([u8; 32], FixedPriceListing)>, ShakescapeRelayHandleError> {
+        let service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        let mut offers = Vec::new();
+        for record in service.name_market.records.values() {
+            let NameMarketRecordState::Active { listing } = &record.state else {
+                continue;
+            };
+            if listing.created_at > now || listing.expires_at <= now {
+                continue;
+            }
+            if listing.network().magic != service.name_market.network_magic
+                || listing.network().genesis.as_bytes() != &service.name_market.network_genesis
+                || !listing.proof.name.is_ascii()
+                || listing.verify().is_err()
+                || listing.listing_hash().map_err(|_| {
+                    ShakescapeRelayHandleError::NameMarket(
+                        "retained name listing identity is invalid",
+                    )
+                })? != record.listing_hash
+            {
+                return Err(ShakescapeRelayHandleError::NameMarket(
+                    "retained name listing is invalid",
+                ));
+            }
+            offers.push((record.listing_hash, listing.clone()));
+            if offers.len() == MAX_SHAKESCAPE_PUBLIC_NAME_OFFERS {
+                break;
+            }
+        }
+        Ok(offers)
     }
 
     /// Mark an incoming connection whose authenticated static key appears in
@@ -3819,5 +3862,39 @@ mod cross_chain_tests {
             service.name_market.records.get(&identity).unwrap().state,
             NameMarketRecordState::Cancelled { .. }
         ));
+    }
+
+    #[test]
+    fn public_name_snapshot_excludes_cancelled_and_expired_listings() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let listing = fixed_price_listing(1, NOW + 600);
+        let listing_hash = listing.listing_hash().unwrap();
+        {
+            let mut service = relay.inner.lock().unwrap();
+            admit_listing(&mut service, [1; 32], listing.clone(), 1, NOW).unwrap();
+        }
+        assert_eq!(
+            relay.public_name_offers(NOW).unwrap(),
+            vec![(listing_hash, listing.clone())]
+        );
+        assert!(relay.public_name_offers(NOW + 600).unwrap().is_empty());
+
+        let mut cancellation =
+            ListingCancellation::for_listing(&listing, NOW, NOW + 700, 2).unwrap();
+        cancellation
+            .sign(&SigningKey::from_slice(&[0x31; 32]).unwrap())
+            .unwrap();
+        {
+            let mut service = relay.inner.lock().unwrap();
+            admit_cancellation(&mut service, [1; 32], cancellation, 2, NOW).unwrap();
+        }
+        assert!(relay.public_name_offers(NOW).unwrap().is_empty());
     }
 }
