@@ -6,9 +6,12 @@ qualification or authorize deployment.
 
 ## Unreleased
 
+## 0.3.14 - 2026-10-24
+
+- Migrate exact protocol dependencies to hns-rs 0.5.1 and the ShakeScape
+  signer to k256 0.14, removing the affected crypto-bigint graph.
 - Expose bounded signed ShakeScape name listings through the optional read-only
-  board listener alongside direct HNS/BTC offers. This change is on `main` and
-  is not part of the v0.3.13 release.
+  board listener alongside direct HNS/BTC offers.
 - Correct current storage and rollout documentation for schema 21/profile
   `hsrd-rocks-fresh-v1` and the removal of `hsrd-storage-maintenance`.
 

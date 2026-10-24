@@ -13,6 +13,11 @@ on:
         default: all
         type: choice
         options: [all, linux, macos, windows]
+      candidate:
+        description: Build the Linux binary from the tag before publishing the release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -68,13 +73,15 @@ jobs:
             echo "Tag $RELEASE_TAG does not match workspace version $version." >&2
             exit 1
           fi
-          release_json=$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
-          jq -e --arg tag "$RELEASE_TAG" \
-            '.tag_name == $tag and .draft == false and (.published_at | type == "string")' \
-            <<< "$release_json" >/dev/null
+          if [[ '${{ inputs.candidate }}' != true ]]; then
+            release_json=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")
+            jq -e --arg tag "$RELEASE_TAG" \
+              '.tag_name == $tag and .draft == false and (.published_at | type == "string")' \
+              <<< "$release_json" >/dev/null
+          fi
           {
             echo "commit=$tag_commit"
             echo "tree=$tag_tree"
@@ -82,6 +89,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           matrix_json='{"include":[{"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04","source":"published-container","binary":"hsrd","group":"linux"},{"target":"aarch64-apple-darwin","runner":"macos-15","source":"cargo","binary":"hsrd","group":"macos"},{"target":"x86_64-apple-darwin","runner":"macos-15-intel","source":"cargo","binary":"hsrd","group":"macos"},{"target":"x86_64-pc-windows-msvc","runner":"windows-2025","source":"cargo","binary":"hsrd.exe","group":"windows"}]}'
           selected_group='${{ inputs.target_group }}'
+          if [[ '${{ inputs.candidate }}' == true ]]; then
+            test "$selected_group" = linux
+            matrix_json='{"include":[{"target":"x86_64-unknown-linux-gnu","runner":"ubuntu-24.04","source":"cargo","binary":"hsrd","group":"linux"}]}'
+          fi
           if [[ "$selected_group" != all ]]; then
             matrix_json=$(jq -c --arg group "$selected_group" \
               '{include: [.include[] | select(.group == $group)]}' <<< "$matrix_json")
@@ -231,7 +242,7 @@ jobs:
             fi
           } 2>&1 | tee ../native-logs/build.log
 
-      - name: Build with native Cargo on macOS and Windows
+      - name: Build with native Cargo
         if: matrix.source == 'cargo'
         id: native_build
         continue-on-error: true

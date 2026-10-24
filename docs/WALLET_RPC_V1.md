@@ -708,7 +708,7 @@ ordinal requires a separately designed storage migration, not a wire shortcut.
 
 The v1 boundary intentionally does not accept Shakedex or HNS-HTLC descriptor
 registrations. Those profiles are duplicated locally for derivative tracking.
-The workspace consumes exact crates.io `hns-rs` `=0.5.0` artifacts from
+The workspace consumes exact crates.io `hns-rs` `=0.5.1` artifacts from
 the published, non-yanked, provenance-verified 19-package cohort. The trusted
 registration adapter is still not installed or qualified. The
 API exposes only evidence for registrations already admitted through a trusted

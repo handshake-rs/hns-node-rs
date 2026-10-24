@@ -17,13 +17,13 @@ default.
 
 ## Current compatibility
 
-- Cargo source version: `0.3.13`; `main` also contains the unreleased
-  read-only name-offer board endpoint described in the [changelog](CHANGELOG.md)
-- Latest release: [`v0.3.13`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.13),
+- Cargo source version: `0.3.14`, including the read-only name-offer board
+  endpoint described in the [changelog](CHANGELOG.md)
+- Latest release: [`v0.3.14`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.14),
   with Linux ARM64 and AMD64 native `hsrd` archives, an offline relinking source
   bundle, build provenance, and SHA-256 checksums
 - Rust toolchain: `1.97.1`
-- Handshake protocol crates: exact `hns-rs 0.5.0`
+- Handshake protocol crates: exact `hns-rs 0.5.1`
 - ShakeScape Experimental V1 registry fingerprint:
   `04fce3f12b717c4254bb66ac07474a6c9f61bd2916efc18ebfc79df82a89a66b`
 - Ordinary public mainnet listener and rendezvous port: TCP `12038`

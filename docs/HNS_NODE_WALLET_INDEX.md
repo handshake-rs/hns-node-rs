@@ -504,7 +504,7 @@ canonical `encode_name_state` byte strings for both views. Projected
 adapter never reconstructs consensus bytes from projected fields. The wire exposes existing tracked-contract
 funding/spend classifications by opaque content ID only: it does not expose
 descriptor registration or raw revealed-preimage transport merely because
-exact crates.io `hns-rs` `=0.5.0` artifacts are pinned. The exact wire
+exact crates.io `hns-rs` `=0.5.1` artifacts are pinned. The exact wire
 contract is in
 [`WALLET_RPC_V1.md`](WALLET_RPC_V1.md).
 
@@ -669,7 +669,7 @@ never drops an internally retained revealed preimage.
 
 The separate Shakescape cache is connected to the active peer transport through
 the typed name-market and cross-chain node adapter. The workspace pins exact
-crates.io `hns-rs =0.5.0` artifacts containing the generated Shakescape V1
+crates.io `hns-rs =0.5.1` artifacts containing the generated Shakescape V1
 registry assignments and typed envelopes. Messages reach the adapter only after
 exact Shakescape V1 registry/network/genesis admission; no sibling path or
 unassigned message ID is permitted. Joined public multi-node/mobile canary

@@ -1,7 +1,7 @@
 # Docker and GHCR
 
 The repository's checked-in Compose file still defaults to the older v0.3.4
-canary images below. The latest documented node release is v0.3.13; use
+canary images below. The latest documented node release is v0.3.14; use
 reviewed release digests for a current deployment. Release workflows publish
 multi-platform OCI images for `linux/amd64` (x86_64) and `linux/arm64`
 (AArch64):
@@ -144,6 +144,10 @@ native amd64 and arm64 GitHub-hosted runners. Publishing occurs only for a
 published GitHub Release whose tag is valid semantic versioning. Before the
 GHCR release event proceeds, it verifies the uploaded hsrd binary archive,
 separate relinking/source archive, `SHA256SUMS`, and `BUILD-PROVENANCE.json`.
+To prepare the Linux x86 archive before that event, dispatch the Native hsrd
+binaries workflow for the exact tag with `target_group=linux` and
+`candidate=true`, review its build and storage-test artifact, and add the
+archive to the draft release alongside the Linux arm64 and source assets.
 Each native runner pushes an untagged platform image by digest; the final jobs
 create separate multi-platform node and resolver manifests and apply only the
 prerelease canary tag, or the stable version, minor-version, and `latest` tags,

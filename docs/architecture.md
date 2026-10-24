@@ -255,7 +255,7 @@ Ordinary VERSION/VERACK precedes the connection-local Shakescape Experimental V1
 registry exchange; typed HIP-76 `f0`/`f1` traffic is admitted only after that
 agreement and under separate requester/provider role policy. These extensions
 do not enter consensus or authority. The workspace pins exact crates.io
-`hns-rs` `=0.5.0` artifacts from the published, non-yanked,
+`hns-rs` `=0.5.1` artifacts from the published, non-yanked,
 provenance-verified 19-package cohort, while the active transport deliberately
 remains Shakescape V1.
 Marketplace roles stay locally bounded and wire-disabled until Shakescape V1

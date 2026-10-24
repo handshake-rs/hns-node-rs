@@ -47,7 +47,7 @@ zeroize.workspace = true
 [dev-dependencies]
 hns-chain = { path = "../hns-chain", features = ["test-fixtures"] }
 hns-covenants.workspace = true
-hns-transaction = { version = "=0.5.0" }
+hns-transaction = { version = "=0.5.1" }
 
 [[bin]]
 name = "hsrd"

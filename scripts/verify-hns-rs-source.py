@@ -14,56 +14,56 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-MANIFEST_SHA256 = "c6e25c64f4e18544264cce0c70ce1b67efdb1b9f2b8da00b12900acf9fbd8aa1"
+MANIFEST_SHA256 = "e2ba0228cb8aed0e5e377572e6d992bcd42944da068591819929a5650cdde5c4"
 DIRECT = {
-    "hns-covenants": "0.5.0",
-    "hns-dns-relay-protocol": "0.5.0",
-    "hns-hnsr-protocol": "0.5.0",
-    "hns-marketplace-protocol": "0.5.0",
-    "hns-odoh-protocol": "0.5.0",
-    "hns-p2p-experimental": "0.5.0",
-    "hns-rollback-journal": "0.5.0",
-    "hns-swap": "0.5.0",
+    "hns-covenants": "0.5.1",
+    "hns-dns-relay-protocol": "0.5.1",
+    "hns-hnsr-protocol": "0.5.1",
+    "hns-marketplace-protocol": "0.5.1",
+    "hns-odoh-protocol": "0.5.1",
+    "hns-p2p-experimental": "0.5.1",
+    "hns-rollback-journal": "0.5.1",
+    "hns-swap": "0.5.1",
 }
 ROOT_CLOSURE = {
-    ('hns-chat-protocol', '0.5.0'),
-    ('hns-covenants', '0.5.0'),
-    ('hns-dns-relay-protocol', '0.5.0'),
-    ('hns-encoding', '0.5.0'),
-    ('hns-hnsr-protocol', '0.5.0'),
-    ('hns-hrm', '0.5.0'),
-    ('hns-marketplace-protocol', '0.5.0'),
-    ('hns-odoh-protocol', '0.5.0'),
-    ('hns-p2p-experimental', '0.5.0'),
-    ('hns-primitives', '0.5.0'),
-    ('hns-rollback-journal', '0.5.0'),
-    ('hns-script', '0.5.0'),
-    ('hns-service-authority', '0.5.0'),
-    ('hns-swap', '0.5.0'),
-    ('hns-transaction', '0.5.0'),
+    ('hns-chat-protocol', '0.5.1'),
+    ('hns-covenants', '0.5.1'),
+    ('hns-dns-relay-protocol', '0.5.1'),
+    ('hns-encoding', '0.5.1'),
+    ('hns-hnsr-protocol', '0.5.1'),
+    ('hns-hrm', '0.5.1'),
+    ('hns-marketplace-protocol', '0.5.1'),
+    ('hns-odoh-protocol', '0.5.1'),
+    ('hns-p2p-experimental', '0.5.1'),
+    ('hns-primitives', '0.5.1'),
+    ('hns-rollback-journal', '0.5.1'),
+    ('hns-script', '0.5.1'),
+    ('hns-service-authority', '0.5.1'),
+    ('hns-swap', '0.5.1'),
+    ('hns-transaction', '0.5.1'),
 }
 FUZZ_CLOSURE = {
-    ('hns-chat-protocol', '0.5.0'),
-    ('hns-covenants', '0.5.0'),
-    ('hns-dns-relay-protocol', '0.5.0'),
-    ('hns-encoding', '0.5.0'),
-    ('hns-hnsr-protocol', '0.5.0'),
-    ('hns-hrm', '0.5.0'),
-    ('hns-marketplace-protocol', '0.5.0'),
-    ('hns-odoh-protocol', '0.5.0'),
-    ('hns-p2p-experimental', '0.5.0'),
-    ('hns-primitives', '0.5.0'),
-    ('hns-script', '0.5.0'),
-    ('hns-service-authority', '0.5.0'),
-    ('hns-swap', '0.5.0'),
-    ('hns-transaction', '0.5.0'),
+    ('hns-chat-protocol', '0.5.1'),
+    ('hns-covenants', '0.5.1'),
+    ('hns-dns-relay-protocol', '0.5.1'),
+    ('hns-encoding', '0.5.1'),
+    ('hns-hnsr-protocol', '0.5.1'),
+    ('hns-hrm', '0.5.1'),
+    ('hns-marketplace-protocol', '0.5.1'),
+    ('hns-odoh-protocol', '0.5.1'),
+    ('hns-p2p-experimental', '0.5.1'),
+    ('hns-primitives', '0.5.1'),
+    ('hns-script', '0.5.1'),
+    ('hns-service-authority', '0.5.1'),
+    ('hns-swap', '0.5.1'),
+    ('hns-transaction', '0.5.1'),
 }
 ROOT_LOCAL_NAME_COLLISIONS = {
-    "hns-mining": "0.3.13",
-    "hns-primitives": "0.3.13",
+    "hns-mining": "0.3.14",
+    "hns-primitives": "0.3.14",
 }
 FUZZ_LOCAL_NAME_COLLISIONS = {
-    "hns-primitives": "0.3.13",
+    "hns-primitives": "0.3.14",
 }
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 ALLOWED_PACKAGE_ALIASES = {
@@ -72,7 +72,7 @@ ALLOWED_PACKAGE_ALIASES = {
         ("workspace", "dependencies", "hns-protocol-primitives"),
     ): {
         "package": "hns-primitives",
-        "version": "=0.5.0",
+        "version": "=0.5.1",
     },
 }
 
@@ -132,7 +132,7 @@ def tracked_manifests() -> list[Path]:
 
 
 def published_checksums() -> dict[tuple[str, str], str]:
-    path = ROOT / "release/hns-rs-0.5.0-crates.sha256"
+    path = ROOT / "release/hns-rs-0.5.1-crates.sha256"
     try:
         raw = path.read_bytes()
     except OSError as error:

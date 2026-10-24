@@ -79,10 +79,7 @@ impl ShakescapeRelayAcceptanceSigner {
         let endpoint_private_key = Zeroizing::new(endpoint_private_key);
         let signing_key = SigningKey::from_bytes((&*endpoint_private_key).into())
             .map_err(|_| ShakescapeRelayAcceptanceSignerError::InvalidPrivateKey)?;
-        if signing_key
-            .verifying_key()
-            .to_encoded_point(true)
-            .as_bytes()
+        if signing_key.verifying_key().to_sec1_point(true).as_bytes()
             != policy.hnsa().endpoint_public_key
         {
             return Err(ShakescapeRelayAcceptanceSignerError::KeyMismatch);
@@ -2508,7 +2505,7 @@ mod cross_chain_tests {
         SigningKey::from_bytes((&secret).into())
             .unwrap()
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .unwrap()
@@ -2760,7 +2757,7 @@ mod cross_chain_tests {
 
     fn fixed_price_listing(sequence: u64, expires_at: u64) -> FixedPriceListing {
         let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
-        let seller_public_key = signing_key.verifying_key().to_encoded_point(true);
+        let seller_public_key = signing_key.verifying_key().to_sec1_point(true);
         let seller_public_key = seller_public_key
             .as_bytes()
             .try_into()
