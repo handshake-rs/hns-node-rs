@@ -17,7 +17,8 @@ default.
 
 ## Current compatibility
 
-- Node source line: `0.3.13`
+- Cargo source version: `0.3.13`; `main` also contains the unreleased
+  read-only name-offer board endpoint described in the [changelog](CHANGELOG.md)
 - Latest release: [`v0.3.13`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.13),
   with Linux ARM64 and AMD64 native `hsrd` archives, an offline relinking source
   bundle, build provenance, and SHA-256 checksums
@@ -46,11 +47,13 @@ cd hns-node-rs
 cargo build --locked --release -p hns-node --bin hsrd
 ```
 
-The binary is written to `target/release/hsrd`.
+With Cargo's default target directory, the binary is written to
+`target/release/hsrd`. A local Cargo `build.target-dir` setting changes that
+path; use `cargo metadata --format-version 1 --no-deps` to find it.
 
 ## Run a mainnet node
 
-The default storage profile is pruned. Outbound P2P, fixed-seed bootstrap,
+The default storage mode is pruned. Outbound P2P, fixed-seed bootstrap,
 learned-peer discovery, header synchronization, block acquisition, and active
 state validation are enabled by default.
 
@@ -169,9 +172,15 @@ current registry fingerprint. Regtest intentionally uses plaintext local P2P;
 it is a node/registry qualification test, not evidence for public Brontide or
 HNSR deployment.
 
-## Storage profiles
+## Storage modes and schema
 
-The default `pruned` profile retains consensus state and the rollback horizon
+The current on-disk schema is 21/profile `hsrd-rocks-fresh-v1`. The `pruned`
+and `archive` choices below are runtime storage modes. See the
+[storage rollout procedure](docs/storage-rollout.md) before using an existing
+data root with a new binary; most older schema/profile pairs require a fresh
+synchronized root.
+
+The default `pruned` mode retains consensus state and the rollback horizon
 while removing older raw block and undo payloads. It can synchronize and serve
 current peers without maintaining a global wallet history index.
 
@@ -186,7 +195,8 @@ data directory in archive mode:
 ```
 
 A directory that has already pruned history cannot later become a complete
-archive. See [`docs/storage-rollout.md`](docs/storage-rollout.md).
+archive. See [`docs/storage-schema.md`](docs/storage-schema.md) for the retained
+data contract.
 
 The node checks the predicted bytes required by individual storage operations.
 It does not impose an unrelated fixed 10 GB free-space cushion at ordinary
@@ -214,7 +224,9 @@ authorizes neither route. See:
 ## Other components
 
 The repository also contains `hns-resolverd`, a separately deployed bounded
-Handshake DNS resolver. It is not automatically exposed by `hsrd`:
+Handshake DNS resolver. It is not automatically exposed by `hsrd`. The
+checked-in Compose defaults still use v0.3.4 canary images; select reviewed
+image digests before using it as a current release deployment:
 
 ```sh
 docker compose up --detach

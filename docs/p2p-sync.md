@@ -422,8 +422,8 @@ not guess a peer attribution for delayed contextual failures.
 
 ## Restart and checkpoint semantics
 
-A versioned sync checkpoint (retained by schema 19/profile
-`hsrd-mining-v15`) contains:
+A versioned sync checkpoint (retained by the current schema 21/profile
+`hsrd-rocks-fresh-v1`) contains:
 
 - monotonically increasing sequence;
 - stage;

@@ -7,14 +7,21 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **19** and the storage profile is
-**`hsrd-mining-v15`**. Verify the exact schema/profile pair before opening a
-persistent data root. A mismatched or unsupported pair fails closed. Use the
-[current maintenance procedure](storage-rollout.md) and a verified complete
-fallback before any authorized conversion.
+The current persistent schema version is **21** and the storage profile is
+**`hsrd-rocks-fresh-v1`**. These values come from `SCHEMA_VERSION` and
+`STORAGE_PROFILE` in `crates/hns-store/src/lib.rs`; the runtime `pruned` and
+`archive` modes are separate choices. A mismatched or unsupported pair fails
+closed. Use the [current rollout procedure](storage-rollout.md) and a verified
+complete fallback before changing a persistent deployment.
 
-Version 19 contains the authority, state, native synchronization, and mining
-publication schema plus the optimized storage tiers:
+Schema 19/profile `hsrd-mining-v15` has a narrow marker and mixed wallet-index
+fallback transition in the store layer. That compatibility path does not
+perform a general physical-store migration or qualify the old chainstate for
+authority. Other older pairs require a fresh synchronized data root. Do not
+infer safe migration from a successful schema-marker write.
+
+The current layout contains authority, state, native synchronization, and
+mining publication records plus the optimized storage tiers:
 
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
@@ -35,11 +42,12 @@ publication schema plus the optimized storage tiers:
   authenticated 4 KiB record subpages, bounded path-local subpage reuse, and
   monotonic physical seals every 360 heights without changing consensus-root
   timing. Pruned mode rewrites the reachable union into a fresh generation
-  after sixteen sealed segments. Pages written by schema 18 remain readable in
-  place;
+  after sixteen sealed segments. Legacy name pages remain readable as a
+  fallback where their exact format is supported;
 - checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
-  compact locators and authoritative manifests; inline values remain
-  readable during migration;
+  compact locators and authoritative manifests. The store has a bounded
+  internal inline-value conversion API; the current node does not expose an
+  offline migration executable for it;
 - versioned, checksummed `name-tree-snapshot/v1/<height-be>` records written in
   the `snapshots` column family at each network name-tree interval; each value
   binds its active block hash and resulting root;
@@ -121,7 +129,7 @@ offline writer or detect replay of an older whole-database checkpoint. HRM,
 HNSA, or HNSR authority must remain disabled until the embedding also maintains
 and validates the required minimum revision in separately protected storage,
 with an explicit reset/recovery procedure. These additive optional records do
-not by themselves change schema 19 or storage profile `hsrd-mining-v15`; making
+not by themselves change schema 21 or storage profile `hsrd-rocks-fresh-v1`; making
 one mandatory is a later reviewed profile boundary.
 
 ## Backend and durability
@@ -133,16 +141,16 @@ one mandatory is a later reviewed profile boundary.
 - Required behavior: column families, atomic batches, true read snapshots,
   prefix iteration, bounded caches, explicit compaction policy, and crash
   recovery.
-- Point-oriented column families share one bounded 192 MiB LRU block cache.
+- Point-oriented column families share a bounded 768 MiB LRU block cache.
   The RocksDB `blocks` and `undo` families contain locator-sized values for new
-  data and retain a separate 32 MiB inline-value cache. Every column family uses a
-  10-bit full Bloom filter, cached high-priority index/filter blocks, and pinned
-  level-zero index/filter blocks. Bulk block/undo data blocks are 32 KiB.
+  data and use a separate 32 MiB archive-locator cache. Every column family
+  uses a 10-bit full Bloom filter, cached index/filter blocks, and pinned
+  level-zero index/filter blocks. Table data blocks are 16 KiB.
 - RocksDB receives four combined background flush/compaction jobs. This matches
   the current four-core canary host and lets flush/compaction use otherwise idle
   cores; deployment-scale stall, CPU-contention, and memory qualification remain
   required on other hardware profiles.
-- Aggregate WAL retention across all column families is capped at 256 MiB.
+- Aggregate WAL retention across all column families is capped at 1 GiB.
   RocksDB otherwise derives a multi-gigabyte allowance from the sum of every
   column family's write buffers, which amplified mainnet replay disk use.
 - Interval-boundary name-tree updates append only newly constructed records
@@ -674,15 +682,14 @@ exact source pair and a complete verified backup. Restart must truncate
 unpublished tails and retain a coherent committed root. Unsupported profiles
 require a fresh synchronized data root.
 
-The operator workflow is specified in
-[`storage-rollout.md`](storage-rollout.md). `hsrd-storage-maintenance backup`
-accepts each reviewed source profile and publishes a complete fallback marker
-only after the RocksDB checkpoint and independent external-file copies are
-synced. `inventory` validates every committed archive frame.
-`migrate-inline` converts inline block/undo values in bounded idempotent
-transactions. It advances through each hash prefix with the same exclusive
-record/byte-bounded cursor rather than materializing the prefix, and mixed
-inline/locator operation remains supported when disk headroom is insufficient.
+The current operator workflow is in
+[`storage-rollout.md`](storage-rollout.md). The former
+`hsrd-storage-maintenance` binary has been removed; its backup, inventory,
+compaction, and inline-migration commands are unavailable. The library still
+provides bounded archive inventory, scrub, and internal inline-value conversion
+APIs. Those APIs do not constitute an operator-qualified migration path. A
+complete stopped-state fallback must include RocksDB, name pages, and
+block/undo payload segments.
 
 ## Persistent Urkel status
 
@@ -755,13 +762,11 @@ and online catch-up use a 4 GiB threshold to amortize the rewrite; synchronized
 online maintenance returns to 256 MiB. New files are synced before one RocksDB
 batch publishes every replacement locator and both manifests.
 Recovery keeps the manifest-selected generation and removes either unpublished
-new files or superseded predecessors. The stopped-node
-`hsrd-storage-maintenance compact` command performs the same rewrite with full
-pre/post frame scrubs and a JSON reclamation report. It first performs a
-read-only, budget-checked plan. `compact --dry-run` reports the exact live,
-physical, reclaimable, and estimated atomic-locator bytes without creating a
-generation. Mutating compaction refuses to start below its configured reclaim
-threshold or above any record/byte budget.
+new files or superseded predecessors. The current node runs bounded online
+compaction through its canonical writer. The store library retains read-only,
+budget-checked planning and bounded scrub APIs, but no current standalone
+`compact` or `compact --dry-run` command exposes them to an operator. An
+external offline compaction campaign needs a newly qualified tool and evidence.
 
 Segment bytes are synced before RocksDB publication, but a write error does not
 prove that RocksDB rejected the batch. After any such ambiguous error the

@@ -77,10 +77,12 @@ provided user-service unit:
 ```sh
 cargo build --locked --release --manifest-path Cargo.toml \
   -p hns-node --bin hsrd
+node_target_dir="$(cargo metadata --format-version 1 --no-deps | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 install -d -m 700 "$HOME/.config/systemd/user" \
   "$HOME/.config/hsrd" "$HOME/.local/share/hsrd/mainnet-canary" \
   "$HOME/.local/libexec"
-install -m 755 target/release/hsrd "$HOME/.local/libexec/hsrd"
+install -m 755 "$node_target_dir/release/hsrd" "$HOME/.local/libexec/hsrd"
 install -m 600 deploy/meshmine-hsrd-mainnet-canary.service \
   "$HOME/.config/systemd/user/meshmine-hsrd-mainnet-canary.service"
 systemctl --user daemon-reload

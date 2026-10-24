@@ -8,6 +8,10 @@ local `.cargo/config.toml` with target directory
 `TMPDIR=/home/den/.cache/codex/hns-node-rs-audit/tmp`,
 `ROCKSDB_COMPILE=0`, `ROCKSDB_LIB_DIR` pointing to that prebuilt library, and
 `ROCKSDB_STATIC=1`. Do not compile bundled RocksDB on this host.
+Examples elsewhere that refer to `target/release` assume Cargo's default
+target directory. On this host, find the configured directory with
+`cargo metadata --format-version 1 --no-deps` and use its `target_directory`
+value followed by `/release`.
 
 ## Standalone gate
 

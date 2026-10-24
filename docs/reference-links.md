@@ -31,6 +31,6 @@
 - [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
 - [RustSec](https://rustsec.org/)
 
-Handshake P2P wire behavior is fixture-tested against hsd/hnsd. No DNS, UI,
-wallet, or broad web/RPC standards are product requirements for this mining
-node.
+Handshake P2P wire behavior is fixture-tested against hsd/hnsd. DNS resolver,
+wallet-index, and authenticated RPC interfaces in this repository have their
+own contracts; they do not change Handshake consensus or mining authority.

@@ -1,7 +1,10 @@
 # Docker and GHCR
 
-Each release publishes two multi-platform OCI images for `linux/amd64`
-(x86_64) and `linux/arm64` (AArch64):
+The repository's checked-in Compose file still defaults to the older v0.3.4
+canary images below. The latest documented node release is v0.3.13; use
+reviewed release digests for a current deployment. Release workflows publish
+multi-platform OCI images for `linux/amd64` (x86_64) and `linux/arm64`
+(AArch64):
 
 ```sh
 docker pull ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.4

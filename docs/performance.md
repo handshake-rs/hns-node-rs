@@ -358,25 +358,20 @@ This layout makes authenticated hashing and canonical record verification the
 dominant per-node work. It changes local storage metadata, not Urkel roots,
 proofs, name semantics, or reorganization atomicity.
 
-Schema 19/profile `hsrd-mining-v15` enables authenticated record subpages.
-Schema-18 pages remain readable without rewriting, and schema-17 current roots
-are bootstrapped into the current format before startup audit. That
-one-time conversion splits the upper tree into at most 4,096 deterministic
-subtrees, advances their post-order traversals together with RocksDB
-`MultiGet`s of at most 1,024 nodes, and writes each completed 64 KiB page
-immediately. It reads each reachable fallback record once and retains only a
-deduplication set, shallow traversal stacks, and one page buffer rather than a
-second all-record map and an all-page output graph. Old `NameTreeNodes` records
-remain a read-only fallback for historical retained roots. New block and undo
-payloads use the same fsync-before-publication rule with 256 MiB segment
-rotation and transparent locator resolution.
+The current schema 21/profile `hsrd-rocks-fresh-v1` uses authenticated record
+subpages. The store still contains legacy page readers and fallback node-record
+paths, but the current node does not perform the old schema-17/18 startup
+conversion. Older data roots require the [current rollout procedure](storage-rollout.md).
+New block and undo payloads use the same fsync-before-publication rule with
+256 MiB segment rotation and transparent locator resolution.
 
 Normal restart does not re-hash immutable historical block/undo segments.
 Recovery checks that every sealed file exists, removes unpublished future
 segments, and fully validates/truncates only the two bounded active tails.
 Individual historical reads still verify their frame checksum and key.
-`hsrd-storage-maintenance inventory` is the explicit offline O(archive) scrub
-when exhaustive media verification is required.
+The library exposes bounded archive inventory and scrub APIs; the former
+`hsrd-storage-maintenance inventory` operator command was removed. An
+exhaustive offline media campaign needs a separately qualified current tool.
 
 A matching atomic clean-shutdown checkpoint also avoids repeating consensus
 validation over every resident header and the complete block/header/height
@@ -395,8 +390,8 @@ live block/undo records into a new generation and atomically publishes all
 locators plus both manifests. Native sync repeats the due inspection every ten
 minutes, serialized through the sole canonical writer, so long-running IBD no
 longer retains physically dead frames until its next restart. Synchronized
-operation returns to 256 MiB. The offline
-`hsrd-storage-maintenance compact` variant adds exhaustive pre/post scrubs.
+operation returns to 256 MiB. The former offline `compact` command is no
+longer a current operator interface.
 
 Page-backed name state is compacted by retained-root union rather than by
 historical replay. Once native synchronization is caught up, sixteen physical
@@ -410,11 +405,11 @@ retained root locators atomically before old files are removed.
 
 ## Current RocksDB boundary
 
-Point-oriented column families share a bounded 192 MiB cache. New raw blocks
+Point-oriented column families share a bounded 768 MiB cache. New raw blocks
 and undo payloads bypass the LSM and place only compact locators in RocksDB;
-inline values retain a separate 32 MiB cache. Bloom filters, cached
-index/filter blocks, bounded WAL retention, and four background jobs constrain
-the remaining read and write amplification.
+archive locators use a separate 32 MiB cache. Bloom filters, cached
+index/filter blocks, a 1 GiB aggregate WAL limit, and four background jobs
+constrain the remaining read and write amplification.
 
 Name-tree compaction validates the complete retained-root union before deletion,
 performs a key-only preflight, and commits unreachable keys in 65,536-key

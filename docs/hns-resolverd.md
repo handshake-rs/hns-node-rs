@@ -61,6 +61,10 @@ cargo build --locked --release -p hns-node --bin hsrd
 cargo build --locked --release -p hns-resolver --bin hns-resolverd
 ```
 
+If Cargo has a configured target directory, use
+`cargo metadata --format-version 1 --no-deps` to locate its `target_directory` and run the
+binary from that directory's `release/` subdirectory.
+
 Start and synchronize `hsrd` first. Its existing JSON diagnostics expose sync
 progress; there is no HTML status page:
 
@@ -113,22 +117,24 @@ repeated; `--disable-icann-fallback` produces an HNS-only resolver.
 The compiled addresses come from InterNIC's
 [`named.root`](https://www.internic.net/domain/named.root), and the validation
 keys come from IANA's [DNSSEC trust-anchor publication](https://www.iana.org/dnssec/files).
-Release qualification must recheck both sources. Hickory 0.26.1 includes the
-active KSK-2017 and pre-published KSK-2024; IANA currently schedules the active
-rollover for October 11, 2026, so anchor rollover remains an explicit operator
-and dependency-update obligation rather than an assumption.
+Release qualification must recheck both sources. The locked Hickory 0.26.3
+resolver includes KSK-2017 and KSK-2024. [IANA reports](https://www.iana.org/news/2026/root-zone-begins-using-new-ksk-2026)
+that KSK-2024 began signing the root zone on October 11, 2026. Qualify live
+DNSSEC validation with the successor anchor and continue tracking later
+revocation and dependency updates.
 
 ## Docker and Pinner
 
-The release publishes the resolver separately from the node:
+The checked-in Compose stack currently pins the older v0.3.4 canary resolver
+image. It does not select the latest node release automatically:
 
 ```bash
 docker pull ghcr.io/handshake-rs/hns-resolverd:canary-v0.3.4
 ```
 
-The checked-in Compose stack is the preferred deployment. It shares the node's
-network namespace with the resolver, keeping hsrd RPC on loopback, and publishes
-DNS only on host loopback:
+After overriding both image variables with reviewed release digests, the
+checked-in Compose stack shares the node's network namespace with the
+resolver, keeps hsrd RPC on loopback, and publishes DNS only on host loopback:
 
 ```bash
 docker compose up --detach

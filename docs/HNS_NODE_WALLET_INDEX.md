@@ -258,7 +258,7 @@ Therefore:
   `pruned_trusted_node_projection`; that projection crosses a trusted-node
   boundary and is not a cryptographic binding of the `Coin` output bytes to
   the txid;
-- the archive storage profile is required for guaranteed historical raw
+- the archive storage mode is required for guaranteed historical raw
   transaction and owner-transaction retrieval;
 - reorganization remains limited by the node's retained undo horizon, exactly
   as active-state reorganization is.

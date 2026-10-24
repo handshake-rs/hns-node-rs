@@ -151,8 +151,8 @@ external name-page and block/undo segment paths must be writable only by the
 dedicated `hsrd` service identity and trusted, audited offline maintenance.
 Retain a reviewed record of numeric owners/groups, modes, ACLs,
 parent-directory and mount controls, every privileged writer (including
-OS/root, storage, backup, and hypervisor access), and the exact maintenance
-binaries and access window. The evidence directory must likewise have a
+OS/root, storage, backup, and hypervisor access), and the exact backup or
+maintenance tools and access window. The evidence directory must likewise have a
 documented writer and reviewer boundary.
 
 The release verifier authenticates supplied artifacts; it cannot reconstruct
@@ -186,9 +186,11 @@ SHA-256; and verify the recorded digest:
 umask 077
 install -d -m 0700 /ABS/private/hsrd-candidate
 artifact=/ABS/private/hsrd-candidate/hsrd-SOURCE_REVISION
+node_target_dir="$(cargo metadata --format-version 1 --no-deps | \
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 [[ ! -e "$artifact" && ! -L "$artifact" ]]
-install -m 0500 -- target/release/hsrd "$artifact"
-cmp --silent -- target/release/hsrd "$artifact"
+install -m 0500 -- "$node_target_dir/release/hsrd" "$artifact"
+cmp --silent -- "$node_target_dir/release/hsrd" "$artifact"
 sha256sum -- "$artifact" >"$artifact.sha256"
 sha256sum --check --strict "$artifact.sha256"
 ```
@@ -546,11 +548,14 @@ peak RSS,
 deployment configuration and raw artifacts because one universal hardware
 ceiling would be misleading.
 
-Collect the offline backup, inventory, compaction, restart, rollback, and state
-manifest outputs described in
-[`storage-rollout.md`](storage-rollout.md). Hash both inventories, state
-manifests, service logs, and fallback verification. A synthetic small database
-cannot satisfy this gate.
+Collect complete fallback, pre/post inventory, compaction, restart, rollback,
+and state-manifest evidence under the [current storage rollout](storage-rollout.md).
+The former `hsrd-storage-maintenance` CLI has been removed. The library's
+inventory and scrub APIs or a separately qualified external tool must produce
+the required evidence; an obsolete executable is not a substitute. If a
+current method cannot produce the required artifacts, this gate remains
+unqualified. Hash the inventories, state manifests, service logs, and fallback
+verification. A synthetic small database cannot satisfy this gate.
 
 This harness never deletes HSD block data. Any later HSD-data removal is a
 separate destructive operation and requires, before approval: an independently

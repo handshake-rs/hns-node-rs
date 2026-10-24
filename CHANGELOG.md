@@ -4,6 +4,14 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
+## Unreleased
+
+- Expose bounded signed ShakeScape name listings through the optional read-only
+  board listener alongside direct HNS/BTC offers. This change is on `main` and
+  is not part of the v0.3.13 release.
+- Correct current storage and rollout documentation for schema 21/profile
+  `hsrd-rocks-fresh-v1` and the removal of `hsrd-storage-maintenance`.
+
 ## 0.3.13 - 2026-10-19
 
 - Publish Linux release binaries and container images with source-bound OCI

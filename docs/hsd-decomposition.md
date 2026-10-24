@@ -42,7 +42,7 @@ update those values, but it may not approximate or omit them.
 | `lib/mempool/fees.js` | Historical fee estimation is optional. Exact entry fees and package rates used by template ordering are mandatory. |
 | `lib/net/bip152.js` | Retain exact compact-block negotiation, witness short IDs, differential indexes, bounded reconstruction/fallback, and recent-block serving. Full block relay remains the compatibility and failure fallback. |
 | `lib/workers/*` | Preserve bounded parallel stateless verification, but use native Rust worker pools and immutable inputs rather than porting the child-process protocol. |
-| `lib/blockchain/migrations.js`, `lib/migrations/*` | Implement explicit `hsrd` schema migrations and import tools. Do not inherit unrelated `hsd` product schema merely for compatibility. |
+| `lib/blockchain/migrations.js`, `lib/migrations/*` | Keep explicit `hsrd` schema/profile boundaries. The current node uses a fresh schema-21 store; any historical import or in-place migration needs its own qualified tool and recovery plan. Do not inherit unrelated `hsd` product schema merely for compatibility. |
 | `lib/node/fullnode.js` | Recompose only chain, store, minimal mempool, P2P/sync, mining, metrics, and bounded control. Its DNS, HTTP, and broad RPC components are separable constructors and are not mining dependencies. |
 | `lib/node/rpc.js`, `http.js` | Keep a small authenticated/local diagnostics, differential, and operator-control surface. Mining never traverses it. |
 
