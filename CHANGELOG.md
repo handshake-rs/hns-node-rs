@@ -6,6 +6,32 @@ qualification or authorize deployment.
 
 ## Unreleased
 
+- Update both workspace and fuzz lockfiles to `libz-sys 1.1.31` and
+  `zstd-sys 2.1.2+zstd.1.5.7`, addressing RUSTSEC-2026-0418 (build-script
+  environment disclosure) and RUSTSEC-2026-0410 (WebAssembly allocator
+  memory corruption). Replace the withdrawn `crypto-bigint 0.7.7` with
+  `0.7.9` in both lockfiles. Keep the RocksDB 10.4.2 dependency and storage
+  format.
+- Require schema 22/profile `hsrd-rocks-current-v2` and current storage record
+  encodings. Remove historical schema upgrades, mixed wallet-index fallbacks,
+  inline payload conversion, old name-page readers, and inferred registration
+  observations. Earlier data roots need a fresh synchronization; preserve each
+  prior root with its matching binary for recovery.
+- Store staged operation values and budget charges together, keep common keys
+  inline, and share immutable payloads across overlays, caches, checkpoints,
+  and deferred publication. Checkpoints retain one original per changed key;
+  reorganization admission includes those retained originals and journal space.
+  Account for two retained/source representations with measured 192-byte
+  operation framing and an explicit replacement peak. Reserve backend table
+  capacity before materialization and retain the fixed 256 MiB reorg ceiling.
+- Bound snapshot state/name caches by 16/32 MiB as well as entry count. Add
+  isolated allocator qualification for replay, checkpoint overwrites, cache
+  fills, and allocation-free shared reads.
+- Resume native sync across a stored fork by atomically connecting only the
+  first replacement prefix with strictly more work than the old active tip.
+  Replay its stored descendants in ordinary bounded slices, so an unrelated
+  catch-up backlog does not exhaust the fixed reorganization effect budget.
+
 ## 0.3.14 - 2026-10-24
 
 - Migrate exact protocol dependencies to hns-rs 0.5.1 and the ShakeScape

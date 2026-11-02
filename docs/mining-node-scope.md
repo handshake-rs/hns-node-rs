@@ -89,5 +89,5 @@ and authority from native validation. Production qualification requires:
 3. stable multi-peer native operation through restarts, partitions, and
    reorganizations, with bounded offline differential audits of retained data;
 4. successful candidate construction/validation and multi-path publication;
-5. a reviewed migration and fallback plan that does not create ambiguous fork
+5. a reviewed fresh-root rollout and recovery plan that does not create ambiguous fork
    choice.

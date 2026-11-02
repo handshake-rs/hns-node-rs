@@ -5449,10 +5449,14 @@ impl NodeService {
             }
         };
 
-        let Some(activation) = self.state.best_chain_activation_plan(
-            candidate_hash,
-            NodeReorgLimits::with_maximum_connect(maximum_connect),
-        )?
+        let snapshot = self.state.store.snapshot()?;
+        let Some(activation) =
+            NodeReadHandle::native_sync_best_chain_activation_plan_from_snapshot(
+                &snapshot,
+                &self.state.chain,
+                candidate_hash,
+                NodeReorgLimits::with_maximum_connect(maximum_connect),
+            )?
         else {
             return Ok(None);
         };
@@ -5778,7 +5782,7 @@ impl NodeReadHandle {
         {
             return Ok(None);
         }
-        let plan = match active.as_ref() {
+        let mut plan = match active.as_ref() {
             Some(tip) => headers
                 .plan_reorg_between_bounded(
                     &tip.hash,
@@ -5798,6 +5802,40 @@ impl NodeReadHandle {
             },
         };
         super::validate_reorg_plan(&snapshot, active.as_ref(), candidate, &plan)?;
+
+        // Only the fork replacement must share one atomic transaction. Once
+        // its cumulative work beats the old active tip, the stored descendants
+        // can use ordinary bounded direct replay. Including the entire backlog
+        // here can exhaust the fixed reorg effect budget on every startup even
+        // though the actual branch switch fits. Select from the validated path
+        // before enforcing the configured count or loading replacement bodies.
+        if let Some(active) = active.as_ref().filter(|_| !plan.disconnect.is_empty()) {
+            let mut replacement = None;
+            for (position, hash) in plan.connect.iter().enumerate() {
+                let record = load_block_index_record(&snapshot, hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("replacement block index {} is missing", hash.to_hex())
+                })?;
+                if record.chainwork > active.chainwork {
+                    replacement = Some((position + 1, record));
+                    break;
+                }
+            }
+            let (required_connect, tip) = replacement.ok_or_else(|| {
+                anyhow::anyhow!("stored replacement does not exceed the active tip's chainwork")
+            })?;
+            if required_connect < plan.connect.len() {
+                tracing::info!(
+                    disconnect_blocks = plan.disconnect.len(),
+                    connect_blocks = required_connect,
+                    deferred_connect_blocks = plan.connect.len() - required_connect,
+                    active_height = active.height,
+                    activation_height = tip.height,
+                    activation_hash = %tip.hash.to_hex(),
+                    "planning atomic stored-branch switch before direct catch-up"
+                );
+                plan.connect.truncate(required_connect);
+            }
+        }
         if plan.connect.len() > limits.maximum_connect {
             anyhow::bail!(
                 "active-state reorganization needs more than {} replacement blocks before exceeding the active tip",
@@ -12619,6 +12657,27 @@ mod tests {
                 super::super::MAX_REORG_STAGED_EFFECT_BYTES.saturating_add(1),
             ))
         );
+    }
+
+    #[test]
+    fn staged_effect_retry_recognizes_the_reported_nested_state_error() {
+        let limit = super::super::MAX_REORG_STAGED_EFFECT_BYTES;
+        let actual = limit + 317;
+        let error = anyhow::Error::new(super::super::StateConnectError(
+            hns_state::StateError::Store(StoreError::LimitExceeded {
+                context: ReorgStagedEffectMeter::CONTEXT,
+                limit,
+                actual,
+            }),
+        ))
+        .context("failed to connect stored block at height 351900")
+        .context("active-state connector failed without block-invalid evidence");
+        assert_eq!(reorg_staged_effect_limit(&error), Some((limit, actual)));
+        assert_eq!(
+            direct_staged_effect_retry(&error, false, 4),
+            Some((2, limit, actual))
+        );
+        assert_eq!(direct_staged_effect_retry(&error, true, 4), None);
     }
 
     #[test]

@@ -174,11 +174,12 @@ HNSR deployment.
 
 ## Storage modes and schema
 
-The current on-disk schema is 21/profile `hsrd-rocks-fresh-v1`. The `pruned`
+The current on-disk schema is 22/profile `hsrd-rocks-current-v2`. The `pruned`
 and `archive` choices below are runtime storage modes. See the
 [storage rollout procedure](docs/storage-rollout.md) before using an existing
-data root with a new binary; most older schema/profile pairs require a fresh
-synchronized root.
+data root with a new binary. Every older schema/profile pair, including schema
+21, is rejected and requires a fresh synchronized root. No automatic schema
+upgrade or historical record conversion is performed.
 
 The default `pruned` mode retains consensus state and the rollback horizon
 while removing older raw block and undo payloads. It can synchronize and serve

@@ -97,7 +97,7 @@ struct Cli {
     storage_durability: DurabilityPolicy,
 
     /// Maintain active-chain transaction-to-block history for diagnostics.
-    #[arg(long = "transaction-index", alias = "index-tx")]
+    #[arg(long = "transaction-index")]
     transaction_index: bool,
 
     /// Maintain active-chain history keyed by canonical output script.
@@ -166,10 +166,6 @@ struct Cli {
     /// archive retains complete history for historical peer serving.
     #[arg(long, value_enum, default_value_t = StorageMode::Pruned)]
     storage_mode: StorageMode,
-
-    /// Legacy spelling for `--storage-mode pruned`.
-    #[arg(long, hide = true)]
-    prune_undo_history: bool,
 
     /// Reaffirm the default native P2P, headers, block-body, and active-state synchronization.
     #[arg(long = "native-sync", action = ArgAction::SetTrue)]
@@ -361,9 +357,6 @@ struct Cli {
 
 impl Cli {
     fn into_config(self) -> anyhow::Result<NodeConfig> {
-        if self.prune_undo_history && self.storage_mode == StorageMode::Archive {
-            anyhow::bail!("--prune-undo-history conflicts with explicit --storage-mode archive");
-        }
         let native_sync = self.native_sync || !self.no_native_sync;
         let p2p_discovery = self.p2p_discovery || !self.no_p2p_discovery;
         let complete_shakescape_relay = self.shakescape_mobile_rendezvous
@@ -454,8 +447,7 @@ impl Cli {
                 startup_interval: self.name_tree_compaction_interval,
             },
             undo_retention: UndoRetentionConfig {
-                prune_history: self.prune_undo_history
-                    || self.storage_mode.prunes_payload_history(),
+                prune_history: self.storage_mode.prunes_payload_history(),
             },
             native_sync: NativeSyncConfig {
                 enabled: native_sync,
@@ -926,12 +918,8 @@ mod tests {
             .expect("archive config");
         assert!(!archive.undo_retention.prune_history);
 
-        let conflict =
-            Cli::try_parse_from(["hsrd", "--storage-mode", "archive", "--prune-undo-history"])
-                .expect("legacy conflict parses")
-                .into_config()
-                .expect_err("archive and legacy prune flag conflict");
-        assert!(conflict.to_string().contains("conflicts"));
+        assert!(Cli::try_parse_from(["hsrd", "--prune-undo-history"]).is_err());
+        assert!(Cli::try_parse_from(["hsrd", "--index-tx"]).is_err());
     }
 
     #[test]
@@ -1084,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_legacy_relay_flags_enable_federation_without_hnsr() {
+    fn complete_explicit_relay_flags_enable_federation_without_hnsr() {
         let config = Cli::try_parse_from([
             "hsrd",
             "--data-dir",

@@ -500,13 +500,14 @@ limits, and collection-read admission used by every wallet method also gate
 `incoming_transfers_page`. The exact response schema is in
 [`WALLET_RPC_V1.md`](WALLET_RPC_V1.md#incoming-transfer-discovery).
 
-Do not point a profile-v4 binary at this deployment's non-empty, wallet-enabled
-profile-v3 data directory. Normal startup deliberately rejects that unsafe
-upgrade because pruning may already have removed exact source inclusion data.
-Provision a fresh v4 data directory and resynchronize unless a later
-version-matched offline migration is separately qualified and reconstructs
-every active TRANSFER's canonical transaction ordinal and total output count
-from verified archive data.
+The current binary requires schema 22/profile `hsrd-rocks-current-v2` and wallet
+profile payload version 4. Every earlier storage/profile pair is rejected;
+there is no automatic upgrade or offline migration command. Provision a fresh
+data directory with the final wallet profile and resynchronize using the
+[current rollout procedure](storage-rollout.md). Preserve the existing root
+with its matching binary. Current TRANSFER evidence must bind every active
+TRANSFER's canonical transaction ordinal and total output count; startup never
+infers that evidence from a pruned UTXO set.
 
 ## Stop before maintenance or builds
 

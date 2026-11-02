@@ -13,7 +13,7 @@ use hns_state::{
     load_stored_name_tree_root, name_page_root_key, visit_name_tree_snapshot_pins_bounded,
     NamePageRootLocator, NamePageRootRecord, NamePageState, NamePageTreeReader,
     NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, StateError, TreeRoot, NAME_PAGE_STATE_KEY,
-    NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_BYTES, NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS,
+    NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_BYTES, NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_RECORDS,
     NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_BYTES, NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_RECORDS,
 };
 use hns_store::{
@@ -144,8 +144,8 @@ fn main() -> Result<()> {
     let pin_summary = visit_name_tree_snapshot_pins_bounded(
         &snapshot,
         NameTreeSnapshotPinScanLimits {
-            max_records: NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS,
-            max_bytes: NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_BYTES,
+            max_records: NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_RECORDS,
+            max_bytes: NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_BYTES,
             page_budget: PrefixScanBudget {
                 max_entries: NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_RECORDS,
                 max_bytes: NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_BYTES,
@@ -200,10 +200,6 @@ fn main() -> Result<()> {
                 .transpose()
                 .map_err(anyhow::Error::from)
         })
-        .transpose()?
-        .flatten();
-    let target_legacy_record = find_node
-        .map(|target| snapshot.get(ColumnFamily::NameTreeNodes, target.as_bytes()))
         .transpose()?
         .flatten();
     if let (Some(state), Some(record)) = (&page_state, &target_page_record) {
@@ -278,7 +274,6 @@ fn main() -> Result<()> {
                 "block_hash": pin.block_hash.to_hex(),
             })
         }).collect::<Vec<_>>(),
-        "find_node_legacy_record_present": target_legacy_record.is_some(),
         "find_node_page_root_record": target_page_record.as_ref().map(|record| serde_json::json!({
             "height": record.height,
             "generation": record.locator.generation,

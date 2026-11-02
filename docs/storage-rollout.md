@@ -1,30 +1,28 @@
-# Storage rollout, migration, and fallback
+# Current-format storage rollout and recovery
 
 This is the operational path for the current `hsrd` source tree. The on-disk
-schema is **21** with profile **`hsrd-rocks-fresh-v1`**. `pruned` and `archive`
+schema is **22** with profile **`hsrd-rocks-current-v2`**. `pruned` and `archive`
 are runtime storage modes, not schema profiles. The authoritative values are
 `SCHEMA_VERSION` and `STORAGE_PROFILE` in `crates/hns-store/src/lib.rs`.
 
-The former `hsrd-storage-maintenance` executable and its `backup`, `inventory`,
-`compact`, `migrate-inline`, `fence-inspect`, and `fence-clear` commands were
-removed. Do not use an older copy of this guide to operate a current data root.
-The current binaries are listed in `crates/hns-node/Cargo.toml`. The node still
-rejects a `.hsrd-storage-maintenance` marker at startup, but there is no
-current maintenance command that requires creating one.
+This is a breaking storage-format boundary. The node accepts only the current
+schema/profile pair and current record encodings. It has no historical schema
+upgrade, mixed wallet-index reader, inline payload converter, or old name-page
+reader. Existing schema 21 roots require a fresh synchronization into a distinct
+directory. Never change stored version markers to bypass this check.
 
 ## Compatibility boundary
 
 | Existing store | Current code behavior | Operational path |
 | --- | --- | --- |
-| Empty directory | Initializes schema 21 and the current profile. | Start with the final network, storage mode, and wallet-index profile. |
-| Schema 21 / `hsrd-rocks-fresh-v1` | Opens after identity, archive, and startup recovery checks. | Upgrade the binary with a complete fallback and verify the exact active tip and state. |
-| Schema 19 / `hsrd-mining-v15` | The store layer has a narrow marker and mixed-index fallback transition. It does not rebuild or qualify historical consensus state. | Keep the source unchanged and use a fresh synchronized data root unless this exact transition has separately passed full production qualification. |
-| Other schema/profile pairs or a nonempty unversioned store | Refused by schema initialization. | Use a fresh synchronized data root. Do not edit markers or copy selected column families. |
+| Empty directory | Initializes schema 22 and `hsrd-rocks-current-v2`. | Start with the final network, storage mode, and wallet-index profile. |
+| Schema 22 / `hsrd-rocks-current-v2` | Opens after identity, archive, and startup recovery checks. | Preserve a complete fallback and verify the exact active tip and state. |
+| Any other schema/profile pair, including schema 21, or a nonempty unversioned store | Refused before schema initialization changes any markers. | Preserve the existing root and synchronize a new one. Do not edit markers or copy selected column families. |
 
-The node's current storage path is intentionally fresh-first. A marker
-transition is not evidence that an older physical store is safe for authority.
-An in-place historical conversion needs its own implementation and qualification.
-See [storage schema](storage-schema.md) and [state parity](state-parity.md).
+A build of this source tree requires the schema 22 root described here.
+Historical Handshake consensus rules, retained undo, and canonical-chain
+validation remain required during the new synchronization. See
+[storage schema](storage-schema.md) and [state parity](state-parity.md).
 
 ## 1. Identify the candidate and preserve the source
 

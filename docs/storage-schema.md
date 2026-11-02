@@ -7,18 +7,20 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **21** and the storage profile is
-**`hsrd-rocks-fresh-v1`**. These values come from `SCHEMA_VERSION` and
+The current persistent schema version is **22** and the storage profile is
+**`hsrd-rocks-current-v2`**. These values come from `SCHEMA_VERSION` and
 `STORAGE_PROFILE` in `crates/hns-store/src/lib.rs`; the runtime `pruned` and
 `archive` modes are separate choices. A mismatched or unsupported pair fails
 closed. Use the [current rollout procedure](storage-rollout.md) and a verified
 complete fallback before changing a persistent deployment.
 
-Schema 19/profile `hsrd-mining-v15` has a narrow marker and mixed wallet-index
-fallback transition in the store layer. That compatibility path does not
-perform a general physical-store migration or qualify the old chainstate for
-authority. Other older pairs require a fresh synchronized data root. Do not
-infer safe migration from a successful schema-marker write.
+All earlier schema/profile pairs, including schema 21, are rejected. The store
+does not rewrite older version markers, repair old accumulator formats, read
+mixed wallet-index families, convert inline payloads, or accept previous name
+page and record encodings. A new binary needs a fresh synchronized data root;
+preserve the prior root with its matching binary for recovery. This boundary
+removes storage compatibility code without changing historical consensus rules
+or the retained undo needed for current reorganizations.
 
 The current layout contains authority, state, native synchronization, and
 mining publication records plus the optimized storage tiers:
@@ -42,12 +44,11 @@ mining publication records plus the optimized storage tiers:
   authenticated 4 KiB record subpages, bounded path-local subpage reuse, and
   monotonic physical seals every 360 heights without changing consensus-root
   timing. Pruned mode rewrites the reachable union into a fresh generation
-  after sixteen sealed segments. Legacy name pages remain readable as a
-  fallback where their exact format is supported;
+  after sixteen sealed segments. Only the current authenticated page format
+  is accepted;
 - checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
-  compact locators and authoritative manifests. The store has a bounded
-  internal inline-value conversion API; the current node does not expose an
-  offline migration executable for it;
+  compact locators and authoritative manifests; inline payload values are
+  rejected instead of interpreted or converted;
 - versioned, checksummed `name-tree-snapshot/v1/<height-be>` records written in
   the `snapshots` column family at each network name-tree interval; each value
   binds its active block hash and resulting root;
@@ -129,7 +130,7 @@ offline writer or detect replay of an older whole-database checkpoint. HRM,
 HNSA, or HNSR authority must remain disabled until the embedding also maintains
 and validates the required minimum revision in separately protected storage,
 with an explicit reset/recovery procedure. These additive optional records do
-not by themselves change schema 21 or storage profile `hsrd-rocks-fresh-v1`; making
+not by themselves change schema 22 or storage profile `hsrd-rocks-current-v2`; making
 one mandatory is a later reviewed profile boundary.
 
 ## Backend and durability
@@ -170,12 +171,34 @@ one mandatory is a later reviewed profile boundary.
   byte budget fails instead of bypassing the bound. Full `scan_prefix` remains
   only for callers whose domain is
   intrinsically bounded or explicit offline analysis.
-- One atomic activation snapshot has a 65,536-entry read-through cache,
+- One atomic activation snapshot has a read-through cache bounded by both
+  **65,536 entries and 16 MiB**,
   including misses, for immutable metadata, headers, height/block/transaction
-  indexes, UTXOs, name state, and snapshot records. A separate 131,072-entry
-  positive cache covers content-addressed name-tree nodes. Overlay
+  indexes, UTXOs, name state, and snapshot records. A separate positive cache
+  bounded by **131,072 entries and 32 MiB** covers content-addressed name-tree
+  nodes. Admission counts key bytes, retained value capacity, and 256 bytes of
+  allocation/table framing per entry, plus 512 bytes when a column family first
+  enters that cache. A value that exceeds the remaining
+  allowance is returned without retention; misses also consume entry/framing
+  allowance. Overlay
   writes/deletes always take precedence and both caches are discarded with that
   snapshot.
+- Each final staged mutation stores its admission charge beside its operation
+  and value. There is no parallel map retaining another copy of every key.
+  Keys through 36 bytes fit inline; longer keys share an immutable allocation.
+  Shared immutable value buffers survive overlay, checkpoint, cache, and batch
+  handoffs. Shared point and multi-get APIs avoid copying payloads on cache hits;
+  callers that request an owned `Vec` still pay for a copy when another owner
+  remains. Deferred publication consumes uniquely owned vectors without copying
+  their bytes.
+- A checkpoint retains only the original version of each changed key. Repeated
+  writes to that key release intermediate versions. Commit releases originals;
+  rollback restores the exact original operations and charges. Retained
+  originals and journal entries contribute to the admission budget separately
+  from the current staged values. The fixed reorganization ceiling remains
+  256 MiB; it is an effect budget, not a process RSS limit. Snapshot caches,
+  resident chain indexes, RocksDB caches, and caller-owned data have separate
+  lifetimes and bounds. See the allocation workload in [node qualification](testing.md).
 - Every block deduplicates its non-coinbase inputs and spendable output
   collision keys, resolves them with one snapshot-bound UTXO multi-get, and
   retains the decoded results in an outpoint hash map through validation and
@@ -190,6 +213,33 @@ one mandatory is a later reviewed profile boundary.
 
 `RocksSnapshot` owns an actual RocksDB snapshot at one sequence number. It is
 not a clone of the live database handle.
+
+### Reorganization ownership accounting
+
+One final operation reserves twice its key bytes, retained value capacity (or
+borrowed input length), and 192-byte operation framing. The two representations
+cover source encoding and retained shared/backend ownership. Checkpoint
+originals and their journal entries are separate; a journal entry reserves
+384 bytes plus key bytes and the original operation's charge. Repeated writes
+retain only the original checkpoint version, while transient replacement may
+also keep the current version alive until the insertion completes.
+
+For an accepted replacement, let `previous` be the current operation's charge,
+`next` the new operation charge, and `checkpoint_delta` the additional original
+and journal reservation. The projected retained total is
+`consumed - previous + next + checkpoint_delta`; the admission peak adds
+`previous.saturating_sub(checkpoint_delta)` so replacement cannot release its
+old reservation before allocation. Overflow saturates to rejection. A rejected
+write leaves the staged value, checkpoint journal, and retained total unchanged.
+Commit releases journal reservations; rollback restores the pre-checkpoint
+total. `staged_effect_bytes` reports the maximum admitted peak across the
+transaction, including temporary replacements, rather than only its final
+retained total. Name-page packing, publication, and archive transformation
+continue to charge their own additional representations before durable writes.
+The backend batch reserves its final table capacity before draining the overlay,
+so repeated backend resizing does not add a third table during that handoff.
+The [allocation qualification](staging-memory.md) records measured peaks and the
+short-key cases used to select the framing allowance.
 
 ## Block data management and asymptotic bounds
 
@@ -360,7 +410,7 @@ cannot promote a block or grant authority.
 - `block_index`: `block_hash -> BlockIndexRecord` including height, parent,
   chainwork, status, transaction count, and validation timestamp.
 - `blocks`: hash-addressed raw block records with source and integrity metadata.
-  New values are compact checksummed locators into append-only block segments;
+  Values are compact checksummed locators into append-only block segments;
   snapshots resolve and revalidate the frame transparently.
   Shadow-network downloads are retained as non-active records. A body whose
   authenticated commitments prove permanent invalidity is retained with a
@@ -372,10 +422,10 @@ cannot promote a block or grant authority.
 - `tx_index`: optional active-chain transaction lookup for historical
   diagnostics. The mining profile leaves it disabled by default; consensus,
   UTXO validation, block relay, reorganization, and template construction do
-  not read it. `--transaction-index` (alias `--index-tx`) opts in before the
+  not read it. `--transaction-index` opts in before the
   first indexed block. Enabling it after unindexed history exists fails closed
   until an offline rebuild or a new data directory is used.
-  Versioned `wallet-index/v1/` subspaces in the same column family optionally
+  Versioned `wallet-index/v1/` subspaces in the dedicated wallet families optionally
   store script history, outpoint spenders, script UTXOs, immutable public
   Shakedex/HTLC registrations and address bindings, monotonic confirmation
   records, active contract fundings, and confirmed contract events. Their keys cannot collide with fixed 32-byte
@@ -436,8 +486,9 @@ cannot promote a block or grant authority.
   Confirmed HTLC events retain raw revealed preimages in their internal durable
   representation, while public DTO serde is redacted and non-round-trippable.
   `wallet-index/v1/contract/observation/<contract-id>` stores a checksummed
-  lifecycle revision and `NeverConfirmed`, `Confirmed`, or fail-
-  closed `LegacyUnknown` state. `wallet-index/v1/contract/lifecycle-sequence`
+  lifecycle revision and `NeverConfirmed` or `Confirmed` state. A missing
+  observation for an existing registration is corruption and is never repaired
+  or inferred from current funding rows. `wallet-index/v1/contract/lifecycle-sequence`
   allocates revisions across serialized node registration and is retained
   across retirement. New
   registration writes `NeverConfirmed`; the first matching connected funding
@@ -484,12 +535,11 @@ cannot promote a block or grant authority.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.
-- `name_tree_nodes`: read-only migration/fallback records from profiles before
-  authenticated pages. Page-backed operation never adds LSM records. Fallback
-  compaction is disabled until every retained fallback root is explicitly
-  retired.
+- `name_tree_nodes`: the logical staging namespace for content-addressed name
+  nodes. Persistent node operation publishes these records to authenticated
+  pages; old LSM node records are not a root-resolution fallback.
 - `undo`: block UTXO/name/airdrop undo records, including pre-state and
-  post-state roots and reversible accumulator data. New values are compact
+  post-state roots and reversible accumulator data. Values are compact
   locators into append-only undo segments. With explicit undo retirement
   enabled, the HSD-protected prefix and newest per-network reorg window remain
   addressable while intervening locator records are deleted.
@@ -683,13 +733,11 @@ unpublished tails and retain a coherent committed root. Unsupported profiles
 require a fresh synchronized data root.
 
 The current operator workflow is in
-[`storage-rollout.md`](storage-rollout.md). The former
-`hsrd-storage-maintenance` binary has been removed; its backup, inventory,
-compaction, and inline-migration commands are unavailable. The library still
-provides bounded archive inventory, scrub, and internal inline-value conversion
-APIs. Those APIs do not constitute an operator-qualified migration path. A
-complete stopped-state fallback must include RocksDB, name pages, and
-block/undo payload segments.
+[`storage-rollout.md`](storage-rollout.md). The node performs bounded online
+compaction. The library provides bounded archive inventory and scrub APIs;
+there is no historical-format migration API or standalone storage-maintenance
+executable. A complete stopped-state fallback must include RocksDB, name pages,
+and block/undo payload segments.
 
 ## Persistent Urkel status
 
@@ -746,8 +794,7 @@ matching interval pin, and advances the checksummed `undo-pruning/v1`
 checkpoint in the same batch.
 
 Checkpoint version 2 records independent block and undo frontiers, hashes, and
-counts. Version 1 undo-only checkpoints decode without mutation and drive a
-bounded raw-block backfill that never rereads historical payload bytes.
+counts. Older checkpoint encodings are rejected.
 Startup validates the protected prefix, retired band, retained suffix,
 canonical checkpoint bindings, root continuity, and the absence/presence of
 interval pins on the retired/retained sides; missed retirements are caught up

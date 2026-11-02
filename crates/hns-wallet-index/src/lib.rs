@@ -62,9 +62,6 @@ pub const MAX_QUERY_ENTRIES: usize = PREFIX_SCAN_MAX_ENTRIES;
 /// Maximum aggregate key/value bytes in one wallet-index page.
 pub const MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
 
-const ORIGINAL_PROFILE_VERSION: u8 = 1;
-const LIFECYCLE_PROFILE_VERSION: u8 = 2;
-const COMPLETED_RETIREMENT_PROFILE_VERSION: u8 = 3;
 /// Current wallet-index profile version. Version four adds confirmed
 /// TRANSFER-recipient indexing and compact source-inclusion evidence.
 pub const PROFILE_VERSION: u8 = 4;
@@ -153,19 +150,17 @@ pub fn encode_index_profile(profile: WalletIndexProfile) -> [u8; PROFILE_BYTES] 
 /// Decode and validate a persistent profile record.
 pub fn decode_index_profile(raw: &[u8]) -> Result<WalletIndexProfile, IndexError> {
     if raw.len() != PROFILE_BYTES
-        || !matches!(
-            raw.first().copied(),
-            Some(ORIGINAL_PROFILE_VERSION)
-                | Some(LIFECYCLE_PROFILE_VERSION)
-                | Some(COMPLETED_RETIREMENT_PROFILE_VERSION)
-                | Some(PROFILE_VERSION)
-        )
         || raw
             .get(1)
             .is_none_or(|flags| flags & !PROFILE_KNOWN_FLAGS != 0)
         || raw.get(2..) != Some(blake2b_256(&raw[..2]).as_slice())
     {
         return Err(IndexError::Corrupt("invalid wallet-index profile record"));
+    }
+    if raw[0] != PROFILE_VERSION {
+        return Err(IndexError::Corrupt(
+            "unsupported wallet-index profile version; a clean reindex is required",
+        ));
     }
     let flags = raw[1];
     Ok(WalletIndexProfile {
@@ -175,24 +170,6 @@ pub fn decode_index_profile(raw: &[u8]) -> Result<WalletIndexProfile, IndexError
     })
 }
 
-/// Decode and return the downgrade-fencing profile version.
-pub fn index_profile_version(raw: &[u8]) -> Result<u8, IndexError> {
-    let _ = decode_index_profile(raw)?;
-    raw.first()
-        .copied()
-        .ok_or(IndexError::Corrupt("invalid wallet-index profile record"))
-}
-
-/// Whether a valid persistent profile carries the current downgrade-fencing
-/// version. Versions one through three remain readable for diagnosis and safe
-/// initialization of profiles that did not enable the wallet component. A
-/// non-empty wallet-enabled legacy profile must not be upgraded by normal
-/// startup because it lacks v4 TRANSFER-recipient/source evidence.
-pub fn index_profile_is_current(raw: &[u8]) -> Result<bool, IndexError> {
-    Ok(index_profile_version(raw)? == PROFILE_VERSION)
-}
-
-/// Stable content identity for the canonical Handshake output address script.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ScriptId([u8; 32]);
 
@@ -577,9 +554,6 @@ pub enum IndexError {
     /// A matching funding has already been confirmed for this registration.
     #[error("wallet tracked-contract registration has confirmed funding history")]
     ContractConfirmed,
-    /// This legacy registration predates authoritative monotonic confirmation state.
-    #[error("wallet tracked-contract confirmation history is unknown")]
-    ContractConfirmationUnknown,
     /// The caller prepared retirement for another registration lifecycle.
     #[error("wallet tracked-contract lifecycle changed from {expected} to {actual}")]
     StaleContractLifecycle { expected: u64, actual: u64 },
@@ -1608,25 +1582,18 @@ mod tests {
         };
         let current = encode_index_profile(profile);
         assert_eq!(current[0], PROFILE_VERSION);
-        assert!(index_profile_is_current(&current).expect("current profile"));
+        assert_eq!(
+            decode_index_profile(&current).expect("current profile"),
+            profile
+        );
 
-        for prior_version in [
-            ORIGINAL_PROFILE_VERSION,
-            LIFECYCLE_PROFILE_VERSION,
-            COMPLETED_RETIREMENT_PROFILE_VERSION,
-        ] {
-            let mut legacy = current;
-            legacy[0] = prior_version;
-            let legacy_checksum = blake2b_256(&legacy[..2]);
-            legacy[2..].copy_from_slice(&legacy_checksum);
-            assert_eq!(
-                decode_index_profile(&legacy).expect("legacy profile"),
-                profile
-            );
-            assert!(!index_profile_is_current(&legacy).expect("legacy version"));
-            assert_eq!(
-                index_profile_version(&legacy).expect("legacy version number"),
-                prior_version
+        for prior_version in 1..PROFILE_VERSION {
+            let mut obsolete = current;
+            obsolete[0] = prior_version;
+            let checksum = blake2b_256(&obsolete[..2]);
+            obsolete[2..].copy_from_slice(&checksum);
+            assert!(
+                matches!(decode_index_profile(&obsolete), Err(IndexError::Corrupt(message)) if message.contains("unsupported"))
             );
         }
 

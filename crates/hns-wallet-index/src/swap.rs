@@ -372,9 +372,6 @@ pub struct ContractRollbackBoundary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ContractObservationState {
-    // Existing v1 registrations predate authoritative observation state. They
-    // remain readable but can never be treated as never confirmed.
-    LegacyUnknown,
     NeverConfirmed,
     Confirmed,
 }
@@ -778,17 +775,9 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
                 "tracked contract registration address binding mismatch",
             ));
         }
-        if load_observation(snapshot, registration.id)?.is_none() {
-            let lifecycle_revision = next_lifecycle_revision(snapshot, batch)?;
-            put_observation(
-                batch,
-                ContractObservationRecord {
-                    contract_id: registration.id,
-                    lifecycle_revision,
-                    state: ContractObservationState::LegacyUnknown,
-                },
-            )?;
-        }
+        load_observation(snapshot, registration.id)?.ok_or(IndexError::Corrupt(
+            "tracked contract registration has no observation record",
+        ))?;
         return Ok(ContractRegistrationOutcome::AlreadyRegistered);
     }
 
@@ -885,7 +874,7 @@ pub fn tracked_contract_lifecycle_revision<S: ReadSnapshot>(
 /// matching funding and no retained transaction orphans, and durably abandon
 /// every broadcast/rebroadcast source for this descriptor. A previously evicted
 /// transaction can otherwise confirm after deletion without being tracked.
-/// Confirmed funding/event prefixes are checked again here. Legacy registrations
+/// Confirmed funding/event prefixes are checked again here. Registrations
 /// without an authoritative confirmation record fail closed.
 pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     snapshot: &S,
@@ -943,8 +932,9 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         ));
     }
 
-    let observation = load_observation(snapshot, registration.id)?
-        .ok_or(IndexError::ContractConfirmationUnknown)?;
+    let observation = load_observation(snapshot, registration.id)?.ok_or(IndexError::Corrupt(
+        "tracked contract registration has no observation record",
+    ))?;
     if observation.lifecycle_revision != expected_lifecycle_revision {
         return Err(IndexError::StaleContractLifecycle {
             expected: expected_lifecycle_revision,
@@ -953,9 +943,6 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     }
     match observation.state {
         ContractObservationState::NeverConfirmed => {}
-        ContractObservationState::LegacyUnknown => {
-            return Err(IndexError::ContractConfirmationUnknown);
-        }
         ContractObservationState::Confirmed => return Err(IndexError::ContractConfirmed),
     }
     if prefix_has_entry(snapshot, &funding_prefix(registration.id))?
@@ -1076,8 +1063,9 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
             "completed retirement terms disagree with registration",
         ));
     }
-    let observation = load_observation(snapshot, registration.id)?
-        .ok_or(IndexError::ContractConfirmationUnknown)?;
+    let observation = load_observation(snapshot, registration.id)?.ok_or(IndexError::Corrupt(
+        "tracked contract registration has no observation record",
+    ))?;
     if observation.lifecycle_revision != expected_lifecycle_revision {
         return Err(IndexError::StaleContractLifecycle {
             expected: expected_lifecycle_revision,
@@ -1257,7 +1245,9 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
                 "tracked contract registration address binding mismatch",
             ));
         }
-        let _ = load_observation(snapshot, registration.id)?;
+        load_observation(snapshot, registration.id)?.ok_or(IndexError::Corrupt(
+            "tracked contract registration has no observation record",
+        ))?;
         Ok(())
     })?;
     let mut binding_total = 0_u32;
@@ -2431,14 +2421,13 @@ fn mark_contract_confirmed<S: ReadSnapshot, B: WriteBatch>(
     batch: &mut B,
     id: ContractId,
 ) -> Result<(), IndexError> {
-    let existing = load_observation(snapshot, id)?;
-    if existing.is_some_and(|record| record.state == ContractObservationState::Confirmed) {
+    let existing = load_observation(snapshot, id)?.ok_or(IndexError::Corrupt(
+        "tracked contract registration has no observation record",
+    ))?;
+    if existing.state == ContractObservationState::Confirmed {
         return Ok(());
     }
-    let lifecycle_revision = match existing {
-        Some(record) => record.lifecycle_revision,
-        None => next_lifecycle_revision(snapshot, batch)?,
-    };
+    let lifecycle_revision = existing.lifecycle_revision;
     put_observation(
         batch,
         ContractObservationRecord {
@@ -3728,7 +3717,7 @@ mod tests {
     }
 
     #[test]
-    fn never_confirmed_contract_retirement_never_forgets_confirmation_or_legacy_uncertainty() {
+    fn contract_retirement_preserves_confirmation_and_rejects_missing_observation() {
         let store = MemoryStore::new();
         let registration = htlc([0x32; 32]);
         let snapshot = store.snapshot().expect("registration snapshot");
@@ -3831,29 +3820,20 @@ mod tests {
             .expect("legacy state removal commit");
 
         let snapshot = store.snapshot().expect("legacy snapshot");
-        validate_tracked_contract_registry(&snapshot, profile())
-            .expect("legacy registry remains readable");
+        assert!(matches!(
+            validate_tracked_contract_registry(&snapshot, profile()),
+            Err(IndexError::Corrupt(message)) if message.contains("no observation")
+        ));
         let mut retire = store.batch();
         assert!(matches!(
-            retire_never_confirmed_tracked_contract(&snapshot, &mut retire, profile(), &legacy, 0,),
-            Err(IndexError::ContractConfirmationUnknown)
+            retire_never_confirmed_tracked_contract(&snapshot, &mut retire, profile(), &legacy, 0),
+            Err(IndexError::Corrupt(message)) if message.contains("no observation")
         ));
-        let mut migrate = store.batch();
-        assert_eq!(
-            register_tracked_contract(&snapshot, &mut migrate, profile(), &legacy)
-                .expect("legacy idempotent registration"),
-            ContractRegistrationOutcome::AlreadyRegistered
-        );
-        drop(snapshot);
-        store.commit(migrate).expect("legacy marker commit");
-        let snapshot = store.snapshot().expect("marked legacy snapshot");
-        assert_eq!(
-            load_observation(&snapshot, legacy.id)
-                .expect("legacy observation read")
-                .expect("legacy observation")
-                .state,
-            ContractObservationState::LegacyUnknown
-        );
+        let mut register = store.batch();
+        assert!(matches!(
+            register_tracked_contract(&snapshot, &mut register, profile(), &legacy),
+            Err(IndexError::Corrupt(message)) if message.contains("no observation")
+        ));
     }
 
     #[test]

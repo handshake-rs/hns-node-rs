@@ -66,6 +66,45 @@ funding/spend detection, retirement fences, and tracked-state recovery. Check
 both pruned and archive profiles and reject unsupported profile combinations.
 The exact contract is in [wallet indexes](HNS_NODE_WALLET_INDEX.md).
 
+Qualify current-format rejection as well as successful reads. Any prior
+schema/profile must fail before version markers change. Current codecs must
+reject old undo, pruning-checkpoint, wallet-profile, and name-page encodings;
+missing page root locators and registration observations must fail instead of
+activating historical fallbacks. Use an empty data root for schema 22 startup
+and retain an earlier-format root only with its matching binary.
+
+The isolated allocation harness exercises the actual overlay, checkpoint, and
+snapshot-cache implementations:
+
+```bash
+cargo test --locked --release -j 1 -p hns-store --test staging_allocations
+cargo test --locked --release -j 1 -p hns-store --test staging_allocations -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The ordinary tests require zero allocation calls for 4,096 shared overlay/cache
+hits and for repeated 96-byte accounting-key lookups in both backend batches;
+they also check that staging preserves the input allocation. The explicit
+profile reports allocation calls, cumulative requested bytes, and peak live
+requested bytes for 16,384 UTXO mutations, repeated same-key 64 KiB checkpoint
+overwrites with both commit and rollback, and large state/name cache fills.
+An additional current-only profile replaces one key 128 times without a
+checkpoint, alternates input sizes, and repeats the sequence with shared vectors
+whose retained capacity is 1 MiB. It verifies bounded peak ownership and
+capacity-aware diagnostics independently of serialized length.
+A materialization profile fills 14,337 short-key rows, one beyond the previous
+hash-table capacity, with empty and 32-byte values. It compares measured peak
+allocations to candidate framing allowances; reserving the backend table before
+draining the overlay avoids repeated backend growth while both tables coexist.
+Every workload must release all measured allocations. Input buffers live
+during submission so checkpoint peaks include their overlap. The probe is
+thread-local and exists only in this integration-test executable. These numbers
+exclude allocator overhead/fragmentation, native RocksDB allocations, resident
+chain data, and OS page cache; they do not establish a total RSS ceiling or
+mainnet production qualification.
+The recorded before/after results, framing evidence, and artifact identities are
+in [staging allocation qualification](staging-memory.md).
+
 ## Synchronization, relay, and mining
 
 Test bounded framing, Brontide authentication, peer discovery, stalled or closed

@@ -929,7 +929,7 @@ fn reserve_memory_namespace_epoch(
     let mut changes = BatchOperations::new();
     changes.insert(
         StoreKey::new(ColumnFamily::Meta, &control_key(namespace)),
-        Some(next_control.encode(namespace)),
+        Some(next_control.encode(namespace)).into(),
     );
     apply_memory_changes(&mut state, changes)?;
     Ok(token)
@@ -977,11 +977,11 @@ fn compare_exchange_memory_namespace(
     let mut changes = BatchOperations::new();
     changes.insert(
         StoreKey::new(ColumnFamily::Meta, &control_key(namespace)),
-        Some(control.encode(namespace)),
+        Some(control.encode(namespace)).into(),
     );
     changes.insert(
         StoreKey::new(ColumnFamily::Snapshots, &state_key(namespace)),
-        Some(proposed.to_vec()),
+        Some(proposed.to_vec()).into(),
     );
     apply_memory_changes(&mut state, changes)?;
     Ok(outcome)
@@ -1095,7 +1095,7 @@ fn reserve_rocks_namespace_epoch(
     let mut changes = BatchOperations::new();
     changes.insert(
         StoreKey::new(ColumnFamily::Meta, &control_key(namespace)),
-        Some(next_control.encode(namespace)),
+        Some(next_control.encode(namespace)).into(),
     );
     store.commit_operations_locked(changes)?;
     Ok(token)
@@ -1139,11 +1139,11 @@ fn compare_exchange_rocks_namespace(
     let mut changes = BatchOperations::new();
     changes.insert(
         StoreKey::new(ColumnFamily::Meta, &control_key(namespace)),
-        Some(control.encode(namespace)),
+        Some(control.encode(namespace)).into(),
     );
     changes.insert(
         StoreKey::new(ColumnFamily::Snapshots, &state_key(namespace)),
-        Some(proposed.to_vec()),
+        Some(proposed.to_vec()).into(),
     );
     store.commit_operations_locked(changes)?;
     Ok(outcome)
@@ -1509,7 +1509,7 @@ mod tests {
         let mut changes = BatchOperations::new();
         changes.insert(
             StoreKey::new(ColumnFamily::Snapshots, &state_key(key)),
-            Some(b"orphan".to_vec()),
+            Some(b"orphan".to_vec()).into(),
         );
         apply_memory_changes(&mut state, changes).expect("inject orphan state");
         drop(state);
@@ -1528,7 +1528,7 @@ mod tests {
         let mut operations = BatchOperations::new();
         operations.insert(
             StoreKey::new(ColumnFamily::Meta, &control_key(key)),
-            Some(b"bypass".to_vec()),
+            Some(b"bypass".to_vec()).into(),
         );
         let batch = crate::MemoryBatch {
             operations,
@@ -1559,7 +1559,7 @@ mod tests {
         let mut changes = BatchOperations::new();
         changes.insert(
             StoreKey::new(ColumnFamily::Meta, &control_key(stale_key)),
-            Some(NamespaceControl::uninitialized(2).encode(stale_key)),
+            Some(NamespaceControl::uninitialized(2).encode(stale_key)).into(),
         );
         apply_memory_changes(&mut state, changes).expect("inject newer durable fence");
         drop(state);
@@ -1583,7 +1583,7 @@ mod tests {
         let mut changes = BatchOperations::new();
         changes.insert(
             StoreKey::new(ColumnFamily::Meta, &control_key(exhausted_key)),
-            Some(NamespaceControl::uninitialized(u64::MAX).encode(exhausted_key)),
+            Some(NamespaceControl::uninitialized(u64::MAX).encode(exhausted_key)).into(),
         );
         apply_memory_changes(&mut state, changes).expect("inject exhausted durable fence");
         drop(state);

@@ -7,6 +7,8 @@
 //! in HSRD's authenticated sequential segment archive, so they never churn
 //! through LSM levels.
 
+use crate::{AccountedWriteBatch, BatchOperation, SharedBytes};
+
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -234,9 +236,9 @@ impl RocksStore {
             return Ok(());
         }
         let mut batch = rocksdb::WriteBatch::default();
-        for (key, value) in operations {
+        for (key, operation) in operations {
             let family = self.cf(key.family)?;
-            match value {
+            match operation.value {
                 Some(value) => batch.put_cf(family, key.key, value),
                 None => batch.delete_cf(family, key.key),
             }
@@ -411,26 +413,74 @@ impl RocksBatch {
 }
 
 impl WriteBatch for RocksBatch {
+    fn reserve_operations(&mut self, additional: usize) {
+        self.operations.reserve(additional);
+    }
+
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.put_shared_accounted(family, key, SharedBytes::from(value), 0)
+    }
+    fn put_shared(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+    ) -> Result<(), StoreError> {
+        self.put_shared_accounted(family, key, value, 0)
+    }
+    fn put_shared_accounted(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+        charge: u64,
+    ) -> Result<(), StoreError> {
         crate::authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
             StoreKey::new(family, key),
-            Some(value.to_vec()),
+            BatchOperation::new(Some(value), charge),
         );
         Ok(())
     }
-
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
+        self.delete_with_charge(family, key, 0)
+    }
+    fn delete_with_charge(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        charge: u64,
+    ) -> Result<(), StoreError> {
         crate::authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
             StoreKey::new(family, key),
-            None,
+            BatchOperation::new(None, charge),
         );
         Ok(())
+    }
+}
+impl AccountedWriteBatch for RocksBatch {
+    fn operation_charge(&self, family: ColumnFamily, key: &[u8]) -> u64 {
+        crate::batch_data::get_batch_operation(&self.operations, family, key)
+            .map_or(0, |operation| operation.charge)
+    }
+    fn checkpoint_retained_charge(&self) -> u64 {
+        self.checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.retained_charge)
+    }
+    fn checkpoint_replacement_charge(&self, family: ColumnFamily, key: &[u8]) -> u64 {
+        if self.checkpoint.is_none() {
+            return 0;
+        }
+        crate::batch_data::checkpoint_entry_charge(
+            key,
+            crate::batch_data::get_batch_operation(&self.operations, family, key),
+        )
     }
 }
 
@@ -440,7 +490,7 @@ impl CheckpointWriteBatch for RocksBatch {
     }
 
     fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
-        commit_batch_checkpoint(&mut self.checkpoint)
+        commit_batch_checkpoint(&mut self.operations, &mut self.checkpoint)
     }
 
     fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {

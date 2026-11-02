@@ -54,7 +54,12 @@ atomic-effect budget. These timings describe completed slices and do not time
 an activation that fails terminally before publication.
 `active_state_last_staged_effect_bytes` and
 `active_state_last_staged_effect_limit` report the busiest committed atomic
-publication in a slice. `active_state_last_staged_effect_blocks` reports its
+publication in a slice. The byte count is that transaction's maximum admitted
+ownership/effect peak, including checkpoint originals and temporary operation
+replacement, even when the final retained batch is smaller. It does not include
+the independently bounded snapshot caches or represent process RSS. The exact
+charge model is in [storage schema](storage-schema.md#reorganization-ownership-accounting).
+`active_state_last_staged_effect_blocks` reports its
 block count, even when a slice has two atomic publications. The batch tuner
 waits for four full slices before growing and requires the busiest publication
 to use at most 60% of its budget; a 50% growth step then projects to at most
@@ -344,8 +349,7 @@ The implemented layout is an append-only, generation-based Urkel record store:
    Current pages read one 4 KiB index and only selected 4 KiB record subpages. A mutation Patricia frontier then reconstructs and hashes
    every final shared path once rather than once per key. Exhaustive
    page-backed startup validation uses a bounded 65,536-root window so a
-   mainnet tree needs hundreds of page plans rather than tens of thousands;
-   Validation of fallback node records keeps its conservative 1,024-key window.
+   mainnet tree needs hundreds of page plans rather than tens of thousands.
 5. For a state transaction, append and sync segment data before committing the
    RocksDB root locator and chain-state batch. A crash before the batch leaves
    an unreachable tail; a committed locator can never reference unsynced data.
@@ -358,11 +362,11 @@ This layout makes authenticated hashing and canonical record verification the
 dominant per-node work. It changes local storage metadata, not Urkel roots,
 proofs, name semantics, or reorganization atomicity.
 
-The current schema 21/profile `hsrd-rocks-fresh-v1` uses authenticated record
-subpages. The store still contains legacy page readers and fallback node-record
-paths, but the current node does not perform the old schema-17/18 startup
-conversion. Older data roots require the [current rollout procedure](storage-rollout.md).
-New block and undo payloads use the same fsync-before-publication rule with
+The current schema 22/profile `hsrd-rocks-current-v2` uses authenticated record
+subpages and current record encodings only. Earlier page formats, LSM node
+fallbacks, and startup schema conversions are removed. Older data roots require
+a fresh synchronization using the [current rollout procedure](storage-rollout.md).
+Block and undo payloads use the same fsync-before-publication rule with
 256 MiB segment rotation and transparent locator resolution.
 
 Normal restart does not re-hash immutable historical block/undo segments.
@@ -432,7 +436,7 @@ Optimization is accepted only with:
 - sustained phase/backlog measurements on persistent mainnet storage;
 - template-to-job, candidate-validation, local-connect, and first-peer
   publication latency distributions;
-- reproducible builds and a reviewed migration and fallback procedure;
+- reproducible builds and a reviewed fresh-root rollout and recovery procedure;
 - a passing `run-production-assurance.sh release` bundle for the exact commit
   and Git tree. Harness availability or an unavailable measurement is not a
   passing record.

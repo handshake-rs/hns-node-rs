@@ -55,11 +55,8 @@ const NAME_PAGE_READ_AHEAD_FILES_PER_WORKER: usize = 2;
 // staging allowance.
 const NAME_PAGE_PATH_RECORD_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
-const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
-const LEGACY_NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
-const LEGACY_NAME_PAGE_STATE_BYTES: usize = LEGACY_NAME_PAGE_STATE_BODY_BYTES + 32;
 const NAME_PAGE_STATE_BODY_BYTES: usize =
-    LEGACY_NAME_PAGE_STATE_BODY_BYTES + 1 + std::mem::size_of::<u32>();
+    4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4 + 1 + std::mem::size_of::<u32>();
 const NAME_PAGE_STATE_BYTES: usize = NAME_PAGE_STATE_BODY_BYTES + 32;
 pub const NAME_PAGE_STATE_KEY: &[u8] = b"name-page-state/v1";
 pub const NAME_PAGE_SEGMENT_BLOCKS: u32 = 360;
@@ -141,7 +138,7 @@ pub struct NamePageStreamLimits {
     pub max_frontier: u64,
     pub max_known_addresses: u64,
     /// Bytes that must remain available after every fixed-size page append.
-    /// A zero value is reserved for tests and compatibility callers; online
+    /// A zero value is reserved for tests and explicit callers; online
     /// production generation uses the node's exact filesystem reserve.
     pub minimum_filesystem_reserve_bytes: u64,
     pub deadline: Instant,
@@ -549,9 +546,9 @@ impl NamePageState {
     }
 
     pub fn decode(raw: &[u8]) -> Result<Self, PageTreeError> {
-        if raw.len() != NAME_PAGE_STATE_BYTES && raw.len() != LEGACY_NAME_PAGE_STATE_BYTES {
+        if raw.len() != NAME_PAGE_STATE_BYTES {
             return Err(PageTreeError::StateCodec(format!(
-                "name-page state contains {} bytes; expected {NAME_PAGE_STATE_BYTES} or {LEGACY_NAME_PAGE_STATE_BYTES}",
+                "name-page state contains {} bytes; expected {NAME_PAGE_STATE_BYTES}",
                 raw.len()
             )));
         }
@@ -567,7 +564,7 @@ impl NamePageState {
         let version = reader
             .read_u32()
             .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
-        if version != NAME_PAGE_STATE_VERSION && version != LEGACY_NAME_PAGE_STATE_VERSION {
+        if version != NAME_PAGE_STATE_VERSION {
             return Err(PageTreeError::StateCodec(format!(
                 "unsupported name-page state version {version}"
             )));
@@ -641,9 +638,7 @@ impl NamePageState {
                 )))
             }
         };
-        let last_sealed_height = if version == LEGACY_NAME_PAGE_STATE_VERSION {
-            None
-        } else {
+        let last_sealed_height = {
             match reader
                 .read_u8()
                 .map_err(|error| PageTreeError::StateCodec(error.to_string()))?
@@ -2410,7 +2405,7 @@ fn validation_cache_index(key: u64) -> usize {
 /// store. The exact historical address index is backed by an immediately
 /// unlinked seek/read/write file during validation, so unclean startup stays
 /// bounded by the page table rather than anonymous memory or swap. Only
-/// explicitly published durable roots remain in the short legacy-overlay
+/// explicitly published durable roots remain in the short staging overlay
 /// summary.
 #[derive(Debug)]
 pub struct NamePageValidation {
@@ -2433,24 +2428,11 @@ impl NamePageValidation {
 pub struct NamePageSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
     pages: &'a NamePageTreeReader,
-    fallback_legacy_nodes: bool,
 }
 
 impl<'a, S: ReadSnapshot> NamePageSnapshot<'a, S> {
     pub const fn new(base: &'a S, pages: &'a NamePageTreeReader) -> Self {
-        Self {
-            base,
-            pages,
-            fallback_legacy_nodes: false,
-        }
-    }
-
-    pub const fn with_legacy_fallback(base: &'a S, pages: &'a NamePageTreeReader) -> Self {
-        Self {
-            base,
-            pages,
-            fallback_legacy_nodes: true,
-        }
+        Self { base, pages }
     }
 }
 
@@ -2471,7 +2453,6 @@ impl<S: ReadSnapshot> ReadSnapshot for NamePageSnapshot<'_, S> {
             .map_err(|error| StoreError::Backend(error.to_string()))?
         {
             Some(raw) => Ok(Some(raw)),
-            None if self.fallback_legacy_nodes => self.base.get(family, key),
             None => Ok(None),
         }
     }
@@ -2496,35 +2477,37 @@ impl<S: ReadSnapshot> ReadSnapshot for NamePageSnapshot<'_, S> {
                 Ok(TreeRoot::new(root))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        let mut loaded = self
-            .pages
+        self.pages
             .load_many(&roots)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        if !self.fallback_legacy_nodes {
-            return Ok(loaded);
-        }
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
 
-        let missing = loaded
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| value.is_none().then_some((index, keys[index])))
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Ok(loaded);
+    fn get_shared(
+        &self,
+        family: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<hns_store::SharedBytes>, StoreError> {
+        if family != ColumnFamily::NameTreeNodes {
+            return self.base.get_shared(family, key);
         }
-        let missing_keys = missing.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-        let legacy = self.base.get_many(family, &missing_keys)?;
-        if legacy.len() != missing.len() {
-            return Err(StoreError::Backend(format!(
-                "legacy name-tree multi-get returned {} records for {} keys",
-                legacy.len(),
-                missing.len()
-            )));
+        self.get(family, key)
+            .map(|value| value.map(hns_store::SharedBytes::from))
+    }
+
+    fn get_many_shared(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<hns_store::SharedBytes>>, StoreError> {
+        if family != ColumnFamily::NameTreeNodes {
+            return self.base.get_many_shared(family, keys);
         }
-        for ((index, _), value) in missing.into_iter().zip(legacy) {
-            loaded[index] = value;
-        }
-        Ok(loaded)
+        self.get_many(family, keys).map(|values| {
+            values
+                .into_iter()
+                .map(|value| value.map(hns_store::SharedBytes::from))
+                .collect()
+        })
     }
 
     fn scan_prefix(
@@ -4860,7 +4843,7 @@ impl PageTreeError {
 mod tests {
     use super::*;
     use hns_primitives::NameHash;
-    use hns_store::{encode_name_page, MemoryStore, Store, WriteBatch};
+    use hns_store::{encode_name_subpage_page, MemoryStore, Store, WriteBatch};
     use hns_urkel::{
         prove_hsd_from_records, update_record_tree, validate_record_tree, MemoryUrkel,
     };
@@ -5188,7 +5171,7 @@ mod tests {
     }
 
     #[test]
-    fn name_page_state_round_trips_seals_and_decodes_legacy_state() {
+    fn name_page_state_round_trips_seals_and_rejects_obsolete_state() {
         let state = NamePageState {
             manifest: SegmentManifest {
                 generation: 7,
@@ -5206,14 +5189,16 @@ mod tests {
             state
         );
 
-        let mut legacy_body = encoded[..LEGACY_NAME_PAGE_STATE_BODY_BYTES].to_vec();
-        legacy_body[..4].copy_from_slice(&LEGACY_NAME_PAGE_STATE_VERSION.to_le_bytes());
-        let mut legacy = legacy_body.clone();
-        legacy.extend_from_slice(&blake2b_256(&legacy_body));
-        let decoded = NamePageState::decode(&legacy).expect("decode legacy state");
-        assert_eq!(decoded.last_sealed_height, None);
-        assert_eq!(decoded.committed_height, state.committed_height);
-        assert_eq!(decoded.manifest, state.manifest);
+        let mut obsolete = encoded.clone();
+        obsolete[..4].copy_from_slice(&1u32.to_le_bytes());
+        let body_bytes = obsolete.len() - 32;
+        let checksum = blake2b_256(&obsolete[..body_bytes]);
+        obsolete[body_bytes..].copy_from_slice(&checksum);
+        assert!(matches!(
+            NamePageState::decode(&obsolete),
+            Err(PageTreeError::StateCodec(message)) if message.contains("unsupported")
+        ));
+        assert!(NamePageState::decode(&encoded[..encoded.len() - 5]).is_err());
     }
 
     #[test]
@@ -5724,7 +5709,7 @@ mod tests {
         };
         let leaf_address = NamePageAddress::new(0, 0, 0).expect("leaf address");
         let root_address = NamePageAddress::new(0, 0, 2).expect("root address");
-        let invalid_page = encode_name_page(&[
+        let invalid_page = encode_name_subpage_page(&[
             NamePageRecord {
                 key: *left.as_bytes(),
                 children: Vec::new(),

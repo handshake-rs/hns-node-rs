@@ -81,7 +81,7 @@ directory to its built components. Startup fails closed when:
 - a requested component was not built for existing active-chain history;
 - a requested profile would remove a component from non-empty indexed history;
 - wallet-index keys exist without a profile record;
-- a checksummed profile is corrupt;
+- a checksummed profile is corrupt or uses any payload version other than 4;
 - `--wallet-index` would implicitly enable a transaction index after unindexed
   history already exists.
 - a complete wallet profile does not bind version-4 TRANSFER-recipient and
@@ -93,27 +93,24 @@ history, spender, and wallet capabilities are immutable in both directions.
 Startup accepts redundant raw flags with the same effective capabilities, but
 it neither stops writes to a built component nor enables an unbuilt one. This
 prevents a failed startup or a partially indexed interval from stranding an
-otherwise complete index. Use a new data directory or a separately qualified
-offline reindex to change capabilities.
+otherwise complete index. Use a new data directory with the final profile and
+resynchronize to change capabilities.
 
-There is no in-place backfill during normal startup. For an existing data
-directory, use one of these explicit procedures:
-
-1. create a new data directory with the final profile and resynchronize; or
-2. use a version-matched offline reindex tool once that tool is qualified for
-   the exact `hsrd` storage schema.
+There is no in-place backfill, historical-profile conversion, or offline reindex
+command. The node supports only the current storage schema/profile and current
+wallet record encodings.
 
 Do not copy `tx_index` keys between data directories. The active-chain binding,
 network identity, store schema, and profile record must move as one qualified
 backup. Complete TRANSFER evidence requires exact canonical transaction
 ordinals and source-output counts. An active UTXO alone cannot reconstruct
 those facts. Use a fresh synchronized data root when the persisted profile
-cannot prove completeness; any offline reindex must be separately qualified
-against the exact storage schema and verified canonical archive inputs.
+cannot prove completeness. Wallet rows live in the dedicated `wallet_history`
+and `wallet_state` families; there are no mixed-layout fallback reads from
+`tx_index`.
 
-Contract tracking does not require an index-profile migration for a store that
-already has `--wallet-index`: it adds versioned derivative keys under that
-existing profile. Registrations are immutable and must be committed through
+Contract tracking uses versioned derivative keys under the current
+`--wallet-index` profile. Registrations are immutable and must be committed through
 `register_tracked_contract` before funding is broadcast. Registration after a
 funding confirmation does not backfill history; rescan/reindex or a
 new funding outpoint is required.
@@ -187,9 +184,9 @@ abandonment decision: the wallet must durably cancel every related broadcast/
 rebroadcast intent and accept that a later matching confirmation will not be
 tracked under the removed descriptor.
 
-Existing registrations that predate the monotonic record are marked
-`LegacyUnknown` on an idempotent registration write and fail closed for this
-retirement. A distinct typed completed-retirement operation handles only a
+An existing registration without its monotonic observation record is corrupt.
+Startup, registration, confirmation, and retirement reject it; they do not
+invent a previous lifecycle state. A distinct typed completed-retirement operation handles only a
 currently fully spent `Confirmed` lifecycle. It walks the complete bounded,
 ordered event history, rejects duplicate funding outpoints, proves every
 funding has one exact spend, requires no active funding, and refuses any event

@@ -48,12 +48,8 @@ use hns_primitives::{
     MAX_SCRIPT_STACK, MAX_TX_SIZE, MIN_ADDRESS_HASH_SIZE,
 };
 use hns_store::{
-    decode_u32, encode_u32, ColumnFamily, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
-    Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES, INTERVAL_SCHEMA_VERSION,
-    INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE,
-    MIXED_INDEX_SCHEMA_VERSION, MIXED_INDEX_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION,
-    PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, STAGED_STATE_POINT_READ_CACHE_LIMIT,
-    STORAGE_PROFILE,
+    ColumnFamily, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot, Store, StoreError,
+    WriteBatch, AIRDROP_FIELD_BYTES, STAGED_STATE_POINT_READ_CACHE_LIMIT,
 };
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
@@ -66,37 +62,8 @@ use hns_urkel::{
 use serde::{Deserialize, Serialize};
 
 const BLOCK_UNDO_VERSION: u32 = 7;
-const LEGACY_BLOCK_UNDO_VERSION: u32 = 6;
 const NAME_TREE_ACCUMULATOR_VERSION: u32 = 1;
 pub const NAME_TREE_ACCUMULATOR_KEY: &[u8] = b"name-tree-accumulator/v1";
-pub const NAME_TREE_INTERVAL_MIGRATION_PREFIX: &[u8] = b"migration/v17/";
-const NAME_TREE_INTERVAL_MIGRATION_SCHEMA_KEY: &[u8] = b"migration/v17/original-schema";
-const NAME_TREE_INTERVAL_MIGRATION_PROFILE_KEY: &[u8] = b"migration/v17/original-profile";
-const NAME_TREE_INTERVAL_MIGRATION_ROOT_KEY: &[u8] = b"migration/v17/original-working-root";
-const NAME_TREE_INTERVAL_MIGRATION_COMMIT_ROOT_KEY: &[u8] =
-    b"migration/v17/original-committed-root";
-const NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX: &[u8] = b"migration/v17/undo-v6/";
-const NAME_TREE_INTERVAL_MIGRATION_BATCH: usize = 256;
-const NAME_TREE_INTERVAL_MIGRATION_OPERATION_OVERHEAD_BYTES: u64 = 64;
-const NAME_TREE_INTERVAL_MIGRATION_ROCKS_TEMPORARY_MULTIPLIER: u64 = 2;
-const NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES: u64 = 128;
-pub const NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_RECORDS: usize = 1_024;
-pub const NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_BYTES: usize = 1024 * 1024;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_RECORDS: u64 = 10_000_000;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_BYTES: u64 = 512 * 1024 * 1024;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_UNDO_INPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_BACKUP_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PUBLICATION_BYTES: u64 = 128 * 1024 * 1024 * 1024;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_BATCH_BYTES: u64 = 64 * 1024 * 1024;
-/// The fixed accumulator body/checksum plus its worst-case count varint must
-/// leave 34 encoded bytes per distinct name.
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES: u64 =
-    ((NAME_TREE_ACCUMULATOR_CODEC_MAX - (4 + 32 + 4 + 4 + 9 + 32))
-        / NAME_TREE_ACCUMULATOR_ENTRY_BYTES) as u64;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAME_BYTES: u64 =
-    NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES
-        * NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES;
-pub const NAME_TREE_INTERVAL_MIGRATION_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
 const NAME_TREE_SNAPSHOT_PIN_VERSION: u32 = 1;
 pub const NAME_TREE_SNAPSHOT_PIN_PREFIX: &[u8] = b"name-tree-snapshot/v1/";
 const NAME_TREE_SNAPSHOT_PIN_BODY_SIZE: usize = 4 + 4 + 32 + 32;
@@ -122,6 +89,10 @@ const MIN_SPENT_COIN_ENTRY_BYTES: usize = 1 + MIN_SPENT_COIN_CODEC_BYTES;
 const MIN_NAME_UNDO_CODEC_BYTES: usize = 32 + 1;
 const MIN_NAME_UNDO_ENTRY_BYTES: usize = 1 + MIN_NAME_UNDO_CODEC_BYTES;
 const NAME_TREE_ACCUMULATOR_ENTRY_BYTES: usize = 32 + 2;
+/// Maximum distinct names representable by the current accumulator codec.
+const NAME_TREE_ACCUMULATOR_MAX_NAMES: u64 = ((NAME_TREE_ACCUMULATOR_CODEC_MAX
+    - (4 + 32 + 4 + 4 + 9 + 32))
+    / NAME_TREE_ACCUMULATOR_ENTRY_BYTES) as u64;
 
 pub const RETAINED_NAME_TREE_ROOT_SCAN_PAGE_RECORDS: usize = 1;
 pub const RETAINED_NAME_TREE_ROOT_SCAN_PAGE_BYTES: usize =
@@ -134,9 +105,9 @@ pub const RETAINED_NAME_TREE_ROOT_MAX_ROOTS: u64 = 16_384;
 pub const RETAINED_NAME_TREE_ROOT_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
 pub const NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_RECORDS: usize = 1_024;
 pub const NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_BYTES: usize = 1024 * 1024;
-pub const NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS: u64 = 1_000_000;
-pub const NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_BYTES: u64 =
-    NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE as u64 * NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS;
+pub const NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_RECORDS: u64 = 1_000_000;
+pub const NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_BYTES: u64 =
+    NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE as u64 * NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_RECORDS;
 pub const NAME_TREE_SNAPSHOT_PIN_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
 pub const NAME_TREE_MATERIALIZATION_SCAN_PAGE_RECORDS: usize = 1_024;
 pub const NAME_TREE_MATERIALIZATION_SCAN_PAGE_BYTES: usize = 1024 * 1024;
@@ -609,104 +580,6 @@ struct NameTreeAccumulatorPrevious {
     boundary_accumulator: Option<NameTreeAccumulator>,
 }
 
-/// Evidence for the one-key startup reconciliation of accumulators written by
-/// the legacy touched-name undo contract. No undo, NameState, authenticated
-/// tree, or chain-index record is rewritten by this compatibility bridge.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NameTreeAccumulatorReconciliationSummary {
-    pub first_height: Height,
-    pub last_height: Height,
-    pub previous_names: usize,
-    pub reconciled_names: usize,
-    pub previous_references: u64,
-    pub reconciled_references: u64,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NameTreeIntervalMigrationSummary {
-    pub active_heights: usize,
-    pub undos_rewritten: usize,
-    pub legacy_undos_backed_up: usize,
-    pub pending_names: usize,
-    pub tip_height: Option<Height>,
-    pub height_index_bytes: u64,
-    pub undo_input_bytes: u64,
-    pub backup_output_bytes: u64,
-    pub rewrite_output_bytes: u64,
-    pub publication_bytes: u64,
-    pub required_temporary_bytes: u64,
-    pub peak_pending_names: u64,
-    pub peak_pending_name_bytes: u64,
-    pub peak_batch_bytes: u64,
-    pub batch_commits: u64,
-}
-
-/// Exact, read-only resource projection for a schema-16 interval migration.
-/// The database temporary estimate covers the complete staged publication plus
-/// one equivalent copy-on-write publication; the caller adds its reserve.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NameTreeIntervalMigrationPlan {
-    pub active_heights: u64,
-    pub height_index_bytes: u64,
-    pub undo_records: u64,
-    pub legacy_undos_to_backup: u64,
-    pub undo_input_bytes: u64,
-    pub backup_output_bytes: u64,
-    pub rewrite_output_bytes: u64,
-    pub publication_bytes: u64,
-    pub required_temporary_bytes: u64,
-    pub peak_pending_names: u64,
-    pub peak_pending_name_bytes: u64,
-    pub maximum_record_publication_bytes: u64,
-}
-
-/// Finite cursor and time envelope for the one-time schema-16 height-index
-/// migration. The deadline is absolute so page reads, point reads, validation,
-/// and durable batch commits all consume the same allowance.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NameTreeIntervalMigrationLimits {
-    pub max_height_records: u64,
-    /// Maximum sum of height-index key/value bytes.
-    pub max_height_bytes: u64,
-    /// Maximum sum of resolved active-chain undo value bytes.
-    pub max_undo_input_bytes: u64,
-    /// Maximum newly persistent backup key/value and operation bytes.
-    pub max_backup_output_bytes: u64,
-    /// Maximum backup plus rewritten-undo publication bytes.
-    pub max_publication_bytes: u64,
-    /// Maximum key/value and conservative operation bytes staged in one
-    /// database transaction. One record is never split across batches.
-    pub max_pending_batch_bytes: u64,
-    pub max_pending_names: u64,
-    /// Conservative in-memory estimate for distinct accumulator names.
-    pub max_pending_name_bytes: u64,
-    pub page_budget: PrefixScanBudget,
-    pub deadline: Instant,
-}
-
-impl Default for NameTreeIntervalMigrationLimits {
-    fn default() -> Self {
-        let now = Instant::now();
-        Self {
-            max_height_records: NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_RECORDS,
-            max_height_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_BYTES,
-            max_undo_input_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_UNDO_INPUT_BYTES,
-            max_backup_output_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_BACKUP_OUTPUT_BYTES,
-            max_publication_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_PUBLICATION_BYTES,
-            max_pending_batch_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_BATCH_BYTES,
-            max_pending_names: NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES,
-            max_pending_name_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAME_BYTES,
-            page_budget: PrefixScanBudget {
-                max_entries: NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_RECORDS,
-                max_bytes: NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_BYTES,
-            },
-            deadline: now
-                .checked_add(NAME_TREE_INTERVAL_MIGRATION_MAX_ELAPSED)
-                .unwrap_or(now),
-        }
-    }
-}
-
 impl NameTreeAccumulator {
     fn new(base_root: TreeRoot, height: Height) -> Self {
         Self {
@@ -1016,7 +889,7 @@ pub struct BlockUndo {
 
 /// Finite envelope for startup/offline retained-name-root discovery.
 ///
-/// The compatibility wrapper uses [`Self::default`]. An explicit archive or
+/// The collecting wrapper uses [`Self::default`]. An explicit archive or
 /// offline compaction that needs a larger qualified envelope must call
 /// [`retained_name_tree_roots_bounded`] with reviewed limits instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1067,7 +940,7 @@ pub struct RetainedNameTreeRootSelection {
 
 /// Caller-owned envelope for streaming durable interval pins. Archive startup
 /// should derive total limits from its already validated tip/profile instead
-/// of using the collecting compatibility wrapper.
+/// of using the collecting collecting wrapper.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NameTreeSnapshotPinScanLimits {
     pub max_records: u64,
@@ -1081,8 +954,8 @@ impl Default for NameTreeSnapshotPinScanLimits {
     fn default() -> Self {
         let now = Instant::now();
         Self {
-            max_records: NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS,
-            max_bytes: NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_BYTES,
+            max_records: NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_RECORDS,
+            max_bytes: NAME_TREE_SNAPSHOT_PIN_DEFAULT_MAX_BYTES,
             page_budget: PrefixScanBudget {
                 max_entries: NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_RECORDS,
                 max_bytes: NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_BYTES,
@@ -1196,7 +1069,7 @@ impl BlockUndo {
     pub fn decode(bytes: &[u8]) -> Result<Self, StateError> {
         let mut reader = Reader::new(bytes, BLOCK_UNDO_CODEC_MAX)?;
         let version = reader.read_u32()?;
-        if version != BLOCK_UNDO_VERSION && version != LEGACY_BLOCK_UNDO_VERSION {
+        if version != BLOCK_UNDO_VERSION {
             return Err(StateError::Codec(format!(
                 "unsupported block undo version {version}"
             )));
@@ -1261,7 +1134,7 @@ impl BlockUndo {
             name_tree_interval_boundary,
             previous_name_tree_accumulator_last_height,
             previous_name_tree_accumulator,
-        ) = if version == BLOCK_UNDO_VERSION {
+        ) = {
             let name_tree_interval_boundary = match reader.read_u8()? {
                 0 => false,
                 1 => true,
@@ -1300,8 +1173,6 @@ impl BlockUndo {
                 previous_name_tree_accumulator_last_height,
                 previous_name_tree_accumulator,
             )
-        } else {
-            (false, None, None)
         };
 
         reader.ensure_finished()?;
@@ -1688,7 +1559,7 @@ fn decode_block_undo_metadata(
     }
     let mut reader = BorrowedCodecReader::new(bytes, BLOCK_UNDO_CODEC_MAX, "block undo")?;
     let version = reader.read_u32()?;
-    if version != BLOCK_UNDO_VERSION && version != LEGACY_BLOCK_UNDO_VERSION {
+    if version != BLOCK_UNDO_VERSION {
         return Err(StateError::Codec(format!(
             "unsupported block undo version {version}"
         )));
@@ -1752,7 +1623,7 @@ fn decode_block_undo_metadata(
         validate_borrowed_name_undo(undo)?;
     }
 
-    if version == BLOCK_UNDO_VERSION {
+    {
         match reader.read_u8()? {
             0 | 1 => {}
             value => {
@@ -2389,7 +2260,7 @@ impl<S: Store> StoredStateEngine<S> {
 
     pub fn load_undo(&self, block_hash: &BlockHash) -> Result<Option<BlockUndo>, StateError> {
         let snapshot = self.store.snapshot()?;
-        let Some(bytes) = snapshot.get(ColumnFamily::Undo, block_hash.as_bytes())? else {
+        let Some(bytes) = snapshot.get_shared(ColumnFamily::Undo, block_hash.as_bytes())? else {
             return Ok(None);
         };
         BlockUndo::decode(&bytes).map(Some)
@@ -2430,7 +2301,9 @@ impl<S: Store> StoredStateEngine<S> {
 impl<S: Store> StateView for StoredStateEngine<S> {
     fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, StateError> {
         let snapshot = self.store.snapshot()?;
-        let Some(bytes) = snapshot.get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))? else {
+        let Some(bytes) =
+            snapshot.get_shared(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?
+        else {
             return Ok(None);
         };
         decode_coin(&bytes).map(Some)
@@ -2455,7 +2328,7 @@ impl<S: Store> StateEngine for StoredStateEngine<S> {
     fn disconnect_block(&mut self, request: DisconnectBlock) -> Result<StateSummary, StateError> {
         let snapshot = self.store.snapshot()?;
         let undo = snapshot
-            .get(ColumnFamily::Undo, request.block_hash.as_bytes())?
+            .get_shared(ColumnFamily::Undo, request.block_hash.as_bytes())?
             .map(|bytes| BlockUndo::decode(&bytes))
             .transpose()?
             .ok_or(StateError::MissingUndo(request.block_hash))?;
@@ -3287,7 +3160,7 @@ where
         .map(encode_outpoint_key)
         .collect::<Vec<_>>();
     let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    let values = snapshot.get_many_shared(ColumnFamily::Utxo, &key_refs)?;
     if values.len() != outpoints.len() {
         return Err(StateError::Codec(format!(
             "UTXO multi-get returned {} values for {} replay outpoints",
@@ -3335,7 +3208,7 @@ pub fn prepare_block_utxos_with_state_effects<'a, T: ReadSnapshot>(
         .iter()
         .map(AsRef::as_ref)
         .collect::<Vec<&[u8]>>();
-    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    let values = snapshot.get_many_shared(ColumnFamily::Utxo, &key_refs)?;
     if values.len() != effects.input_outpoints().len() {
         return Err(StateError::Codec(format!(
             "prepared UTXO multi-get returned {} values for {} lookup groups",
@@ -3452,7 +3325,7 @@ fn prefetch_block_utxos_with_transaction_ids<T: ReadSnapshot>(
         .map(encode_outpoint_key)
         .collect::<Vec<_>>();
     let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    let values = snapshot.get_many_shared(ColumnFamily::Utxo, &key_refs)?;
     if values.len() != outpoints.len() {
         return Err(StateError::Codec(format!(
             "UTXO multi-get returned {} values for {} block outpoints",
@@ -3771,7 +3644,7 @@ pub fn prepare_mempool_name_delta<T: ReadSnapshot>(
     })
 }
 
-/// Compatibility helper for callers that do not retain an incremental overlay.
+/// Convenience helper for callers that do not retain an incremental overlay.
 /// Production node admission uses [`rebuild_mempool_name_overlay`] plus
 /// [`prepare_mempool_name_delta`] instead.
 pub fn verify_mempool_name_context<T: ReadSnapshot>(
@@ -4092,7 +3965,8 @@ fn load_existing_coin<T: ReadSnapshot>(
     snapshot: &T,
     outpoint: &Outpoint,
 ) -> Result<Coin, StateError> {
-    let Some(bytes) = snapshot.get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))? else {
+    let Some(bytes) = snapshot.get_shared(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?
+    else {
         return Err(StateError::MissingCoin(outpoint.clone()));
     };
     let coin = decode_coin(&bytes)?;
@@ -4156,7 +4030,10 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
             self.headers_by_height.borrow_mut().insert(height, None);
             return Ok(None);
         };
-        let Some(bytes) = self.snapshot.get(ColumnFamily::Headers, hash.as_bytes())? else {
+        let Some(bytes) = self
+            .snapshot
+            .get_shared(ColumnFamily::Headers, hash.as_bytes())?
+        else {
             return Err(StateError::ChainView(format!(
                 "canonical height {height} points to a missing header"
             )));
@@ -4218,7 +4095,7 @@ impl<T: ReadSnapshot> NameContext for SnapshotChainContext<'_, T> {
         }
         let Some(bytes) = self
             .snapshot
-            .get(ColumnFamily::Headers, hash.as_bytes())
+            .get_shared(ColumnFamily::Headers, hash.as_bytes())
             .map_err(|error| ConsensusError::View(error.to_string()))?
         else {
             self.main_chain_heights_by_hash
@@ -4874,7 +4751,7 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
         .keys()
         .map(|node_root| node_root.as_bytes().as_slice())
         .collect::<Vec<_>>();
-    let existing_records = snapshot.get_many(ColumnFamily::NameTreeNodes, &record_keys)?;
+    let existing_records = snapshot.get_many_shared(ColumnFamily::NameTreeNodes, &record_keys)?;
     if existing_records.len() != update.records().len() {
         return Err(StateError::Codec(format!(
             "name-tree multi-get returned {} records for {} keys",
@@ -4884,7 +4761,7 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
     }
     for ((node_root, raw), existing) in update.records().iter().zip(existing_records) {
         match existing {
-            Some(existing) if existing != *raw => {
+            Some(existing) if existing.as_ref() != raw.as_slice() => {
                 return Err(StateError::PersistedNodeConflict(*node_root));
             }
             Some(_) => {}
@@ -4964,7 +4841,7 @@ where
     .map_err(StateError::NameTree)
 }
 
-/// Validate only the legacy records above an already audited immutable page
+/// Validate only the staged records above an already audited immutable page
 /// subtree. The page summary supplies the subtree's maximum relative path so
 /// an overlay cannot hide a path that exceeds Urkel's 256-bit key bound.
 pub fn validate_persisted_name_tree_overlays<T, I>(
@@ -5037,896 +4914,9 @@ pub fn load_name_tree_accumulator<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<Option<NameTreeAccumulator>, StateError> {
     snapshot
-        .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?
+        .get_shared(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?
         .map(|raw| NameTreeAccumulator::decode(&raw))
         .transpose()
-}
-
-fn name_tree_interval_migration_backup_key(block_hash: BlockHash) -> Vec<u8> {
-    let mut key =
-        Vec::with_capacity(NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX.len() + BLOCK_UNDO_KEY_BYTES);
-    key.extend_from_slice(NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX);
-    key.extend_from_slice(block_hash.as_bytes());
-    key
-}
-
-fn name_tree_interval_migration_operation_bytes(
-    key_bytes: usize,
-    value_bytes: usize,
-    context: &'static str,
-) -> Result<u64, StateError> {
-    u64::try_from(key_bytes)
-        .ok()
-        .and_then(|key| {
-            u64::try_from(value_bytes)
-                .ok()
-                .and_then(|value| key.checked_add(value))
-        })
-        .and_then(|bytes| bytes.checked_add(NAME_TREE_INTERVAL_MIGRATION_OPERATION_OVERHEAD_BYTES))
-        .ok_or_else(|| StateError::Codec(format!("{context} byte count overflow")))
-}
-
-fn name_tree_interval_migration_record_bytes(
-    raw_undo_bytes: usize,
-    rewritten_undo_bytes: usize,
-    backup_key_bytes: usize,
-    needs_backup: bool,
-) -> Result<(u64, u64, u64), StateError> {
-    let backup = if needs_backup {
-        name_tree_interval_migration_operation_bytes(
-            backup_key_bytes,
-            raw_undo_bytes,
-            "name-tree interval migration backup publication",
-        )?
-    } else {
-        0
-    };
-    let rewrite = name_tree_interval_migration_operation_bytes(
-        BLOCK_UNDO_KEY_BYTES,
-        rewritten_undo_bytes,
-        "name-tree interval migration undo publication",
-    )?;
-    let publication = backup.checked_add(rewrite).ok_or_else(|| {
-        StateError::Codec("name-tree interval migration record publication overflow".to_owned())
-    })?;
-    Ok((backup, rewrite, publication))
-}
-
-fn ensure_name_tree_interval_migration_record_batch_limit(
-    publication_bytes: u64,
-    limit: u64,
-) -> Result<(), StateError> {
-    if publication_bytes > limit {
-        return Err(StateError::ResourceLimit {
-            context: "name-tree interval migration pending batch bytes",
-            limit,
-            actual: publication_bytes,
-        });
-    }
-    Ok(())
-}
-
-fn enforce_name_tree_interval_accumulator_limits(
-    accumulator: Option<&NameTreeAccumulator>,
-    limits: NameTreeIntervalMigrationLimits,
-    peak_names: &mut u64,
-    peak_bytes: &mut u64,
-) -> Result<(), StateError> {
-    let names = accumulator
-        .map(|pending| u64::try_from(pending.names.len()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    enforce_name_tree_interval_accumulator_size(names, limits)?;
-    let bytes = names.saturating_mul(NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES);
-    *peak_names = (*peak_names).max(names);
-    *peak_bytes = (*peak_bytes).max(bytes);
-    Ok(())
-}
-
-fn enforce_name_tree_interval_accumulator_size(
-    names: u64,
-    limits: NameTreeIntervalMigrationLimits,
-) -> Result<(), StateError> {
-    let name_limit = limits
-        .max_pending_names
-        .min(NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES);
-    if names > name_limit {
-        return Err(StateError::ResourceLimit {
-            context: "name-tree interval migration pending names",
-            limit: name_limit,
-            actual: names,
-        });
-    }
-    let bytes = names.saturating_mul(NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES);
-    if bytes > limits.max_pending_name_bytes {
-        return Err(StateError::ResourceLimit {
-            context: "name-tree interval migration pending name bytes",
-            limit: limits.max_pending_name_bytes,
-            actual: bytes,
-        });
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_name_tree_interval_migration_undo(
-    raw_undo: &[u8],
-    block_hash: BlockHash,
-    height: Height,
-    tree_interval: Height,
-    previous_undo_height: &mut Option<Height>,
-    accumulator: &mut Option<NameTreeAccumulator>,
-    limits: NameTreeIntervalMigrationLimits,
-    peak_pending_names: &mut u64,
-    peak_pending_name_bytes: &mut u64,
-) -> Result<(u32, Vec<u8>), StateError> {
-    let undo_version = raw_undo
-        .get(..4)
-        .and_then(|raw| raw.try_into().ok())
-        .map(u32::from_le_bytes)
-        .ok_or_else(|| StateError::Codec("block undo version is truncated".to_owned()))?;
-    let mut undo = BlockUndo::decode(raw_undo)?;
-    if undo.block_hash != block_hash || undo.height != height {
-        return Err(StateError::Codec(format!(
-            "active block undo disagrees with height {height}"
-        )));
-    }
-
-    if previous_undo_height.and_then(|value: Height| value.checked_add(1)) != Some(height) {
-        *accumulator = None;
-    }
-    if accumulator
-        .as_ref()
-        .is_some_and(|pending| pending.base_root != undo.previous_committed_tree_root)
-    {
-        return Err(StateError::Codec(format!(
-            "legacy name-tree interval root continuity breaks at height {height}"
-        )));
-    }
-    enforce_name_tree_interval_accumulator_limits(
-        accumulator.as_ref(),
-        limits,
-        peak_pending_names,
-        peak_pending_name_bytes,
-    )?;
-
-    undo.previous_tree_root = undo.previous_committed_tree_root;
-    undo.resulting_tree_root = undo.resulting_committed_tree_root;
-    undo.name_tree_interval_boundary = height.is_multiple_of(tree_interval);
-    undo.previous_name_tree_accumulator_last_height =
-        accumulator.as_ref().map(|pending| pending.last_height);
-    if undo.name_tree_interval_boundary {
-        // Move, rather than clone, the potentially large map into this one
-        // boundary undo. The encoded record is immediately staged/discarded.
-        undo.previous_name_tree_accumulator = accumulator.take();
-    } else {
-        undo.previous_name_tree_accumulator = None;
-        let pending = accumulator.get_or_insert_with(|| {
-            NameTreeAccumulator::new(undo.previous_committed_tree_root, height)
-        });
-        pending.last_height = height;
-        for name_undo in &undo.previous_name_states {
-            if let Some(count) = pending.names.get_mut(&name_undo.name_hash) {
-                *count = count.checked_add(1).ok_or_else(|| {
-                    StateError::Codec(
-                        "migrated name-tree accumulator reference count overflowed".to_owned(),
-                    )
-                })?;
-            } else {
-                let projected = u64::try_from(pending.names.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1);
-                enforce_name_tree_interval_accumulator_size(projected, limits)?;
-                pending.names.insert(name_undo.name_hash, 1);
-            }
-        }
-        enforce_name_tree_interval_accumulator_limits(
-            accumulator.as_ref(),
-            limits,
-            peak_pending_names,
-            peak_pending_name_bytes,
-        )?;
-    }
-
-    let rewritten = undo.encode()?;
-    let rewritten_bytes = u64::try_from(rewritten.len()).unwrap_or(u64::MAX);
-    if rewritten_bytes > BLOCK_UNDO_CODEC_MAX as u64 {
-        return Err(StateError::ResourceLimit {
-            context: "name-tree interval migration rewritten undo bytes",
-            limit: BLOCK_UNDO_CODEC_MAX as u64,
-            actual: rewritten_bytes,
-        });
-    }
-    *previous_undo_height = Some(height);
-    Ok((undo_version, rewritten))
-}
-
-#[derive(Debug)]
-struct NameTreeIntervalMigrationPreflight {
-    plan: NameTreeIntervalMigrationPlan,
-    final_accumulator: Option<NameTreeAccumulator>,
-    tip_height: Option<Height>,
-}
-
-fn preflight_name_tree_interval_migration<T: ReadSnapshot>(
-    snapshot: &T,
-    tree_interval: Height,
-    original_committed_root: TreeRoot,
-    limits: NameTreeIntervalMigrationLimits,
-) -> Result<NameTreeIntervalMigrationPreflight, StateError> {
-    let mut plan = NameTreeIntervalMigrationPlan::default();
-    let mut accumulator = None;
-    let mut previous_undo_height = None;
-    let mut continuation = None::<Vec<u8>>;
-    let mut tip_height = None;
-    loop {
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
-        let page = snapshot.scan_prefix_page(
-            ColumnFamily::HeightIndex,
-            b"",
-            continuation.as_deref(),
-            limits.page_budget,
-        )?;
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
-        validate_state_scan_page(
-            &page,
-            b"",
-            continuation.as_deref(),
-            limits.page_budget,
-            "name-tree interval migration preflight height scan",
-        )?;
-        let next = page.continuation.clone();
-        for (height_key, hash_bytes) in page.entries {
-            ensure_retained_root_deadline(
-                limits.deadline,
-                "name-tree interval migration preflight",
-            )?;
-            plan.active_heights = add_bounded_resource(
-                plan.active_heights,
-                1,
-                limits.max_height_records,
-                "name-tree interval migration height records",
-            )?;
-            let height_record_bytes = height_key
-                .len()
-                .checked_add(hash_bytes.len())
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .unwrap_or(u64::MAX);
-            plan.height_index_bytes = add_bounded_resource(
-                plan.height_index_bytes,
-                height_record_bytes,
-                limits.max_height_bytes,
-                "name-tree interval migration height bytes",
-            )?;
-            let raw_height: [u8; 4] = height_key.as_slice().try_into().map_err(|_| {
-                StateError::Codec(format!(
-                    "active height key contains {} bytes; expected 4",
-                    height_key.len()
-                ))
-            })?;
-            let height = u32::from_be_bytes(raw_height);
-            tip_height = Some(height);
-            let raw_hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
-                StateError::Codec(format!(
-                    "active height {height} contains a {}-byte block hash",
-                    hash_bytes.len()
-                ))
-            })?;
-            let block_hash = BlockHash::new(raw_hash);
-
-            let Some(raw_undo) = snapshot.get(ColumnFamily::Undo, block_hash.as_bytes())? else {
-                accumulator = None;
-                previous_undo_height = None;
-                continue;
-            };
-            ensure_retained_root_deadline(
-                limits.deadline,
-                "name-tree interval migration preflight",
-            )?;
-            plan.undo_records = plan.undo_records.checked_add(1).ok_or_else(|| {
-                StateError::Codec("name-tree interval migration undo count overflow".to_owned())
-            })?;
-            plan.undo_input_bytes = add_bounded_resource(
-                plan.undo_input_bytes,
-                u64::try_from(raw_undo.len()).unwrap_or(u64::MAX),
-                limits.max_undo_input_bytes,
-                "name-tree interval migration undo input bytes",
-            )?;
-            let (undo_version, rewritten) = prepare_name_tree_interval_migration_undo(
-                &raw_undo,
-                block_hash,
-                height,
-                tree_interval,
-                &mut previous_undo_height,
-                &mut accumulator,
-                limits,
-                &mut plan.peak_pending_names,
-                &mut plan.peak_pending_name_bytes,
-            )?;
-            let backup_key = name_tree_interval_migration_backup_key(block_hash);
-            let needs_backup = if undo_version == LEGACY_BLOCK_UNDO_VERSION {
-                match snapshot.get(ColumnFamily::Snapshots, &backup_key)? {
-                    Some(existing) if existing != raw_undo => {
-                        return Err(StateError::Codec(format!(
-                            "legacy undo migration backup conflicts at height {height}"
-                        )))
-                    }
-                    Some(_) => false,
-                    None => true,
-                }
-            } else {
-                false
-            };
-            let (backup_bytes, rewrite_bytes, publication_bytes) =
-                name_tree_interval_migration_record_bytes(
-                    raw_undo.len(),
-                    rewritten.len(),
-                    backup_key.len(),
-                    needs_backup,
-                )?;
-            ensure_name_tree_interval_migration_record_batch_limit(
-                publication_bytes,
-                limits.max_pending_batch_bytes,
-            )?;
-            plan.maximum_record_publication_bytes =
-                plan.maximum_record_publication_bytes.max(publication_bytes);
-            if needs_backup {
-                plan.legacy_undos_to_backup =
-                    plan.legacy_undos_to_backup.checked_add(1).ok_or_else(|| {
-                        StateError::Codec(
-                            "name-tree interval migration backup count overflow".to_owned(),
-                        )
-                    })?;
-            }
-            plan.backup_output_bytes = add_bounded_resource(
-                plan.backup_output_bytes,
-                backup_bytes,
-                limits.max_backup_output_bytes,
-                "name-tree interval migration backup output bytes",
-            )?;
-            plan.rewrite_output_bytes = plan
-                .rewrite_output_bytes
-                .checked_add(rewrite_bytes)
-                .ok_or_else(|| {
-                    StateError::Codec(
-                        "name-tree interval migration rewrite output overflow".to_owned(),
-                    )
-                })?;
-            plan.publication_bytes = add_bounded_resource(
-                plan.publication_bytes,
-                publication_bytes,
-                limits.max_publication_bytes,
-                "name-tree interval migration publication bytes",
-            )?;
-        }
-        let Some(next) = next else {
-            break;
-        };
-        continuation = Some(next);
-    }
-
-    if let Some(tip_height) = tip_height {
-        if previous_undo_height != Some(tip_height) {
-            return Err(StateError::Codec(
-                "active tip is missing undo required for interval migration".to_owned(),
-            ));
-        }
-        if tip_height.is_multiple_of(tree_interval) != accumulator.is_none() {
-            return Err(StateError::Codec(
-                "migrated name-tree accumulator disagrees with tip interval timing".to_owned(),
-            ));
-        }
-    }
-    if accumulator
-        .as_ref()
-        .is_some_and(|pending| pending.base_root != original_committed_root)
-    {
-        return Err(StateError::Codec(
-            "migrated accumulator base does not match the durable committed root".to_owned(),
-        ));
-    }
-    plan.required_temporary_bytes = plan
-        .publication_bytes
-        .checked_mul(NAME_TREE_INTERVAL_MIGRATION_ROCKS_TEMPORARY_MULTIPLIER)
-        .ok_or_else(|| {
-            StateError::Codec(
-                "name-tree interval migration temporary byte projection overflow".to_owned(),
-            )
-        })?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
-    Ok(NameTreeIntervalMigrationPreflight {
-        plan,
-        final_accumulator: accumulator,
-        tip_height,
-    })
-}
-
-/// Read-only exact input/publication projection used by production startup to
-/// qualify filesystem capacity before any migration marker or undo is written.
-/// For `H` active heights and `U` distinct pending names, the ordered cursor
-/// pass is `O(H + name-undo entries * log U)` and retains only one scan page,
-/// one decoded undo, and the codec-bounded `O(U)` interval accumulator.
-pub fn plan_name_tree_interval_accumulator_migration_bounded<S: Store>(
-    store: &S,
-    tree_interval: Height,
-    limits: NameTreeIntervalMigrationLimits,
-) -> Result<Option<NameTreeIntervalMigrationPlan>, StateError> {
-    limits.page_budget.validate()?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
-    if tree_interval == 0 {
-        return Err(StateError::Codec(
-            "network name-tree snapshot interval is zero".to_owned(),
-        ));
-    }
-    let snapshot = store.snapshot()?;
-    let Some(raw_schema) = snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?
-    else {
-        return Ok(None);
-    };
-    let schema = decode_u32(&raw_schema)?;
-    let profile = snapshot
-        .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?
-        .ok_or_else(|| {
-            StateError::Codec("schema marker exists without a storage profile".to_owned())
-        })?;
-    if schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE {
-        return Ok(None);
-    }
-    if schema == MIXED_INDEX_SCHEMA_VERSION && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE {
-        return Ok(None);
-    }
-    if (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
-        || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
-    {
-        return Ok(None);
-    }
-    if schema != PRE_INTERVAL_SCHEMA_VERSION || profile.as_slice() != PRE_INTERVAL_STORAGE_PROFILE {
-        return Err(StateError::Codec(format!(
-            "cannot migrate schema/profile {schema}/{} to {SCHEMA_VERSION}/{}",
-            String::from_utf8_lossy(&profile),
-            String::from_utf8_lossy(STORAGE_PROFILE)
-        )));
-    }
-    let original_working_root = load_stored_name_tree_root(&snapshot)?;
-    let original_committed_root = load_stored_name_tree_commit_root(&snapshot)?;
-    validate_persisted_name_tree_root(&snapshot, original_working_root)?;
-    validate_persisted_name_tree_root(&snapshot, original_committed_root)?;
-    let preflight = preflight_name_tree_interval_migration(
-        &snapshot,
-        tree_interval,
-        original_committed_root,
-        limits,
-    )?;
-    if preflight.tip_height.is_none()
-        && (original_working_root != TreeRoot::ZERO || original_committed_root != TreeRoot::ZERO)
-    {
-        return Err(StateError::Codec(
-            "empty legacy chain has a non-empty name-tree root".to_owned(),
-        ));
-    }
-    Ok(Some(preflight.plan))
-}
-
-/// Upgrade the schema-16 per-block working-tree layout to the current interval
-/// accumulator profile. Schemas 17 and 18 already have the consensus
-/// transformation and receive only the fail-closed storage-profile cutover.
-/// Legacy schema-16 undo bytes are retained under a migration prefix before
-/// their active records are rewritten, and the schema/profile marker changes
-/// only after every undo chunk is durable. Re-entering after a crash is
-/// idempotent.
-pub fn migrate_name_tree_interval_accumulator<S: Store>(
-    store: &S,
-    tree_interval: Height,
-) -> Result<Option<NameTreeIntervalMigrationSummary>, StateError> {
-    migrate_name_tree_interval_accumulator_bounded(
-        store,
-        tree_interval,
-        NameTreeIntervalMigrationLimits::default(),
-    )
-}
-
-pub fn migrate_name_tree_interval_accumulator_bounded<S: Store>(
-    store: &S,
-    tree_interval: Height,
-    limits: NameTreeIntervalMigrationLimits,
-) -> Result<Option<NameTreeIntervalMigrationSummary>, StateError> {
-    limits.page_budget.validate()?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    if tree_interval == 0 {
-        return Err(StateError::Codec(
-            "network name-tree snapshot interval is zero".to_owned(),
-        ));
-    }
-
-    let snapshot = store.snapshot()?;
-    let Some(raw_schema) = snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?
-    else {
-        return Ok(None);
-    };
-    let schema = decode_u32(&raw_schema)?;
-    let profile = snapshot
-        .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?
-        .ok_or_else(|| {
-            StateError::Codec("schema marker exists without a storage profile".to_owned())
-        })?;
-    if schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE {
-        return Ok(None);
-    }
-    if schema == MIXED_INDEX_SCHEMA_VERSION && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE {
-        return Ok(None);
-    }
-    if (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
-        || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
-    {
-        drop(snapshot);
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-        let mut batch = store.batch();
-        batch.put(
-            ColumnFamily::Meta,
-            MetaKey::SchemaVersion.as_bytes(),
-            &encode_u32(SCHEMA_VERSION),
-        )?;
-        batch.put(
-            ColumnFamily::Meta,
-            MetaKey::StorageProfile.as_bytes(),
-            STORAGE_PROFILE,
-        )?;
-        batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
-        store.commit(batch)?;
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-        return Ok(None);
-    }
-    if schema != PRE_INTERVAL_SCHEMA_VERSION || profile.as_slice() != PRE_INTERVAL_STORAGE_PROFILE {
-        return Err(StateError::Codec(format!(
-            "cannot migrate schema/profile {schema}/{} to {SCHEMA_VERSION}/{}",
-            String::from_utf8_lossy(&profile),
-            String::from_utf8_lossy(STORAGE_PROFILE)
-        )));
-    }
-
-    let original_working_root = load_stored_name_tree_root(&snapshot)?;
-    let original_committed_root = load_stored_name_tree_commit_root(&snapshot)?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    validate_persisted_name_tree_root(&snapshot, original_working_root)?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    validate_persisted_name_tree_root(&snapshot, original_committed_root)?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    // Finish the complete read-only projection before writing even the
-    // migration marker. This makes total-input/output, accumulator, and
-    // one-record batch refusal non-mutating and safe to retry offline.
-    let preflight = preflight_name_tree_interval_migration(
-        &snapshot,
-        tree_interval,
-        original_committed_root,
-        limits,
-    )?;
-    if preflight.tip_height.is_none()
-        && (original_working_root != TreeRoot::ZERO || original_committed_root != TreeRoot::ZERO)
-    {
-        return Err(StateError::Codec(
-            "empty legacy chain has a non-empty name-tree root".to_owned(),
-        ));
-    }
-    drop(snapshot);
-
-    // These small bindings are written first and never overwritten. They are
-    // enough to identify and reverse the metadata cutover; each rewritten
-    // legacy undo is backed up alongside them below.
-    {
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-        let snapshot = store.snapshot()?;
-        let backups = [
-            (
-                NAME_TREE_INTERVAL_MIGRATION_SCHEMA_KEY,
-                raw_schema.as_slice(),
-            ),
-            (NAME_TREE_INTERVAL_MIGRATION_PROFILE_KEY, profile.as_slice()),
-            (
-                NAME_TREE_INTERVAL_MIGRATION_ROOT_KEY,
-                original_working_root.as_bytes().as_slice(),
-            ),
-            (
-                NAME_TREE_INTERVAL_MIGRATION_COMMIT_ROOT_KEY,
-                original_committed_root.as_bytes().as_slice(),
-            ),
-        ];
-        let mut batch = store.batch();
-        for (key, expected) in backups {
-            match snapshot.get(ColumnFamily::Snapshots, key)? {
-                Some(existing) if existing.as_slice() != expected => {
-                    return Err(StateError::Codec(
-                        "name-tree interval migration backup conflicts with an existing value"
-                            .to_owned(),
-                    ));
-                }
-                Some(_) => {}
-                None => batch.put(ColumnFamily::Snapshots, key, expected)?,
-            }
-        }
-        batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
-        drop(snapshot);
-        store.commit(batch)?;
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    }
-
-    let NameTreeIntervalMigrationPreflight {
-        plan,
-        final_accumulator: expected_accumulator,
-        tip_height: expected_tip_height,
-    } = preflight;
-    let height_snapshot = store.snapshot()?;
-    let mut summary = NameTreeIntervalMigrationSummary {
-        required_temporary_bytes: plan.required_temporary_bytes,
-        peak_pending_names: plan.peak_pending_names,
-        peak_pending_name_bytes: plan.peak_pending_name_bytes,
-        ..NameTreeIntervalMigrationSummary::default()
-    };
-    let mut height_records = 0u64;
-    let mut height_bytes = 0u64;
-    let mut undo_input_bytes = 0u64;
-    let mut backup_output_bytes = 0u64;
-    let mut rewrite_output_bytes = 0u64;
-    let mut publication_bytes = 0u64;
-    let mut accumulator: Option<NameTreeAccumulator> = None;
-    let mut previous_undo_height = None;
-    let mut pending_batch = store.batch();
-    let mut pending_writes = 0usize;
-    let mut pending_batch_bytes = 0u64;
-    let mut peak_pending_names = 0u64;
-    let mut peak_pending_name_bytes = 0u64;
-    let mut continuation = None::<Vec<u8>>;
-    loop {
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-        let page = height_snapshot.scan_prefix_page(
-            ColumnFamily::HeightIndex,
-            b"",
-            continuation.as_deref(),
-            limits.page_budget,
-        )?;
-        validate_state_scan_page(
-            &page,
-            b"",
-            continuation.as_deref(),
-            limits.page_budget,
-            "name-tree interval migration height scan",
-        )?;
-        let next = page.continuation.clone();
-        for (height_key, hash_bytes) in page.entries {
-            ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-            height_records = add_bounded_resource(
-                height_records,
-                1,
-                limits.max_height_records,
-                "name-tree interval migration height records",
-            )?;
-            let record_bytes = height_key
-                .len()
-                .checked_add(hash_bytes.len())
-                .and_then(|bytes| u64::try_from(bytes).ok())
-                .unwrap_or(u64::MAX);
-            height_bytes = add_bounded_resource(
-                height_bytes,
-                record_bytes,
-                limits.max_height_bytes,
-                "name-tree interval migration height bytes",
-            )?;
-            summary.active_heights =
-                usize::try_from(height_records).map_err(|_| StateError::ResourceLimit {
-                    context: "name-tree interval migration height records",
-                    limit: usize::MAX as u64,
-                    actual: height_records,
-                })?;
-
-            let raw_height: [u8; 4] = height_key.as_slice().try_into().map_err(|_| {
-                StateError::Codec(format!(
-                    "active height key contains {} bytes; expected 4",
-                    height_key.len()
-                ))
-            })?;
-            let height = u32::from_be_bytes(raw_height);
-            summary.tip_height = Some(height);
-            let raw_hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
-                StateError::Codec(format!(
-                    "active height {height} contains a {}-byte block hash",
-                    hash_bytes.len()
-                ))
-            })?;
-            let block_hash = BlockHash::new(raw_hash);
-            let Some(raw_undo) = height_snapshot.get(ColumnFamily::Undo, block_hash.as_bytes())?
-            else {
-                accumulator = None;
-                previous_undo_height = None;
-                continue;
-            };
-            ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-            undo_input_bytes = add_bounded_resource(
-                undo_input_bytes,
-                u64::try_from(raw_undo.len()).unwrap_or(u64::MAX),
-                limits.max_undo_input_bytes,
-                "name-tree interval migration undo input bytes",
-            )?;
-            let (undo_version, rewritten_undo) = prepare_name_tree_interval_migration_undo(
-                &raw_undo,
-                block_hash,
-                height,
-                tree_interval,
-                &mut previous_undo_height,
-                &mut accumulator,
-                limits,
-                &mut peak_pending_names,
-                &mut peak_pending_name_bytes,
-            )?;
-            let backup_key = name_tree_interval_migration_backup_key(block_hash);
-            let needs_backup = if undo_version == LEGACY_BLOCK_UNDO_VERSION {
-                match height_snapshot.get(ColumnFamily::Snapshots, &backup_key)? {
-                    Some(existing) if existing != raw_undo => {
-                        return Err(StateError::Codec(format!(
-                            "legacy undo migration backup conflicts at height {height}"
-                        )))
-                    }
-                    Some(_) => false,
-                    None => true,
-                }
-            } else {
-                false
-            };
-            let (record_backup_bytes, record_rewrite_bytes, record_publication_bytes) =
-                name_tree_interval_migration_record_bytes(
-                    raw_undo.len(),
-                    rewritten_undo.len(),
-                    backup_key.len(),
-                    needs_backup,
-                )?;
-            ensure_name_tree_interval_migration_record_batch_limit(
-                record_publication_bytes,
-                limits.max_pending_batch_bytes,
-            )?;
-            let record_writes = usize::from(needs_backup) + 1;
-            let next_writes = pending_writes.saturating_add(record_writes);
-            let next_batch_bytes = pending_batch_bytes.saturating_add(record_publication_bytes);
-            if pending_writes != 0
-                && (next_writes > NAME_TREE_INTERVAL_MIGRATION_BATCH
-                    || next_batch_bytes > limits.max_pending_batch_bytes)
-            {
-                ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-                store.commit(pending_batch)?;
-                ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-                summary.batch_commits = summary.batch_commits.checked_add(1).ok_or_else(|| {
-                    StateError::Codec(
-                        "name-tree interval migration batch commit count overflow".to_owned(),
-                    )
-                })?;
-                pending_batch = store.batch();
-                pending_writes = 0;
-                pending_batch_bytes = 0;
-            }
-            if needs_backup {
-                pending_batch.put(ColumnFamily::Snapshots, &backup_key, &raw_undo)?;
-                pending_writes += 1;
-                summary.legacy_undos_backed_up += 1;
-            }
-            pending_batch.put(ColumnFamily::Undo, block_hash.as_bytes(), &rewritten_undo)?;
-            pending_writes += 1;
-            pending_batch_bytes = pending_batch_bytes
-                .checked_add(record_publication_bytes)
-                .ok_or_else(|| {
-                    StateError::Codec(
-                        "name-tree interval migration pending batch byte count overflow".to_owned(),
-                    )
-                })?;
-            summary.peak_batch_bytes = summary.peak_batch_bytes.max(pending_batch_bytes);
-            backup_output_bytes = add_bounded_resource(
-                backup_output_bytes,
-                record_backup_bytes,
-                limits.max_backup_output_bytes,
-                "name-tree interval migration backup output bytes",
-            )?;
-            rewrite_output_bytes = rewrite_output_bytes
-                .checked_add(record_rewrite_bytes)
-                .ok_or_else(|| {
-                    StateError::Codec(
-                        "name-tree interval migration rewrite output overflow".to_owned(),
-                    )
-                })?;
-            publication_bytes = add_bounded_resource(
-                publication_bytes,
-                record_publication_bytes,
-                limits.max_publication_bytes,
-                "name-tree interval migration publication bytes",
-            )?;
-            summary.undos_rewritten += 1;
-        }
-        let Some(next) = next else {
-            break;
-        };
-        continuation = Some(next);
-    }
-    drop(height_snapshot);
-    if pending_writes != 0 {
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-        store.commit(pending_batch)?;
-        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-        summary.batch_commits = summary.batch_commits.checked_add(1).ok_or_else(|| {
-            StateError::Codec("name-tree interval migration batch commit count overflow".to_owned())
-        })?;
-    }
-
-    if let Some(tip_height) = summary.tip_height {
-        if previous_undo_height != Some(tip_height) {
-            return Err(StateError::Codec(
-                "active tip is missing undo required for interval migration".to_owned(),
-            ));
-        }
-        if tip_height.is_multiple_of(tree_interval) != accumulator.is_none() {
-            return Err(StateError::Codec(
-                "migrated name-tree accumulator disagrees with tip interval timing".to_owned(),
-            ));
-        }
-    }
-    if accumulator
-        .as_ref()
-        .is_some_and(|pending| pending.base_root != original_committed_root)
-    {
-        return Err(StateError::Codec(
-            "migrated accumulator base does not match the durable committed root".to_owned(),
-        ));
-    }
-    summary.pending_names = accumulator
-        .as_ref()
-        .map(|pending| pending.names.len())
-        .unwrap_or(0);
-    summary.height_index_bytes = height_bytes;
-    summary.undo_input_bytes = undo_input_bytes;
-    summary.backup_output_bytes = backup_output_bytes;
-    summary.rewrite_output_bytes = rewrite_output_bytes;
-    summary.publication_bytes = publication_bytes;
-    if height_records != plan.active_heights
-        || height_bytes != plan.height_index_bytes
-        || summary.undos_rewritten as u64 != plan.undo_records
-        || summary.legacy_undos_backed_up as u64 != plan.legacy_undos_to_backup
-        || undo_input_bytes != plan.undo_input_bytes
-        || backup_output_bytes != plan.backup_output_bytes
-        || rewrite_output_bytes != plan.rewrite_output_bytes
-        || publication_bytes != plan.publication_bytes
-        || peak_pending_names != plan.peak_pending_names
-        || peak_pending_name_bytes != plan.peak_pending_name_bytes
-        || summary.tip_height != expected_tip_height
-        || accumulator != expected_accumulator
-    {
-        return Err(StateError::Codec(
-            "name-tree interval migration execution disagrees with its read-only preflight"
-                .to_owned(),
-        ));
-    }
-
-    let mut final_batch = store.batch();
-    final_batch.put(
-        ColumnFamily::Meta,
-        MetaKey::NameTreeRoot.as_bytes(),
-        original_committed_root.as_bytes(),
-    )?;
-    match accumulator {
-        Some(accumulator) => final_batch.put(
-            ColumnFamily::Snapshots,
-            NAME_TREE_ACCUMULATOR_KEY,
-            &accumulator.encode()?,
-        )?,
-        None => final_batch.delete(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?,
-    }
-    final_batch.put(
-        ColumnFamily::Meta,
-        MetaKey::SchemaVersion.as_bytes(),
-        &encode_u32(SCHEMA_VERSION),
-    )?;
-    final_batch.put(
-        ColumnFamily::Meta,
-        MetaKey::StorageProfile.as_bytes(),
-        STORAGE_PROFILE,
-    )?;
-    final_batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    store.commit(final_batch)?;
-    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
-    Ok(Some(summary))
 }
 
 pub fn name_tree_snapshot_pin_key(height: Height) -> Vec<u8> {
@@ -6075,7 +5065,7 @@ where
     Ok(summary)
 }
 
-/// Collect pins for bounded compatibility call sites. Production archive
+/// Collect pins for bounded collecting call sites. Production archive
 /// startup should use [`visit_name_tree_snapshot_pins_bounded`] with a
 /// validated tip-derived total limit so memory remains page-bounded.
 pub fn load_name_tree_snapshot_pins<T: ReadSnapshot>(
@@ -6100,8 +5090,8 @@ fn stage_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
 ) -> Result<(), StateError> {
     let key = name_tree_snapshot_pin_key(pin.height);
     let raw = pin.encode();
-    match snapshot.get(ColumnFamily::Snapshots, &key)? {
-        Some(existing) if existing != raw => {
+    match snapshot.get_shared(ColumnFamily::Snapshots, &key)? {
+        Some(existing) if existing.as_ref() != raw.as_slice() => {
             return Err(StateError::NameTreeSnapshotPinConflict { height: pin.height });
         }
         Some(_) => {}
@@ -6120,7 +5110,7 @@ pub fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
     undo: &BlockUndo,
 ) -> Result<(), StateError> {
     let key = name_tree_snapshot_pin_key(undo.height);
-    let Some(raw) = snapshot.get(ColumnFamily::Snapshots, &key)? else {
+    let Some(raw) = snapshot.get_shared(ColumnFamily::Snapshots, &key)? else {
         return Ok(());
     };
     let pin = NameTreeSnapshotPin::decode(&raw)?;
@@ -6313,7 +5303,7 @@ fn load_canonical_header<T: ReadSnapshot>(
         return Ok(None);
     };
     let raw = snapshot
-        .get(ColumnFamily::Headers, hash.as_bytes())?
+        .get_shared(ColumnFamily::Headers, hash.as_bytes())?
         .ok_or(StateError::Chain(hns_chain::ChainError::MissingHeader(
             hash,
         )))?;
@@ -6524,11 +5514,12 @@ pub fn materialize_name_tree_snapshot<T: ReadSnapshot>(
 /// Load the durable binding for the latest interval-committed name-state tree.
 pub fn load_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
     let bytes = snapshot
-        .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())?
+        .get_shared(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())?
         .ok_or(StateError::MissingStoredTreeRoot)?;
     let root: [u8; 32] = bytes
+        .as_ref()
         .try_into()
-        .map_err(|bytes: Vec<u8>| StateError::InvalidStoredTreeRootLength(bytes.len()))?;
+        .map_err(|_| StateError::InvalidStoredTreeRootLength(bytes.len()))?;
     Ok(TreeRoot::new(root))
 }
 
@@ -6537,11 +5528,12 @@ pub fn load_stored_name_tree_commit_root<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<TreeRoot, StateError> {
     let bytes = snapshot
-        .get(ColumnFamily::Meta, MetaKey::NameTreeCommitRoot.as_bytes())?
+        .get_shared(ColumnFamily::Meta, MetaKey::NameTreeCommitRoot.as_bytes())?
         .ok_or(StateError::MissingStoredTreeCommitRoot)?;
     let root: [u8; 32] = bytes
+        .as_ref()
         .try_into()
-        .map_err(|bytes: Vec<u8>| StateError::InvalidStoredTreeCommitRootLength(bytes.len()))?;
+        .map_err(|_| StateError::InvalidStoredTreeCommitRootLength(bytes.len()))?;
     Ok(TreeRoot::new(root))
 }
 
@@ -6581,9 +5573,9 @@ pub fn verify_stored_name_tree_root_metadata_binding<T: ReadSnapshot>(
     Ok(stored)
 }
 
-/// Legacy combined metadata/NameState binding. When no accumulator exists this
+/// Combined metadata/NameState binding. When no accumulator exists this
 /// materializes the complete NameState column and is therefore an offline or
-/// compatibility diagnostic, not a production startup primitive.
+/// collecting diagnostic, not a production startup primitive.
 pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<TreeRoot, StateError> {
@@ -6603,7 +5595,7 @@ pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
 /// Exhaustively materialize and bind the current NameState view, pending
 /// interval accumulator, canonical undo, and latest committed root. This
 /// collecting implementation is retained for offline diagnosis and small
-/// compatibility tests; production startup uses the bounded streaming variant.
+/// differential tests; production startup uses the bounded streaming variant.
 fn prepare_committed_name_tree<T: ReadSnapshot>(
     snapshot: &T,
     tree_interval: Height,
@@ -6659,7 +5651,7 @@ fn prepare_committed_name_tree<T: ReadSnapshot>(
             ))
         })?;
         let raw = snapshot
-            .get(ColumnFamily::Undo, hash.as_bytes())?
+            .get_shared(ColumnFamily::Undo, hash.as_bytes())?
             .ok_or(StateError::MissingUndo(hash))?;
         let undo = BlockUndo::decode(&raw)?;
         if undo.block_hash != hash
@@ -6777,7 +5769,7 @@ fn prepare_committed_name_tree_bounded<T: ReadSnapshot>(
             ))
         })?;
         let raw = snapshot
-            .get(ColumnFamily::Undo, hash.as_bytes())?
+            .get_shared(ColumnFamily::Undo, hash.as_bytes())?
             .ok_or(StateError::MissingUndo(hash))?;
         interval_undo_bytes = add_bounded_resource(
             interval_undo_bytes,
@@ -6946,7 +5938,7 @@ pub fn diagnose_committed_name_tree_node<T: ReadSnapshot>(
     Ok((actual, name_count, record_count, path))
 }
 
-/// Legacy collecting root oracle for offline diagnosis and differential tests.
+/// Collecting root oracle for offline diagnosis and differential tests.
 /// Production startup uses [`verify_name_tree_interval_state_bounded`].
 pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
     snapshot: &T,
@@ -6966,21 +5958,6 @@ struct NameTreeStreamingPreparation {
     stored: TreeRoot,
     overrides: BTreeMap<NameHash, Option<Vec<u8>>>,
     override_working_set_bytes: u64,
-    reconciliation: Option<NameTreeAccumulatorReconciliation>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NameTreeAccumulatorCountPolicy {
-    Exact,
-    LegacySubset,
-}
-
-#[derive(Debug)]
-struct NameTreeAccumulatorReconciliation {
-    previous_raw: Vec<u8>,
-    previous_names: usize,
-    previous_references: u64,
-    reconciled: NameTreeAccumulator,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -7059,7 +6036,7 @@ fn load_name_tree_accumulator_streaming_bounded<T: ReadSnapshot>(
     snapshot: &T,
     limits: NameTreeMaterializationLimits,
 ) -> Result<Option<(NameTreeAccumulator, u64)>, StateError> {
-    let Some(raw) = snapshot.get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)? else {
+    let Some(raw) = snapshot.get_shared(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)? else {
         return Ok(None);
     };
     let raw_bytes = u64::try_from(raw.len()).unwrap_or(u64::MAX);
@@ -7101,7 +6078,7 @@ where
     ensure_retained_root_deadline(deadline, "name-tree streaming verification")?;
     let mut reader = BorrowedCodecReader::new(bytes, BLOCK_UNDO_CODEC_MAX, "block undo")?;
     let version = reader.read_u32()?;
-    if version != BLOCK_UNDO_VERSION && version != LEGACY_BLOCK_UNDO_VERSION {
+    if version != BLOCK_UNDO_VERSION {
         return Err(StateError::Codec(format!(
             "unsupported block undo version {version}"
         )));
@@ -7185,7 +6162,7 @@ where
         name_tree_interval_boundary,
         previous_name_tree_accumulator_last_height,
         has_previous_name_tree_accumulator,
-    ) = if version == BLOCK_UNDO_VERSION {
+    ) = {
         let boundary = match reader.read_u8()? {
             0 => false,
             1 => true,
@@ -7220,8 +6197,6 @@ where
             }
         };
         (boundary, previous_height, has_previous)
-    } else {
-        (false, None, false)
     };
     reader.ensure_finished()?;
     Ok(PendingIntervalUndoView {
@@ -7237,22 +6212,6 @@ fn prepare_name_tree_streaming_overrides<T: ReadSnapshot>(
     tree_interval: Height,
     tip_height: Height,
     limits: NameTreeMaterializationLimits,
-) -> Result<NameTreeStreamingPreparation, StateError> {
-    prepare_name_tree_streaming_overrides_with_count_policy(
-        snapshot,
-        tree_interval,
-        tip_height,
-        limits,
-        NameTreeAccumulatorCountPolicy::Exact,
-    )
-}
-
-fn prepare_name_tree_streaming_overrides_with_count_policy<T: ReadSnapshot>(
-    snapshot: &T,
-    tree_interval: Height,
-    tip_height: Height,
-    limits: NameTreeMaterializationLimits,
-    count_policy: NameTreeAccumulatorCountPolicy,
 ) -> Result<NameTreeStreamingPreparation, StateError> {
     limits.page_budget.validate()?;
     ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
@@ -7282,7 +6241,6 @@ fn prepare_name_tree_streaming_overrides_with_count_policy<T: ReadSnapshot>(
             stored,
             overrides: BTreeMap::new(),
             override_working_set_bytes: 0,
-            reconciliation: None,
         });
     };
 
@@ -7304,9 +6262,7 @@ fn prepare_name_tree_streaming_overrides_with_count_policy<T: ReadSnapshot>(
         ));
     }
 
-    let distinct_override_limit = limits
-        .max_records
-        .min(NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES);
+    let distinct_override_limit = limits.max_records.min(NAME_TREE_ACCUMULATOR_MAX_NAMES);
     let accumulator_names = u64::try_from(accumulator.names.len()).unwrap_or(u64::MAX);
     if accumulator_names > distinct_override_limit {
         return Err(StateError::ResourceLimit {
@@ -7340,7 +6296,7 @@ fn prepare_name_tree_streaming_overrides_with_count_policy<T: ReadSnapshot>(
             ))
         })?;
         let raw = snapshot
-            .get(ColumnFamily::Undo, hash.as_bytes())?
+            .get_shared(ColumnFamily::Undo, hash.as_bytes())?
             .ok_or(StateError::MissingUndo(hash))?;
         interval_undo_bytes = add_bounded_resource(
             interval_undo_bytes,
@@ -7438,69 +6394,17 @@ fn prepare_name_tree_streaming_overrides_with_count_policy<T: ReadSnapshot>(
             )));
         }
     }
-    let reconciliation = match count_policy {
-        NameTreeAccumulatorCountPolicy::Exact => {
-            if accumulator.names != expected_counts {
-                return Err(StateError::Codec(
-                    "name-tree accumulator names disagree with canonical undo".to_owned(),
-                ));
-            }
-            None
-        }
-        NameTreeAccumulatorCountPolicy::LegacySubset => {
-            let is_subset = accumulator.names.iter().all(|(name_hash, count)| {
-                expected_counts
-                    .get(name_hash)
-                    .is_some_and(|expected| count <= expected)
-            });
-            if !is_subset {
-                return Err(StateError::Codec(
-                    "name-tree accumulator cannot be safely reconciled because its names are not a subset of canonical undo"
-                        .to_owned(),
-                ));
-            }
-            if accumulator.names == expected_counts {
-                None
-            } else {
-                let maximum_raw_bytes = |names: usize| {
-                    (4 + 32 + 4 + 4 + 9 + 32u64).saturating_add(
-                        u64::try_from(names)
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(NAME_TREE_ACCUMULATOR_ENTRY_BYTES as u64),
-                    )
-                };
-                let repair_raw_bytes = maximum_raw_bytes(accumulator.names.len())
-                    .saturating_add(maximum_raw_bytes(expected_counts.len()));
-                ensure_name_tree_streaming_working_set(
-                    audit_working_set_bytes,
-                    repair_raw_bytes,
-                    limits,
-                )?;
-                let previous_raw = accumulator.encode()?;
-                let previous_names = accumulator.names.len();
-                let previous_references = accumulator
-                    .names
-                    .values()
-                    .map(|count| u64::from(*count))
-                    .sum();
-                let mut reconciled = accumulator;
-                reconciled.names = expected_counts;
-                Some(NameTreeAccumulatorReconciliation {
-                    previous_raw,
-                    previous_names,
-                    previous_references,
-                    reconciled,
-                })
-            }
-        }
-    };
+    if accumulator.names != expected_counts {
+        return Err(StateError::Codec(
+            "name-tree accumulator names disagree with canonical undo".to_owned(),
+        ));
+    }
     ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
 
     Ok(NameTreeStreamingPreparation {
         stored,
         overrides: boundary_overrides,
         override_working_set_bytes,
-        reconciliation,
     })
 }
 
@@ -7735,112 +6639,6 @@ pub fn verify_name_tree_interval_state_bounded<T: ReadSnapshot>(
     Ok(audit.root)
 }
 
-/// Reconcile the sole legacy accumulator mismatch that is safe to repair at
-/// startup: every stored count must be less than or equal to the raw count in
-/// the exact canonical pending-interval undo sequence. The sequence metadata,
-/// heights, roots, and accumulator identity are validated before any write,
-/// and rewinding the current NameState view through the earliest raw undo for
-/// each name must reconstruct the committed boundary root.
-///
-/// This API must run before concurrent state writers are started. Its only
-/// mutation is one atomic replacement of [`NAME_TREE_ACCUMULATOR_KEY`]. A
-/// fresh bounded invariant audit and exact readback follow the commit.
-pub fn reconcile_legacy_name_tree_interval_accumulator_bounded<S: Store>(
-    store: &S,
-    tree_interval: Height,
-    tip_height: Height,
-    limits: NameTreeMaterializationLimits,
-) -> Result<Option<NameTreeAccumulatorReconciliationSummary>, StateError> {
-    let snapshot = store.snapshot()?;
-    let preparation = prepare_name_tree_streaming_overrides_with_count_policy(
-        &snapshot,
-        tree_interval,
-        tip_height,
-        limits,
-        NameTreeAccumulatorCountPolicy::LegacySubset,
-    )?;
-    let Some(reconciliation) = preparation.reconciliation else {
-        return Ok(None);
-    };
-    let boundary_audit = stream_name_state_root_with_overrides_bounded(
-        &snapshot,
-        &preparation.overrides,
-        preparation.override_working_set_bytes,
-        limits,
-    )?;
-    if preparation.stored != boundary_audit.root {
-        return Err(StateError::StoredTreeRootMismatch {
-            stored: preparation.stored,
-            actual: boundary_audit.root,
-        });
-    }
-
-    let reconciled_raw = reconciliation.reconciled.encode()?;
-    let summary = NameTreeAccumulatorReconciliationSummary {
-        first_height: reconciliation.reconciled.first_height,
-        last_height: reconciliation.reconciled.last_height,
-        previous_names: reconciliation.previous_names,
-        reconciled_names: reconciliation.reconciled.names.len(),
-        previous_references: reconciliation.previous_references,
-        reconciled_references: reconciliation
-            .reconciled
-            .names
-            .values()
-            .map(|count| u64::from(*count))
-            .sum(),
-    };
-    let original_raw = reconciliation.previous_raw;
-    drop(snapshot);
-
-    // Refuse to publish a plan derived from an accumulator that changed after
-    // its immutable snapshot was acquired. Startup owns the only writer; this
-    // readback makes that precondition explicit and fail-closed.
-    let current_snapshot = store.snapshot()?;
-    if current_snapshot.get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?
-        != Some(original_raw)
-    {
-        return Err(StateError::Codec(
-            "name-tree accumulator changed while startup reconciliation was prepared".to_owned(),
-        ));
-    }
-    drop(current_snapshot);
-
-    let mut batch = store.batch();
-    batch.put(
-        ColumnFamily::Snapshots,
-        NAME_TREE_ACCUMULATOR_KEY,
-        &reconciled_raw,
-    )?;
-    store.commit(batch)?;
-
-    let verified_snapshot = store.snapshot()?;
-    let verified = verify_name_tree_interval_state_bounded(
-        &verified_snapshot,
-        tree_interval,
-        tip_height,
-        limits,
-    )?;
-    if verified != preparation.stored {
-        return Err(StateError::StoredTreeRootMismatch {
-            stored: preparation.stored,
-            actual: verified,
-        });
-    }
-    let readback = verified_snapshot
-        .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?
-        .ok_or_else(|| {
-            StateError::Codec(
-                "name-tree accumulator disappeared after startup reconciliation".to_owned(),
-            )
-        })?;
-    if readback != reconciled_raw {
-        return Err(StateError::Codec(
-            "name-tree accumulator readback disagrees with startup reconciliation".to_owned(),
-        ));
-    }
-    Ok(Some(summary))
-}
-
 pub fn encode_coin(coin: &Coin) -> Vec<u8> {
     let mut writer = Writer::with_capacity(COIN_CODEC_MAX);
     coin.outpoint.write_to(&mut writer);
@@ -8045,7 +6843,7 @@ fn load_name_state<T: ReadSnapshot>(
     snapshot: &T,
     name_hash: &NameHash,
 ) -> Result<Option<NameState>, StateError> {
-    let Some(bytes) = snapshot.get(ColumnFamily::NameState, name_hash.as_bytes())? else {
+    let Some(bytes) = snapshot.get_shared(ColumnFamily::NameState, name_hash.as_bytes())? else {
         return Ok(None);
     };
     decode_name_state(name_hash, &bytes).map(Some)
@@ -8061,7 +6859,7 @@ fn load_name_states_batched<T: ReadSnapshot>(
             .iter()
             .map(|name_hash| name_hash.as_bytes().as_slice())
             .collect::<Vec<_>>();
-        let values = snapshot.get_many(ColumnFamily::NameState, &keys)?;
+        let values = snapshot.get_many_shared(ColumnFamily::NameState, &keys)?;
         if values.len() != chunk.len() {
             return Err(StateError::Codec(format!(
                 "name-state multi-get returned {} values for {} keys",
@@ -9118,6 +7916,14 @@ mod tests {
         };
         let raw = undo.encode().expect("encode undo");
         assert_eq!(BlockUndo::decode(&raw).expect("authoritative decode"), undo);
+        let mut obsolete = raw.clone();
+        obsolete[..4].copy_from_slice(&6u32.to_le_bytes());
+        assert!(
+            matches!(BlockUndo::decode(&obsolete), Err(StateError::Codec(message)) if message.contains("unsupported"))
+        );
+        assert!(
+            matches!(decode_block_undo_metadata(&obsolete, Instant::now() + Duration::from_secs(10)), Err(StateError::Codec(message)) if message.contains("unsupported"))
+        );
         let metadata = decode_block_undo_metadata(&raw, Instant::now() + Duration::from_secs(10))
             .expect("borrowing metadata decode");
         assert_eq!(metadata.block_hash, undo.block_hash);
@@ -9743,497 +8549,6 @@ mod tests {
         .expect("test engine")
     }
 
-    fn encode_legacy_block_undo(undo: &BlockUndo) -> Vec<u8> {
-        let mut writer = Writer::new();
-        writer.write_u32(LEGACY_BLOCK_UNDO_VERSION);
-        writer.write_bytes(undo.block_hash.as_bytes());
-        writer.write_u32(undo.height);
-        writer.write_bytes(undo.previous_tree_root.as_bytes());
-        writer.write_bytes(undo.resulting_tree_root.as_bytes());
-        writer.write_bytes(undo.previous_committed_tree_root.as_bytes());
-        writer.write_bytes(undo.resulting_committed_tree_root.as_bytes());
-        writer.write_varint(undo.spent_coins.len() as u64);
-        for coin in &undo.spent_coins {
-            writer.write_varbytes(&encode_coin(coin));
-        }
-        writer.write_varint(undo.created_coins.len() as u64);
-        for outpoint in &undo.created_coins {
-            outpoint.write_to(&mut writer);
-        }
-        writer.write_varint(undo.airdrop_positions.len() as u64);
-        for position in &undo.airdrop_positions {
-            writer.write_u32(*position);
-        }
-        writer.write_varint(undo.previous_name_states.len() as u64);
-        for name_undo in &undo.previous_name_states {
-            writer.write_varbytes(&encode_name_undo(name_undo).expect("legacy name undo"));
-        }
-        writer.finish()
-    }
-
-    #[test]
-    fn interval_migration_batch_accounts_for_one_near_max_undo_atomically() {
-        let backup_key_bytes =
-            NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX.len() + BLOCK_UNDO_KEY_BYTES;
-        let (backup, rewrite, publication) = name_tree_interval_migration_record_bytes(
-            BLOCK_UNDO_CODEC_MAX,
-            BLOCK_UNDO_CODEC_MAX,
-            backup_key_bytes,
-            true,
-        )
-        .expect("near-max record accounting");
-        assert_eq!(publication, backup + rewrite);
-        assert!(publication <= NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_BATCH_BYTES);
-        ensure_name_tree_interval_migration_record_batch_limit(publication, publication)
-            .expect("exact one-record batch limit");
-        assert!(matches!(
-            ensure_name_tree_interval_migration_record_batch_limit(publication, publication - 1),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration pending batch bytes",
-                limit,
-                actual,
-            }) if limit == publication - 1 && actual == publication
-        ));
-        assert_eq!(
-            NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAME_BYTES,
-            NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES
-                * NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES
-        );
-    }
-
-    #[test]
-    fn schema_16_working_tree_migrates_to_reversible_interval_accumulator() {
-        let store = MemoryStore::new();
-        let mut state = engine(store.clone());
-
-        let mut first = block(100, vec![coinbase(vec![open_output(b"migratealpha")])]);
-        first.header.tree_root = *TreeRoot::ZERO.as_bytes();
-        let first_hash = first.hash();
-        let first_summary = state
-            .connect_block(ConnectBlock {
-                block_hash: first_hash,
-                height: 100,
-                coinbase_maturity: 0,
-                block_reward: 0,
-                block: &first,
-            })
-            .expect("connect migration boundary");
-
-        let mut second = block(101, vec![coinbase(vec![open_output(b"migratebeta")])]);
-        second.header.tree_root = *first_summary.resulting_committed_tree_root.as_bytes();
-        let second_hash = second.hash();
-        state
-            .connect_block(ConnectBlock {
-                block_hash: second_hash,
-                height: 101,
-                coinbase_maturity: 0,
-                block_reward: 0,
-                block: &second,
-            })
-            .expect("connect migration pending block");
-
-        let snapshot = store.snapshot().expect("new-profile snapshot");
-        let mut first_undo = BlockUndo::decode(
-            &snapshot
-                .get(ColumnFamily::Undo, first_hash.as_bytes())
-                .expect("first undo read")
-                .expect("first undo"),
-        )
-        .expect("decode first undo");
-        let mut second_undo = BlockUndo::decode(
-            &snapshot
-                .get(ColumnFamily::Undo, second_hash.as_bytes())
-                .expect("second undo read")
-                .expect("second undo"),
-        )
-        .expect("decode second undo");
-        let committed_root = load_stored_name_tree_commit_root(&snapshot).expect("committed root");
-        let working_root = rebuild_name_tree_root(&snapshot).expect("legacy working root");
-        let beta_hash = hash_name("migratebeta").expect("beta hash");
-        let beta_state = load_name_state(&snapshot, &beta_hash)
-            .expect("beta state read")
-            .expect("beta state");
-        let mut legacy_batch = store.batch();
-        let staged_working_root = stage_name_tree_with_overrides(
-            &snapshot,
-            &mut legacy_batch,
-            committed_root,
-            &BTreeMap::from([(beta_hash, Some(beta_state))]),
-        )
-        .expect("stage legacy working tree");
-        assert_eq!(staged_working_root, working_root);
-        first_undo.name_tree_interval_boundary = false;
-        first_undo.previous_name_tree_accumulator_last_height = None;
-        first_undo.previous_name_tree_accumulator = None;
-        second_undo.previous_tree_root = committed_root;
-        second_undo.resulting_tree_root = working_root;
-        second_undo.name_tree_interval_boundary = false;
-        second_undo.previous_name_tree_accumulator_last_height = None;
-        second_undo.previous_name_tree_accumulator = None;
-        legacy_batch
-            .put(
-                ColumnFamily::Undo,
-                first_hash.as_bytes(),
-                &encode_legacy_block_undo(&first_undo),
-            )
-            .expect("legacy first undo");
-        legacy_batch
-            .put(
-                ColumnFamily::Undo,
-                second_hash.as_bytes(),
-                &encode_legacy_block_undo(&second_undo),
-            )
-            .expect("legacy second undo");
-        write_canonical_height_to_batch(&mut legacy_batch, 100, first_hash)
-            .expect("first active height");
-        write_canonical_height_to_batch(&mut legacy_batch, 101, second_hash)
-            .expect("second active height");
-        legacy_batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeRoot.as_bytes(),
-                working_root.as_bytes(),
-            )
-            .expect("legacy working root");
-        legacy_batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::SchemaVersion.as_bytes(),
-                &encode_u32(PRE_INTERVAL_SCHEMA_VERSION),
-            )
-            .expect("legacy schema");
-        legacy_batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::StorageProfile.as_bytes(),
-                PRE_INTERVAL_STORAGE_PROFILE,
-            )
-            .expect("legacy profile");
-        legacy_batch
-            .delete(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
-            .expect("remove new accumulator");
-        drop(snapshot);
-        store.commit(legacy_batch).expect("commit legacy fixture");
-
-        let migration_limits = NameTreeIntervalMigrationLimits {
-            max_height_records: 2,
-            max_height_bytes: 2 * (4 + 32),
-            page_budget: PrefixScanBudget {
-                max_entries: 1,
-                max_bytes: 4 + 32,
-            },
-            deadline: Instant::now() + Duration::from_secs(60),
-            ..NameTreeIntervalMigrationLimits::default()
-        };
-        let plan = plan_name_tree_interval_accumulator_migration_bounded(
-            &store,
-            Network::Regtest.params().names.tree_interval,
-            migration_limits,
-        )
-        .expect("migration plan")
-        .expect("schema-16 migration required");
-        assert_eq!(plan.active_heights, 2);
-        assert_eq!(plan.height_index_bytes, 2 * (4 + 32));
-        assert_eq!(plan.undo_records, 2);
-        assert_eq!(plan.legacy_undos_to_backup, 2);
-        assert_eq!(plan.peak_pending_names, 1);
-        assert_eq!(
-            plan.peak_pending_name_bytes,
-            NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES
-        );
-        assert_eq!(
-            plan.required_temporary_bytes,
-            plan.publication_bytes * NAME_TREE_INTERVAL_MIGRATION_ROCKS_TEMPORARY_MULTIPLIER
-        );
-        let migration_limits = NameTreeIntervalMigrationLimits {
-            max_undo_input_bytes: plan.undo_input_bytes,
-            max_backup_output_bytes: plan.backup_output_bytes,
-            max_publication_bytes: plan.publication_bytes,
-            max_pending_batch_bytes: plan.maximum_record_publication_bytes,
-            max_pending_names: plan.peak_pending_names,
-            max_pending_name_bytes: plan.peak_pending_name_bytes,
-            ..migration_limits
-        };
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    deadline: Instant::now(),
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::DeadlineExceeded {
-                context: "name-tree interval migration"
-            })
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_height_records: 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration height records",
-                limit: 1,
-                actual: 2,
-            })
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_height_bytes: 2 * (4 + 32) - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration height bytes",
-                limit,
-                actual,
-            }) if limit == (2 * (4 + 32) - 1) as u64
-                && actual == (2 * (4 + 32)) as u64
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_undo_input_bytes: plan.undo_input_bytes - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration undo input bytes",
-                limit,
-                actual,
-            }) if limit == plan.undo_input_bytes - 1 && actual == plan.undo_input_bytes
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_backup_output_bytes: plan.backup_output_bytes - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration backup output bytes",
-                limit,
-                actual,
-            }) if limit == plan.backup_output_bytes - 1
-                && actual == plan.backup_output_bytes
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_publication_bytes: plan.publication_bytes - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration publication bytes",
-                limit,
-                actual,
-            }) if limit == plan.publication_bytes - 1 && actual == plan.publication_bytes
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_pending_batch_bytes: plan.maximum_record_publication_bytes - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration pending batch bytes",
-                limit,
-                actual,
-            }) if limit == plan.maximum_record_publication_bytes - 1
-                && actual == plan.maximum_record_publication_bytes
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_pending_names: plan.peak_pending_names - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration pending names",
-                limit,
-                actual,
-            }) if limit == plan.peak_pending_names - 1
-                && actual == plan.peak_pending_names
-        ));
-        assert!(matches!(
-            migrate_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                NameTreeIntervalMigrationLimits {
-                    max_pending_name_bytes: plan.peak_pending_name_bytes - 1,
-                    ..migration_limits
-                },
-            ),
-            Err(StateError::ResourceLimit {
-                context: "name-tree interval migration pending name bytes",
-                limit,
-                actual,
-            }) if limit == plan.peak_pending_name_bytes - 1
-                && actual == plan.peak_pending_name_bytes
-        ));
-        let migration = migrate_name_tree_interval_accumulator_bounded(
-            &store,
-            Network::Regtest.params().names.tree_interval,
-            migration_limits,
-        )
-        .expect("migrate legacy state")
-        .expect("migration performed");
-        assert_eq!(migration.active_heights, 2);
-        assert_eq!(migration.undos_rewritten, 2);
-        assert_eq!(migration.legacy_undos_backed_up, 2);
-        assert_eq!(migration.pending_names, 1);
-        assert_eq!(migration.tip_height, Some(101));
-        assert_eq!(migration.height_index_bytes, plan.height_index_bytes);
-        assert_eq!(migration.undo_input_bytes, plan.undo_input_bytes);
-        assert_eq!(migration.backup_output_bytes, plan.backup_output_bytes);
-        assert_eq!(migration.rewrite_output_bytes, plan.rewrite_output_bytes);
-        assert_eq!(migration.publication_bytes, plan.publication_bytes);
-        assert_eq!(
-            migration.required_temporary_bytes,
-            plan.required_temporary_bytes
-        );
-        assert_eq!(migration.peak_pending_names, plan.peak_pending_names);
-        assert_eq!(
-            migration.peak_pending_name_bytes,
-            plan.peak_pending_name_bytes
-        );
-        assert!(migration.peak_batch_bytes <= migration_limits.max_pending_batch_bytes);
-        assert_eq!(migration.batch_commits, 2);
-
-        let snapshot = store.snapshot().expect("migrated snapshot");
-        assert_eq!(
-            decode_u32(
-                &snapshot
-                    .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
-                    .expect("schema read")
-                    .expect("schema")
-            )
-            .expect("decode schema"),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
-                .expect("profile read")
-                .expect("profile"),
-            STORAGE_PROFILE
-        );
-        assert_eq!(
-            load_stored_name_tree_root(&snapshot).expect("migrated root"),
-            committed_root
-        );
-        let accumulator = load_name_tree_accumulator(&snapshot)
-            .expect("accumulator read")
-            .expect("accumulator");
-        assert_eq!(accumulator.first_height, 101);
-        assert_eq!(accumulator.last_height, 101);
-        assert_eq!(accumulator.names, BTreeMap::from([(beta_hash, 1)]));
-        verify_name_tree_interval_state(
-            &snapshot,
-            Network::Regtest.params().names.tree_interval,
-            101,
-        )
-        .expect("migrated interval audit");
-        drop(snapshot);
-
-        state
-            .disconnect_block(DisconnectBlock {
-                block_hash: second_hash,
-                height: 101,
-            })
-            .expect("disconnect migrated pending block");
-        let snapshot = store.snapshot().expect("post-disconnect snapshot");
-        assert!(load_name_tree_accumulator(&snapshot)
-            .expect("post-disconnect accumulator")
-            .is_none());
-        assert_eq!(
-            verify_stored_name_tree_root(&snapshot).expect("post-disconnect root"),
-            committed_root
-        );
-    }
-
-    #[test]
-    fn schema_17_and_18_interval_state_receive_atomic_storage_profile_cutover() {
-        for (schema, profile) in [
-            (LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE),
-            (INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE),
-        ] {
-            let store = MemoryStore::new();
-            hns_store::initialize_schema(&store).expect("initialize current schema");
-            let mut batch = store.batch();
-            batch
-                .put(
-                    ColumnFamily::Meta,
-                    MetaKey::SchemaVersion.as_bytes(),
-                    &encode_u32(schema),
-                )
-                .expect("legacy schema");
-            batch
-                .put(
-                    ColumnFamily::Meta,
-                    MetaKey::StorageProfile.as_bytes(),
-                    profile,
-                )
-                .expect("legacy profile");
-            batch
-                .put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[1])
-                .expect("legacy clean marker");
-            store.commit(batch).expect("commit legacy markers");
-
-            assert!(migrate_name_tree_interval_accumulator(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-            )
-            .expect("profile migration")
-            .is_none());
-            let snapshot = store.snapshot().expect("migrated snapshot");
-            assert_eq!(
-                decode_u32(
-                    &snapshot
-                        .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
-                        .expect("schema read")
-                        .expect("schema")
-                )
-                .expect("decode schema"),
-                SCHEMA_VERSION
-            );
-            assert_eq!(
-                snapshot
-                    .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
-                    .expect("profile read")
-                    .expect("profile"),
-                STORAGE_PROFILE
-            );
-            assert_eq!(
-                snapshot
-                    .get(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes())
-                    .expect("clean marker"),
-                Some(vec![0])
-            );
-        }
-    }
-
     #[test]
     fn mainnet_2024_open_state_waits_for_tree_interval_commitment() {
         let store = MemoryStore::new();
@@ -10320,342 +8635,6 @@ mod tests {
             load_stored_name_tree_commit_root(&snapshot).expect("commit root"),
             pending_root
         );
-    }
-
-    fn seed_committed_interval_name(store: &MemoryStore, state: &NameState) -> TreeRoot {
-        let snapshot = store.snapshot().expect("seed snapshot");
-        let mut batch = store.batch();
-        write_name_state_to_batch(&mut batch, state).expect("seed name state");
-        let root = stage_name_tree_with_overrides(
-            &snapshot,
-            &mut batch,
-            TreeRoot::ZERO,
-            &BTreeMap::from([(state.name_hash, Some(state.clone()))]),
-        )
-        .expect("seed committed name root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeRoot.as_bytes(),
-                root.as_bytes(),
-            )
-            .expect("bind seeded root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeCommitRoot.as_bytes(),
-                root.as_bytes(),
-            )
-            .expect("bind seeded committed root");
-        drop(snapshot);
-        store.commit(batch).expect("commit seeded name state");
-        root
-    }
-
-    fn install_legacy_noop_interval_undo(
-        store: &MemoryStore,
-        block_hash: BlockHash,
-        height: Height,
-        root: TreeRoot,
-        previous: NameState,
-    ) {
-        let undo = BlockUndo {
-            block_hash,
-            height,
-            previous_tree_root: root,
-            resulting_tree_root: root,
-            previous_committed_tree_root: root,
-            resulting_committed_tree_root: root,
-            spent_coins: Vec::new(),
-            created_coins: Vec::new(),
-            airdrop_positions: Vec::new(),
-            previous_name_states: vec![NameUndo {
-                name_hash: previous.name_hash,
-                previous: Some(previous),
-            }],
-            name_tree_interval_boundary: false,
-            previous_name_tree_accumulator_last_height: None,
-            previous_name_tree_accumulator: None,
-        };
-        let accumulator = NameTreeAccumulator::new(root, height);
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Undo,
-                block_hash.as_bytes(),
-                &undo.encode().expect("encode legacy no-op undo"),
-            )
-            .expect("stage legacy no-op undo");
-        write_canonical_height_to_batch(&mut batch, height, block_hash)
-            .expect("stage legacy canonical height");
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                NAME_TREE_ACCUMULATOR_KEY,
-                &accumulator.encode().expect("encode legacy accumulator"),
-            )
-            .expect("stage legacy accumulator");
-        store.commit(batch).expect("commit legacy interval fixture");
-    }
-
-    #[test]
-    fn legacy_noop_undo_reconciliation_survives_restart_and_disconnect() {
-        let store = MemoryStore::new();
-        let mut engine = engine(store.clone());
-        let name_hash = hash_name("legacy-noop").expect("legacy name hash");
-        let mut state = NameState::null(name_hash);
-        state.initialize(b"legacy-noop".to_vec(), 5);
-        let root = seed_committed_interval_name(&store, &state);
-        let block_hash = BlockHash::new([0xa1; 32]);
-        let height = 11;
-        install_legacy_noop_interval_undo(&store, block_hash, height, root, state.clone());
-
-        let snapshot = store.snapshot().expect("affected restart snapshot");
-        let undo_before = snapshot
-            .get(ColumnFamily::Undo, block_hash.as_bytes())
-            .expect("read legacy undo")
-            .expect("legacy undo");
-        let accumulator_before = snapshot
-            .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
-            .expect("read legacy accumulator")
-            .expect("legacy accumulator");
-        assert!(matches!(
-            verify_name_tree_interval_state_bounded(
-                &snapshot,
-                Network::Regtest.params().names.tree_interval,
-                height,
-                NameTreeMaterializationLimits::default(),
-            ),
-            Err(StateError::Codec(message))
-                if message == "name-tree accumulator names disagree with canonical undo"
-        ));
-        drop(snapshot);
-
-        let reconciliation = reconcile_legacy_name_tree_interval_accumulator_bounded(
-            &store,
-            Network::Regtest.params().names.tree_interval,
-            height,
-            NameTreeMaterializationLimits::default(),
-        )
-        .expect("reconcile affected legacy accumulator")
-        .expect("legacy accumulator requires reconciliation");
-        assert_eq!(reconciliation.first_height, height);
-        assert_eq!(reconciliation.last_height, height);
-        assert_eq!(reconciliation.previous_names, 0);
-        assert_eq!(reconciliation.reconciled_names, 1);
-        assert_eq!(reconciliation.previous_references, 0);
-        assert_eq!(reconciliation.reconciled_references, 1);
-
-        let snapshot = store.snapshot().expect("reconciled restart snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Undo, block_hash.as_bytes())
-                .expect("read reconciled undo")
-                .expect("reconciled undo"),
-            undo_before,
-            "reconciliation must not rewrite canonical undo"
-        );
-        let accumulator_after = snapshot
-            .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
-            .expect("read reconciled accumulator")
-            .expect("reconciled accumulator");
-        assert_ne!(accumulator_after, accumulator_before);
-        assert_eq!(
-            verify_name_tree_interval_state_bounded(
-                &snapshot,
-                Network::Regtest.params().names.tree_interval,
-                height,
-                NameTreeMaterializationLimits::default(),
-            )
-            .expect("reconciled restart audit"),
-            root
-        );
-        drop(snapshot);
-
-        engine
-            .disconnect_block(DisconnectBlock { block_hash, height })
-            .expect("disconnect reconciled legacy no-op");
-        let snapshot = store.snapshot().expect("post-disconnect snapshot");
-        assert!(load_name_tree_accumulator(&snapshot)
-            .expect("load post-disconnect accumulator")
-            .is_none());
-        assert_eq!(
-            load_name_state(&snapshot, &name_hash).expect("load restored no-op name"),
-            Some(state)
-        );
-    }
-
-    #[test]
-    fn legacy_accumulator_reconciliation_rejects_counts_above_canonical_undo() {
-        let store = MemoryStore::new();
-        let _engine = engine(store.clone());
-        let name_hash = hash_name("legacy-overcount").expect("legacy name hash");
-        let mut state = NameState::null(name_hash);
-        state.initialize(b"legacy-overcount".to_vec(), 5);
-        let root = seed_committed_interval_name(&store, &state);
-        let block_hash = BlockHash::new([0xa2; 32]);
-        install_legacy_noop_interval_undo(&store, block_hash, 11, root, state);
-
-        let overcounted = NameTreeAccumulator {
-            base_root: root,
-            first_height: 11,
-            last_height: 11,
-            names: BTreeMap::from([(name_hash, 2)]),
-        }
-        .encode()
-        .expect("encode overcounted accumulator");
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                NAME_TREE_ACCUMULATOR_KEY,
-                &overcounted,
-            )
-            .expect("stage overcounted accumulator");
-        store.commit(batch).expect("commit overcounted accumulator");
-
-        assert!(matches!(
-            reconcile_legacy_name_tree_interval_accumulator_bounded(
-                &store,
-                Network::Regtest.params().names.tree_interval,
-                11,
-                NameTreeMaterializationLimits::default(),
-            ),
-            Err(StateError::Codec(message))
-                if message.contains("not a subset of canonical undo")
-        ));
-        let snapshot = store.snapshot().expect("rejected repair snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
-                .expect("read rejected accumulator")
-                .expect("rejected accumulator"),
-            overcounted
-        );
-    }
-
-    #[test]
-    fn reconciled_legacy_noop_and_filtered_new_undo_disconnect_in_order() {
-        let store = MemoryStore::new();
-        let mut engine = engine(store.clone());
-        let legacy_hash = hash_name("mixed-legacy-noop").expect("legacy name hash");
-        let mut legacy_state = NameState::null(legacy_hash);
-        legacy_state.initialize(b"mixed-legacy-noop".to_vec(), 5);
-        let root = seed_committed_interval_name(&store, &legacy_state);
-        let legacy_block_hash = BlockHash::new([0xb1; 32]);
-        install_legacy_noop_interval_undo(
-            &store,
-            legacy_block_hash,
-            101,
-            root,
-            legacy_state.clone(),
-        );
-        reconcile_legacy_name_tree_interval_accumulator_bounded(
-            &store,
-            Network::Regtest.params().names.tree_interval,
-            101,
-            NameTreeMaterializationLimits::default(),
-        )
-        .expect("reconcile mixed legacy accumulator")
-        .expect("mixed legacy accumulator requires reconciliation");
-
-        let new_name = b"mixed-filtered-new";
-        let new_hash = NameHash::new(hns_primitives::sha3_256(new_name));
-        let mut candidate = block(0xb2, vec![coinbase(vec![open_output(new_name)])]);
-        candidate.header.tree_root = *root.as_bytes();
-        let new_block_hash = candidate.hash();
-        let summary = engine
-            .connect_block(ConnectBlock {
-                block_hash: new_block_hash,
-                height: 102,
-                coinbase_maturity: 0,
-                block_reward: 0,
-                block: &candidate,
-            })
-            .expect("connect new filtered undo block");
-        assert_eq!(summary.names_changed, 1);
-        let new_undo = engine
-            .load_undo(&new_block_hash)
-            .expect("load new undo")
-            .expect("new undo");
-        assert_eq!(new_undo.previous_name_states.len(), 1);
-        assert_eq!(new_undo.previous_name_states[0].name_hash, new_hash);
-
-        let mut canonical = store.batch();
-        write_canonical_height_to_batch(&mut canonical, 102, new_block_hash)
-            .expect("stage new canonical height");
-        store
-            .commit(canonical)
-            .expect("commit new canonical height");
-        let snapshot = store.snapshot().expect("mixed restart snapshot");
-        let accumulator = load_name_tree_accumulator(&snapshot)
-            .expect("load mixed accumulator")
-            .expect("mixed accumulator");
-        assert_eq!(
-            accumulator.names,
-            BTreeMap::from([(legacy_hash, 1), (new_hash, 1)])
-        );
-        assert_eq!(
-            verify_name_tree_interval_state_bounded(
-                &snapshot,
-                Network::Regtest.params().names.tree_interval,
-                102,
-                NameTreeMaterializationLimits::default(),
-            )
-            .expect("mixed restart audit"),
-            root
-        );
-        drop(snapshot);
-        assert!(reconcile_legacy_name_tree_interval_accumulator_bounded(
-            &store,
-            Network::Regtest.params().names.tree_interval,
-            102,
-            NameTreeMaterializationLimits::default(),
-        )
-        .expect("exact mixed accumulator")
-        .is_none());
-
-        engine
-            .disconnect_block(DisconnectBlock {
-                block_hash: new_block_hash,
-                height: 102,
-            })
-            .expect("disconnect new filtered undo");
-        let snapshot = store.snapshot().expect("legacy-only snapshot");
-        let accumulator = load_name_tree_accumulator(&snapshot)
-            .expect("load legacy-only accumulator")
-            .expect("legacy-only accumulator");
-        assert_eq!(accumulator.last_height, 101);
-        assert_eq!(accumulator.names, BTreeMap::from([(legacy_hash, 1)]));
-        assert_eq!(
-            verify_name_tree_interval_state_bounded(
-                &snapshot,
-                Network::Regtest.params().names.tree_interval,
-                101,
-                NameTreeMaterializationLimits::default(),
-            )
-            .expect("legacy-only restart audit"),
-            root
-        );
-        drop(snapshot);
-
-        engine
-            .disconnect_block(DisconnectBlock {
-                block_hash: legacy_block_hash,
-                height: 101,
-            })
-            .expect("disconnect legacy no-op after new undo");
-        let snapshot = store.snapshot().expect("fully disconnected snapshot");
-        assert!(load_name_tree_accumulator(&snapshot)
-            .expect("load final accumulator")
-            .is_none());
-        assert_eq!(
-            load_name_state(&snapshot, &legacy_hash).expect("load legacy state"),
-            Some(legacy_state)
-        );
-        assert!(load_name_state(&snapshot, &new_hash)
-            .expect("load removed new name")
-            .is_none());
     }
 
     #[test]

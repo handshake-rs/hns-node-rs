@@ -737,10 +737,9 @@ impl SegmentArchive {
         expected_kind: SegmentKind,
         key: &[u8],
         encoded: &[u8],
-    ) -> Result<Option<Vec<u8>>, SegmentError> {
-        let Some(value) = SegmentValueLocator::decode(encoded)? else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<u8>, SegmentError> {
+        let value =
+            SegmentValueLocator::decode(encoded)?.ok_or(SegmentError::MissingValueLocator)?;
         if value.kind != expected_kind {
             return Err(SegmentError::ValueLocatorKind {
                 expected: expected_kind,
@@ -788,7 +787,7 @@ impl SegmentArchive {
         if consumed != frame.len() || record.kind != expected_kind || record.key != expected_key {
             return Err(SegmentError::RecordKeyMismatch);
         }
-        Ok(Some(record.payload.to_vec()))
+        Ok(record.payload.to_vec())
     }
 
     pub fn manifests(&self) -> Result<(SegmentManifest, SegmentManifest), SegmentError> {
@@ -1437,6 +1436,8 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> Result<
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SegmentError {
+    #[error("archive value has no segment locator; inline payloads are not supported")]
+    MissingValueLocator,
     #[error("{context} exceeded its resource limit: limit {limit}, actual {actual}")]
     ResourceLimit {
         context: &'static str,
@@ -2186,7 +2187,7 @@ mod tests {
             reopened
                 .resolve(SegmentKind::Block, &key, &locator.encode())
                 .expect("read committed frame"),
-            Some(payload.to_vec())
+            payload.to_vec()
         );
         drop(reopened);
         fs::remove_dir_all(directory).expect("remove archive fixture");
@@ -2270,7 +2271,7 @@ mod tests {
             archive
                 .resolve(SegmentKind::Block, &first_key, &first.encode())
                 .expect("resolve first"),
-            Some(first_payload.to_vec())
+            first_payload.to_vec()
         );
 
         let second = prepare_and_publish(&archive, SegmentKind::Block, second_key, &second_payload);
@@ -2345,13 +2346,13 @@ mod tests {
             recovered
                 .resolve(SegmentKind::Block, &first_key, &first.encode())
                 .expect("resolve old segment"),
-            Some(first_payload.to_vec())
+            first_payload.to_vec()
         );
         assert_eq!(
             recovered
                 .resolve(SegmentKind::Block, &second_key, &second.encode())
                 .expect("resolve active segment"),
-            Some(second_payload.to_vec())
+            second_payload.to_vec()
         );
         drop(recovered);
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
@@ -2376,7 +2377,7 @@ mod tests {
                 archive
                     .resolve(SegmentKind::Block, key, &locator.encode())
                     .expect("resolve archived record"),
-                Some(vec![0x41; 64])
+                vec![0x41; 64]
             );
         }
 

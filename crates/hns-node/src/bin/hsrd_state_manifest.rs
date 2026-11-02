@@ -223,9 +223,7 @@ fn run() -> Result<()> {
     let names = audit_raw_component(&snapshot, ColumnFamily::NameState, b"name-state")?;
     let page_reader = open_name_page_reader(&snapshot, &data_dir)?;
     let working_root = match page_reader.as_ref() {
-        Some(reader) => derive_working_name_tree_root(&NamePageSnapshot::with_legacy_fallback(
-            &snapshot, reader,
-        )),
+        Some(reader) => derive_working_name_tree_root(&NamePageSnapshot::new(&snapshot, reader)),
         None => derive_working_name_tree_root(&snapshot),
     }
     .context("failed to derive current working name-tree root")?;

@@ -1,9 +1,22 @@
 #![forbid(unsafe_code)]
 
 mod authenticated_namespace;
+mod batch_data;
 mod name_page;
 mod rocks;
 mod segment;
+mod staging;
+
+use batch_data::{
+    begin_batch_checkpoint, commit_batch_checkpoint, replace_batch_operation,
+    rollback_batch_checkpoint, BatchCheckpoint, BatchOperation, BatchOperations, StoreKey,
+};
+pub use batch_data::{AccountedWriteBatch, SharedBytes};
+pub use staging::{
+    CacheUsage, SnapshotCacheUsage, StagedBatch, StagedSnapshot, StagingMemoryUsage,
+    StagingOverlay, STAGED_NAME_NODE_READ_CACHE_BYTES, STAGED_NAME_NODE_READ_CACHE_LIMIT,
+    STAGED_STATE_POINT_READ_CACHE_BYTES, STAGED_STATE_POINT_READ_CACHE_LIMIT,
+};
 
 pub use rocks::{RocksBatch, RocksSnapshot, RocksStore};
 
@@ -13,12 +26,12 @@ pub use authenticated_namespace::{
     AUTHENTICATED_NAMESPACE_MAX_STATE_BYTES,
 };
 pub use name_page::{
-    decode_name_page, encode_name_page, encode_name_subpage_page, inspect_name_page_file,
-    plan_name_page_reads, read_name_page_directory, read_name_page_record,
-    truncate_name_pages_to_committed_tail, NamePageAddress, NamePageAppender, NamePageBuilder,
-    NamePageDirectory, NamePageError, NamePageFileInspection, NamePageLayoutBuilder,
-    NamePageLayoutPush, NamePagePush, NamePageRecord, NamePageRecordLocation, NamePageRecordRef,
-    NamePageRef, NAME_PAGE_BYTES, NAME_SUBPAGE_BYTES,
+    decode_name_page, encode_name_subpage_page, inspect_name_page_file, plan_name_page_reads,
+    read_name_page_directory, read_name_page_record, truncate_name_pages_to_committed_tail,
+    NamePageAddress, NamePageAppender, NamePageBuilder, NamePageDirectory, NamePageError,
+    NamePageFileInspection, NamePageLayoutBuilder, NamePageLayoutPush, NamePagePush,
+    NamePageRecord, NamePageRecordLocation, NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES,
+    NAME_SUBPAGE_BYTES,
 };
 #[cfg(unix)]
 pub use name_page::{
@@ -38,12 +51,10 @@ pub use segment::{
 };
 
 use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fmt,
     marker::PhantomData,
     path::{Path, PathBuf},
-    rc::Rc,
     str::FromStr,
     sync::{Arc, RwLock, Weak},
     time::{Duration, Instant},
@@ -51,38 +62,21 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 21;
-/// Last legacy schema that colocated the global transaction index,
-/// immutable wallet history, and mutable wallet state in `tx_index`.
-pub const MIXED_INDEX_SCHEMA_VERSION: u32 = 19;
-pub const LEGACY_SCHEMA_VERSION: u32 = 18;
-pub const INTERVAL_SCHEMA_VERSION: u32 = 17;
-pub const PRE_INTERVAL_SCHEMA_VERSION: u32 = 16;
-
-/// Durable database layout/profile identifier. A profile change is an explicit
-/// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-rocks-fresh-v1";
-pub const MIXED_INDEX_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v15";
-/// Persistent compatibility flag for databases that can still contain v19
-/// wallet rows in the old mixed `tx_index` column family.
-pub const MIXED_INDEX_FALLBACK_REQUIRED_KEY: &[u8] = b"mixed-index-fallback-required/v1";
-pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v14";
-pub const INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
-pub const PRE_INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
+/// Current-only storage contract. Older stores require a fresh reindex.
+pub const SCHEMA_VERSION: u32 = 22;
+/// A new profile fences databases that may contain obsolete record encodings.
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-rocks-current-v2";
 pub const BLOCK_SEGMENT_MANIFEST_KEY: &[u8] = b"block-segment-manifest/v1";
 pub const UNDO_SEGMENT_MANIFEST_KEY: &[u8] = b"undo-segment-manifest/v1";
-pub const SEGMENT_MIGRATION_MAX_BATCH_RECORDS: usize = 32;
-pub const SEGMENT_MIGRATION_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 /// Hard upper bounds for one storage-native prefix page. They protect callers
 /// from accidentally turning a cursor API back into a full-column-family
 /// materialization.
 pub const PREFIX_SCAN_MAX_ENTRIES: usize = 4_096;
-/// One maximum-size legacy inline payload plus key/iterator framing. Callers
-/// should normally choose a much smaller operational page.
+/// Maximum decoded payload plus key/iterator framing. Callers should normally
+/// choose a much smaller operational page.
 pub const PREFIX_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024 + 4 * 1024;
 pub const SEGMENT_COMPACTION_DEFAULT_SCAN_RECORDS: usize = 1_024;
-/// A mixed archive may still contain one legitimate near-maximum inline undo;
-/// the page must be able to inspect and skip it before migration completes.
+/// Scan budget for archived payload locator inventory.
 pub const SEGMENT_COMPACTION_DEFAULT_SCAN_BYTES: usize = PREFIX_SCAN_MAX_BYTES;
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_RECORDS: u64 = 1_000_000;
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_FRAME_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -547,6 +541,30 @@ pub struct NameTreePathRecord {
 pub trait ReadSnapshot {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError>;
 
+    /// Share immutable bytes when the snapshot retains a cached or staged value.
+    /// The default moves a backend-owned vector into the shared buffer.
+    fn get_shared(
+        &self,
+        family: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<SharedBytes>, StoreError> {
+        self.get(family, key)
+            .map(|value| value.map(SharedBytes::from))
+    }
+
+    fn get_many_shared(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<SharedBytes>>, StoreError> {
+        self.get_many(family, keys).map(|values| {
+            values
+                .into_iter()
+                .map(|value| value.map(SharedBytes::from))
+                .collect()
+        })
+    }
+
     fn get_many(
         &self,
         family: ColumnFamily,
@@ -679,7 +697,43 @@ fn paginate_scan_entries(
 }
 
 pub trait WriteBatch {
+    /// Reserve final-operation slots once after all writes have been admitted.
+    /// Deferred materialization uses this to avoid overlapping old and new
+    /// backend tables during repeated growth while the source table is live.
+    fn reserve_operations(&mut self, _additional: usize) {}
+
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError>;
+
+    /// Transfer an immutable value without copying when the batch supports it.
+    fn put_shared(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+    ) -> Result<(), StoreError> {
+        self.put(family, key, &value)
+    }
+
+    /// Internal ownership transfer used by deferred staging. Implementations
+    /// supporting accounting preserve `charge` beside the value.
+    fn put_shared_accounted(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+        _charge: u64,
+    ) -> Result<(), StoreError> {
+        self.put_shared(family, key, value)
+    }
+
+    fn delete_with_charge(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        _charge: u64,
+    ) -> Result<(), StoreError> {
+        self.delete(family, key)
+    }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError>;
 }
@@ -725,601 +779,6 @@ pub trait Store {
     fn batch(&self) -> Self::Batch;
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError>;
-}
-
-/// Read-your-writes overlay for staging one atomic multi-step mutation against
-/// a single immutable base snapshot. The wrapped batch is committed only after
-/// every staged operation has validated successfully.
-// Active-state staging is overwhelmingly point-oriented: every UTXO, wallet
-// row, and consensus record is inserted and then resolved by exact key. Keep
-// those hot mutations in hash tables and pay for ordering only at the two
-// boundaries that require it (prefix scans and authenticated page packing).
-// This avoids maintaining a comparison tree for every intermediate write in
-// a large atomic replay slice.
-type StagedChanges = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
-type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
-type StagedCheckpointEntry = (ColumnFamily, Vec<u8>, Option<Option<Vec<u8>>>);
-type StagedCheckpoint = Vec<StagedCheckpointEntry>;
-type NameNodeReadCache = HashMap<Vec<u8>, Vec<u8>>;
-type StatePointReadCache = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
-/// Bound one active-state transaction's positive cache for content-addressed
-/// name-tree nodes. The cache belongs to a single immutable base snapshot;
-/// staged replacements and deletions are always resolved before it.
-const STAGED_NAME_NODE_READ_CACHE_LIMIT: usize = 131_072;
-/// Bound point values read from one immutable active-state base snapshot.
-/// Missing values are cached too. Overlay writes always take precedence, so
-/// caching cannot mask a later mutation in the same atomic transaction.
-pub const STAGED_STATE_POINT_READ_CACHE_LIMIT: usize = 65_536;
-
-const fn caches_staged_state_point_read(family: ColumnFamily) -> bool {
-    matches!(
-        family,
-        ColumnFamily::Meta
-            | ColumnFamily::Headers
-            | ColumnFamily::HeightIndex
-            | ColumnFamily::BlockIndex
-            | ColumnFamily::TxIndex
-            | ColumnFamily::Utxo
-            | ColumnFamily::NameState
-            | ColumnFamily::Snapshots
-    )
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct StagingOverlay {
-    changes: SharedStagedChanges,
-}
-
-impl StagingOverlay {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn snapshot<'a, S: ReadSnapshot>(&self, base: &'a S) -> StagedSnapshot<'a, S> {
-        StagedSnapshot {
-            base,
-            changes: Rc::clone(&self.changes),
-            name_node_reads: RefCell::default(),
-            state_point_reads: RefCell::default(),
-            state_point_read_count: Cell::new(0),
-        }
-    }
-
-    pub fn batch<B: WriteBatch>(&self, inner: B) -> StagedBatch<B> {
-        StagedBatch {
-            inner,
-            changes: Rc::clone(&self.changes),
-            defer_name_tree_nodes: false,
-            defer_all_writes: false,
-            checkpoint: None,
-        }
-    }
-
-    /// Stage content-addressed name nodes for read-your-writes visibility
-    /// without forwarding them to the underlying LSM batch. The caller must
-    /// publish the captured records to its append-only page store before
-    /// committing [`StagedBatch::into_inner`].
-    pub fn batch_with_deferred_name_tree_nodes<B: WriteBatch>(&self, inner: B) -> StagedBatch<B> {
-        StagedBatch {
-            inner,
-            changes: Rc::clone(&self.changes),
-            defer_name_tree_nodes: true,
-            defer_all_writes: false,
-            checkpoint: None,
-        }
-    }
-
-    /// Retain every final point mutation only in the read-your-writes overlay
-    /// while the atomic state transition is being constructed.
-    ///
-    /// Large replay slices otherwise keep the complete value set twice: once
-    /// in this overlay and once in the backend write batch. After all staged
-    /// reads finish, callers use [`StagedBatch::into_materialized_inner`] to
-    /// transfer final values into the backend batch one at a time.
-    pub fn batch_with_deferred_writes<B: WriteBatch>(&self, inner: B) -> StagedBatch<B> {
-        StagedBatch {
-            inner,
-            changes: Rc::clone(&self.changes),
-            defer_name_tree_nodes: false,
-            defer_all_writes: true,
-            checkpoint: None,
-        }
-    }
-
-    /// Fully defer ordinary writes and route immutable name nodes to the page
-    /// store instead of materializing them into the backend batch.
-    pub fn batch_with_deferred_writes_and_name_tree_nodes<B: WriteBatch>(
-        &self,
-        inner: B,
-    ) -> StagedBatch<B> {
-        StagedBatch {
-            inner,
-            changes: Rc::clone(&self.changes),
-            defer_name_tree_nodes: true,
-            defer_all_writes: true,
-            checkpoint: None,
-        }
-    }
-
-    pub fn staged_family(&self, family: ColumnFamily) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
-        self.changes
-            .borrow()
-            .get(&family)
-            .map(|changes| {
-                changes
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Remove and transfer one staged column family without cloning its keys or
-    /// values. Callers must finish every read through snapshots backed by this
-    /// overlay before consuming the family.
-    pub fn take_staged_family(&self, family: ColumnFamily) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
-        self.changes
-            .borrow_mut()
-            .remove(&family)
-            .map(|changes| changes.into_iter().collect())
-            .unwrap_or_default()
-    }
-}
-
-pub struct StagedSnapshot<'a, S: ReadSnapshot> {
-    base: &'a S,
-    changes: SharedStagedChanges,
-    name_node_reads: RefCell<NameNodeReadCache>,
-    state_point_reads: RefCell<StatePointReadCache>,
-    state_point_read_count: Cell<usize>,
-}
-
-impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
-    fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let staged = self
-            .changes
-            .borrow()
-            .get(&family)
-            .and_then(|changes| changes.get(key))
-            .cloned();
-        if let Some(value) = staged {
-            return Ok(value);
-        }
-        if family == ColumnFamily::NameTreeNodes {
-            if let Some(value) = self.name_node_reads.borrow().get(key) {
-                return Ok(Some(value.clone()));
-            }
-        } else if caches_staged_state_point_read(family) {
-            if let Some(value) = self
-                .state_point_reads
-                .borrow()
-                .get(&family)
-                .and_then(|reads| reads.get(key))
-            {
-                return Ok(value.clone());
-            }
-        }
-        let value = self.base.get(family, key)?;
-        if family == ColumnFamily::NameTreeNodes {
-            if let Some(value) = &value {
-                let mut cache = self.name_node_reads.borrow_mut();
-                if cache.len() < STAGED_NAME_NODE_READ_CACHE_LIMIT {
-                    cache.insert(key.to_vec(), value.clone());
-                }
-            }
-        } else if caches_staged_state_point_read(family)
-            && self.state_point_read_count.get() < STAGED_STATE_POINT_READ_CACHE_LIMIT
-        {
-            let inserted = self
-                .state_point_reads
-                .borrow_mut()
-                .entry(family)
-                .or_default()
-                .insert(key.to_vec(), value.clone())
-                .is_none();
-            if inserted {
-                self.state_point_read_count
-                    .set(self.state_point_read_count.get().saturating_add(1));
-            }
-        }
-        Ok(value)
-    }
-
-    fn get_many(
-        &self,
-        family: ColumnFamily,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        let resolved = {
-            let changes = self.changes.borrow();
-            let name_node_reads = self.name_node_reads.borrow();
-            let state_point_reads = self.state_point_reads.borrow();
-            keys.iter()
-                .map(|key| {
-                    let staged = changes
-                        .get(&family)
-                        .and_then(|changes| changes.get(*key))
-                        .cloned();
-                    if staged.is_some() {
-                        return staged;
-                    }
-                    if family == ColumnFamily::NameTreeNodes {
-                        return name_node_reads.get(*key).cloned().map(Some);
-                    }
-                    if caches_staged_state_point_read(family) {
-                        return state_point_reads
-                            .get(&family)
-                            .and_then(|reads| reads.get(*key))
-                            .cloned();
-                    }
-                    None
-                })
-                .collect::<Vec<_>>()
-        };
-        let missing_keys = keys
-            .iter()
-            .zip(&resolved)
-            .filter_map(|(key, value)| value.is_none().then_some(*key))
-            .collect::<Vec<_>>();
-        let missing_values = if missing_keys.is_empty() {
-            Vec::new()
-        } else {
-            self.base.get_many(family, &missing_keys)?
-        };
-        if missing_values.len() != missing_keys.len() {
-            return Err(StoreError::Backend(format!(
-                "snapshot multi-get returned {} values for {} requested keys",
-                missing_values.len(),
-                missing_keys.len()
-            )));
-        }
-        let mut missing_values = missing_keys.into_iter().zip(missing_values);
-        let mut values = Vec::with_capacity(keys.len());
-        for value in resolved {
-            match value {
-                Some(value) => values.push(value),
-                None => {
-                    let (key, value) = missing_values.next().ok_or_else(|| {
-                        StoreError::Backend(
-                            "snapshot multi-get returned fewer values than requested".to_owned(),
-                        )
-                    })?;
-                    if family == ColumnFamily::NameTreeNodes {
-                        if let Some(value) = &value {
-                            let mut cache = self.name_node_reads.borrow_mut();
-                            if cache.len() < STAGED_NAME_NODE_READ_CACHE_LIMIT {
-                                cache.insert(key.to_vec(), value.clone());
-                            }
-                        }
-                    } else if caches_staged_state_point_read(family)
-                        && self.state_point_read_count.get() < STAGED_STATE_POINT_READ_CACHE_LIMIT
-                    {
-                        let inserted = self
-                            .state_point_reads
-                            .borrow_mut()
-                            .entry(family)
-                            .or_default()
-                            .insert(key.to_vec(), value.clone())
-                            .is_none();
-                        if inserted {
-                            self.state_point_read_count
-                                .set(self.state_point_read_count.get().saturating_add(1));
-                        }
-                    }
-                    values.push(value);
-                }
-            }
-        }
-        if missing_values.next().is_some() {
-            return Err(StoreError::Backend(
-                "snapshot multi-get returned more values than requested".to_owned(),
-            ));
-        }
-        Ok(values)
-    }
-
-    fn scan_prefix(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-    ) -> Result<Vec<ScanEntry>, StoreError> {
-        let mut entries = self
-            .base
-            .scan_prefix(family, prefix)?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-
-        let changes = self.changes.borrow();
-        if let Some(changes) = changes.get(&family) {
-            for (key, value) in changes {
-                if !key.starts_with(prefix) {
-                    continue;
-                }
-                match value {
-                    Some(value) => {
-                        entries.insert(key.clone(), value.clone());
-                    }
-                    None => {
-                        entries.remove(key);
-                    }
-                }
-            }
-        }
-
-        Ok(entries.into_iter().collect())
-    }
-
-    fn scan_prefix_page(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-        start_after: Option<&[u8]>,
-        budget: PrefixScanBudget,
-    ) -> Result<PrefixScanPage, StoreError> {
-        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
-        let changes = self.changes.borrow();
-        let Some(changes) = changes.get(&family) else {
-            return self
-                .base
-                .scan_prefix_page(family, prefix, start_after, budget);
-        };
-
-        // The overlay's point-write table is deliberately unordered. Prefix
-        // scans are uncommon control-plane operations, so materialize only
-        // matching references and sort those once for the ordered merge.
-        let mut staged = changes
-            .iter()
-            .filter(|(key, _)| {
-                key.starts_with(prefix) && start_after.is_none_or(|cursor| key.as_slice() > cursor)
-            })
-            .collect::<Vec<_>>();
-        staged.sort_unstable_by_key(|(key, _)| *key);
-        let mut staged = staged.into_iter().peekable();
-        let mut base_entries = VecDeque::<ScanEntry>::new();
-        let mut base_cursor = start_after.map(<[u8]>::to_vec);
-        let mut base_complete = false;
-        let base_budget = PrefixScanBudget {
-            // One merge lookahead never needs to materialize more base keys
-            // than the caller could return in this page. Keep the maximum byte
-            // allowance so a staged delete can suppress an oversized base
-            // value without producing a false page-budget rejection.
-            max_entries: budget.max_entries,
-            max_bytes: PREFIX_SCAN_MAX_BYTES,
-        };
-        let mut page = PrefixScanPage::default();
-
-        loop {
-            if base_entries.is_empty() && !base_complete {
-                let raw = self.base.scan_prefix_page(
-                    family,
-                    prefix,
-                    base_cursor.as_deref(),
-                    base_budget,
-                )?;
-                if raw.entries.is_empty() && raw.continuation.is_some() {
-                    return Err(StoreError::Backend(
-                        "prefix page continuation did not advance".to_owned(),
-                    ));
-                }
-                base_cursor = raw.continuation.clone();
-                base_complete = raw.continuation.is_none();
-                base_entries = raw.entries.into();
-                if base_entries.is_empty() && !base_complete {
-                    continue;
-                }
-            }
-
-            let ordering = match (base_entries.front(), staged.peek()) {
-                (Some((base_key, _)), Some((staged_key, _))) => {
-                    Some(base_key.as_slice().cmp(staged_key.as_slice()))
-                }
-                (Some(_), None) => Some(std::cmp::Ordering::Less),
-                (None, Some(_)) => Some(std::cmp::Ordering::Greater),
-                (None, None) if base_complete => None,
-                (None, None) => continue,
-            };
-            let Some(ordering) = ordering else {
-                return Ok(page);
-            };
-
-            let candidate = match ordering {
-                std::cmp::Ordering::Less => base_entries.pop_front(),
-                std::cmp::Ordering::Equal => {
-                    base_entries.pop_front();
-                    staged.next().and_then(|(key, value)| {
-                        value.as_ref().map(|value| (key.clone(), value.clone()))
-                    })
-                }
-                std::cmp::Ordering::Greater => staged.next().and_then(|(key, value)| {
-                    value.as_ref().map(|value| (key.clone(), value.clone()))
-                }),
-            };
-            let Some((key, value)) = candidate else {
-                continue;
-            };
-            if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
-                return Ok(page);
-            }
-        }
-    }
-
-    fn prefetch_name_tree_paths(
-        &self,
-        root: [u8; 32],
-        keys: &[[u8; 32]],
-    ) -> Result<Option<Vec<NameTreePathRecord>>, StoreError> {
-        if self
-            .changes
-            .borrow()
-            .get(&ColumnFamily::NameTreeNodes)
-            .is_some_and(|changes| !changes.is_empty())
-        {
-            return Ok(None);
-        }
-        self.base.prefetch_name_tree_paths(root, keys)
-    }
-}
-
-pub struct StagedBatch<B: WriteBatch> {
-    inner: B,
-    changes: SharedStagedChanges,
-    defer_name_tree_nodes: bool,
-    defer_all_writes: bool,
-    checkpoint: Option<StagedCheckpoint>,
-}
-
-impl<B: WriteBatch> StagedBatch<B> {
-    pub fn into_inner(self) -> B {
-        assert!(
-            !self.defer_all_writes,
-            "fully deferred staged writes must be materialized before commit"
-        );
-        self.inner
-    }
-
-    /// Drain a fully deferred overlay into its backend batch without retaining
-    /// a second complete key/value copy for the lifetime of state staging.
-    ///
-    /// Immutable name nodes must first be removed with
-    /// [`StagingOverlay::take_staged_family`], because their durable target is
-    /// the page store rather than this backend batch. Any transfer failure
-    /// leaves an uncommitted backend batch which the caller must discard.
-    pub fn into_materialized_inner(mut self) -> Result<B, StoreError> {
-        if !self.defer_all_writes {
-            return Err(StoreError::Backend(
-                "staged batch does not contain fully deferred writes".to_owned(),
-            ));
-        }
-        if self.checkpoint.is_some() {
-            return Err(StoreError::Backend(
-                "cannot materialize a staged batch with an active checkpoint".to_owned(),
-            ));
-        }
-        if Rc::strong_count(&self.changes) > 2 {
-            return Err(StoreError::Backend(
-                "cannot materialize deferred writes while staged readers or cloned overlays remain"
-                    .to_owned(),
-            ));
-        }
-        let changes = {
-            let mut changes = self.changes.borrow_mut();
-            if self.defer_name_tree_nodes
-                && changes
-                    .get(&ColumnFamily::NameTreeNodes)
-                    .is_some_and(|nodes| !nodes.is_empty())
-            {
-                return Err(StoreError::Backend(
-                    "cannot materialize deferred immutable name nodes into the backend batch"
-                        .to_owned(),
-                ));
-            }
-            std::mem::take(&mut *changes)
-        };
-        for (family, operations) in changes {
-            for (key, value) in operations {
-                match value {
-                    Some(value) => self.inner.put(family, &key, &value)?,
-                    None => self.inner.delete(family, &key)?,
-                }
-            }
-        }
-        Ok(self.inner)
-    }
-}
-
-impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
-    fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        if !self.defer_all_writes
-            && !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes)
-        {
-            self.inner.put(family, key, value)?;
-        }
-        let key = key.to_vec();
-        let previous = self
-            .changes
-            .borrow_mut()
-            .entry(family)
-            .or_default()
-            .insert(key.clone(), Some(value.to_vec()));
-        if let Some(checkpoint) = &mut self.checkpoint {
-            checkpoint.push((family, key, previous));
-        }
-        Ok(())
-    }
-
-    fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
-        if !self.defer_all_writes
-            && !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes)
-        {
-            self.inner.delete(family, key)?;
-        }
-        let key = key.to_vec();
-        let previous = self
-            .changes
-            .borrow_mut()
-            .entry(family)
-            .or_default()
-            .insert(key.clone(), None);
-        if let Some(checkpoint) = &mut self.checkpoint {
-            checkpoint.push((family, key, previous));
-        }
-        Ok(())
-    }
-}
-
-impl<B: CheckpointWriteBatch> CheckpointWriteBatch for StagedBatch<B> {
-    fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
-        if self.checkpoint.is_some() {
-            return Err(StoreError::Backend(
-                "staged batch checkpoint is already active".to_owned(),
-            ));
-        }
-        self.inner.begin_checkpoint()?;
-        self.checkpoint = Some(Vec::new());
-        Ok(())
-    }
-
-    fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
-        if self.checkpoint.is_none() {
-            return Err(StoreError::Backend(
-                "staged batch checkpoint is not active".to_owned(),
-            ));
-        }
-        self.inner.commit_checkpoint()?;
-        self.checkpoint = None;
-        Ok(())
-    }
-
-    fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
-        if self.checkpoint.is_none() {
-            return Err(StoreError::Backend(
-                "staged batch checkpoint is not active".to_owned(),
-            ));
-        }
-        self.inner.rollback_checkpoint()?;
-        let Some(mut journal) = self.checkpoint.take() else {
-            unreachable!("staged checkpoint was checked above");
-        };
-        let mut changes = self.changes.borrow_mut();
-        while let Some((family, key, previous)) = journal.pop() {
-            let family_empty = {
-                let family_changes = changes.entry(family).or_default();
-                match previous {
-                    Some(previous) => {
-                        family_changes.insert(key, previous);
-                    }
-                    None => {
-                        family_changes.remove(&key);
-                    }
-                }
-                family_changes.is_empty()
-            };
-            if family_empty {
-                changes.remove(&family);
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1404,9 +863,7 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
                 )
             })?;
             let current = version == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE;
-            let mixed_index_upgrade = version == MIXED_INDEX_SCHEMA_VERSION
-                && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE;
-            if !current && !mixed_index_upgrade {
+            if !current {
                 return Err(StoreError::Schema(format!(
                     "expected schema/profile {SCHEMA_VERSION}/`{}`, got {version}/`{}`; a clean reindex is required",
                     String::from_utf8_lossy(STORAGE_PROFILE),
@@ -1449,29 +906,7 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
                     airdrop_field.len()
                 )));
             }
-            drop(snapshot);
-            if mixed_index_upgrade {
-                // v20 changed only legacy database placement. Reads retain an exact
-                // fallback to v19's mixed family, while every touched wallet
-                // row is atomically moved to its new family. Updating these
-                // markers after all durable bindings validate makes the
-                // transition restart-safe without a stop-the-world rewrite.
-                let mut batch = store.batch();
-                batch.put(
-                    ColumnFamily::Meta,
-                    MetaKey::SchemaVersion.as_bytes(),
-                    &encode_u32(SCHEMA_VERSION),
-                )?;
-                batch.put(
-                    ColumnFamily::Meta,
-                    MetaKey::StorageProfile.as_bytes(),
-                    STORAGE_PROFILE,
-                )?;
-                batch.put(ColumnFamily::Meta, MIXED_INDEX_FALLBACK_REQUIRED_KEY, &[1])?;
-                store.commit(batch)
-            } else {
-                Ok(())
-            }
+            Ok(())
         }
         None => {
             if profile.is_some()
@@ -1599,8 +1034,6 @@ pub enum StoreHandle {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SegmentFamilyInventory {
-    pub inline_records: u64,
-    pub inline_bytes: u64,
     pub archived_records: u64,
     pub archived_frame_bytes: u64,
     pub locator_bytes: u64,
@@ -1718,13 +1151,6 @@ pub struct SegmentArchiveCompactionReport {
     pub scan_pages: u64,
     pub peak_scan_records: usize,
     pub peak_scan_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-pub struct SegmentMigrationReport {
-    pub migrated_records: u64,
-    pub migrated_bytes: u64,
-    pub commits: u64,
 }
 
 impl StoreHandle {
@@ -2231,11 +1657,14 @@ impl StoreHandle {
                             execution.deadline,
                             "segment compaction payload read",
                         )?;
-                        let Some(locator) =
-                            SegmentValueLocator::decode(&raw).map_err(segment_store_error)?
-                        else {
-                            continue;
-                        };
+                        let locator = SegmentValueLocator::decode(&raw)
+                            .map_err(segment_store_error)?
+                            .ok_or_else(|| {
+                                StoreError::Schema(
+                                    "inline payload is not supported; a clean reindex is required"
+                                        .to_owned(),
+                                )
+                            })?;
                         if locator.kind != kind {
                             return Err(StoreError::Schema(format!(
                                 "{} locator has kind {:?}; expected {kind:?}",
@@ -2264,13 +1693,7 @@ impl StoreHandle {
                         })?;
                         let payload = archive
                             .resolve(kind, &key, &raw)
-                            .map_err(segment_store_error)?
-                            .ok_or_else(|| {
-                                StoreError::Schema(format!(
-                                    "{} locator did not resolve to an archived payload",
-                                    family.name()
-                                ))
-                            })?;
+                            .map_err(segment_store_error)?;
                         ensure_segment_compaction_deadline(
                             execution.deadline,
                             "segment compaction payload read",
@@ -2498,122 +1921,6 @@ impl StoreHandle {
             peak_scan_records,
             peak_scan_bytes,
         })
-    }
-
-    /// Rewrite legacy inline block and undo values through the archive wrapper
-    /// in bounded, idempotent transactions. The caller must hold exclusive
-    /// ownership of the database (the maintenance CLI enforces this with the
-    /// database lock and a clean-shutdown marker).
-    pub fn migrate_inline_segment_payloads(
-        &self,
-        batch_records: usize,
-    ) -> Result<SegmentMigrationReport, StoreError> {
-        self.ensure_operational()?;
-        if !(1..=SEGMENT_MIGRATION_MAX_BATCH_RECORDS).contains(&batch_records) {
-            return Err(StoreError::Schema(
-                format!(
-                    "segment migration batch size must be between 1 and {SEGMENT_MIGRATION_MAX_BATCH_RECORDS}"
-                ),
-            ));
-        }
-        let Self::Archived { inner, .. } = self else {
-            return Err(StoreError::Schema(
-                "segment migration requires an archived store".to_owned(),
-            ));
-        };
-        let scan_budget = PrefixScanBudget {
-            max_entries: batch_records,
-            max_bytes: PREFIX_SCAN_MAX_BYTES,
-        }
-        .validate()?;
-        let mut report = SegmentMigrationReport::default();
-        for family in [ColumnFamily::Blocks, ColumnFamily::Undo] {
-            for prefix in 0u8..=u8::MAX {
-                let snapshot = inner.snapshot()?;
-                let mut continuation = None::<Vec<u8>>;
-                loop {
-                    let page = snapshot.scan_prefix_page(
-                        family,
-                        &[prefix],
-                        continuation.as_deref(),
-                        scan_budget,
-                    )?;
-                    if page.entries.is_empty() && page.continuation.is_some() {
-                        return Err(StoreError::Backend(format!(
-                            "{} migration prefix scan returned a continuation without progress",
-                            family.name()
-                        )));
-                    }
-                    let mut batch = self.batch();
-                    let mut staged_records = 0u64;
-                    let mut staged_bytes = 0u64;
-                    for (key, value) in page.entries {
-                        validate_segment_key(family, &key)?;
-                        if SegmentValueLocator::decode(&value)
-                            .map_err(segment_store_error)?
-                            .is_some()
-                        {
-                            continue;
-                        }
-                        let value_bytes = value.len() as u64;
-                        if value_bytes > SEGMENT_MIGRATION_MAX_BATCH_BYTES {
-                            return Err(StoreError::Schema(format!(
-                                "{} inline value contains {value_bytes} bytes; migration bound is {SEGMENT_MIGRATION_MAX_BATCH_BYTES}",
-                                family.name()
-                            )));
-                        }
-                        if staged_records != 0
-                            && staged_bytes
-                                .checked_add(value_bytes)
-                                .is_none_or(|bytes| bytes > SEGMENT_MIGRATION_MAX_BATCH_BYTES)
-                        {
-                            commit_segment_migration_batch(
-                                self,
-                                batch,
-                                staged_records,
-                                staged_bytes,
-                                &mut report,
-                            )?;
-                            batch = self.batch();
-                            staged_records = 0;
-                            staged_bytes = 0;
-                        }
-                        batch.put(family, &key, &value)?;
-                        staged_records = staged_records.checked_add(1).ok_or_else(|| {
-                            StoreError::Schema(
-                                "segment migration staged record count overflow".to_owned(),
-                            )
-                        })?;
-                        staged_bytes = staged_bytes.checked_add(value_bytes).ok_or_else(|| {
-                            StoreError::Schema(
-                                "segment migration staged byte count overflow".to_owned(),
-                            )
-                        })?;
-                    }
-                    commit_segment_migration_batch(
-                        self,
-                        batch,
-                        staged_records,
-                        staged_bytes,
-                        &mut report,
-                    )?;
-                    let Some(next) = page.continuation else {
-                        break;
-                    };
-                    if continuation
-                        .as_ref()
-                        .is_some_and(|previous| next.as_slice() <= previous.as_slice())
-                    {
-                        return Err(StoreError::Backend(format!(
-                            "{} migration prefix scan continuation did not advance",
-                            family.name()
-                        )));
-                    }
-                    continuation = Some(next);
-                }
-            }
-        }
-        Ok(report)
     }
 }
 
@@ -2949,32 +2256,6 @@ fn validate_segment_scan_page(
     Ok(())
 }
 
-fn commit_segment_migration_batch(
-    store: &StoreHandle,
-    batch: StoreHandleBatch,
-    records: u64,
-    bytes: u64,
-    report: &mut SegmentMigrationReport,
-) -> Result<(), StoreError> {
-    if records == 0 {
-        return Ok(());
-    }
-    store.commit(batch)?;
-    report.migrated_records = report
-        .migrated_records
-        .checked_add(records)
-        .ok_or_else(|| StoreError::Schema("segment migration record count overflow".to_owned()))?;
-    report.migrated_bytes = report
-        .migrated_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| StoreError::Schema("segment migration byte count overflow".to_owned()))?;
-    report.commits = report
-        .commits
-        .checked_add(1)
-        .ok_or_else(|| StoreError::Schema("segment migration commit overflow".to_owned()))?;
-    Ok(())
-}
-
 fn segment_family_inventory(
     store: &StoreHandle,
     family: ColumnFamily,
@@ -3016,8 +2297,7 @@ fn segment_family_inventory_bounded<S: ReadSnapshot>(
         let next = page.continuation.clone();
         for (key, value) in page.entries {
             ensure_segment_compaction_deadline(execution.deadline, "segment compaction inventory")?;
-            if let Some(locator) =
-                accumulate_segment_inventory(&mut inventory, family, &key, &value)?
+            let locator = accumulate_segment_inventory(&mut inventory, family, &key, &value)?;
             {
                 totals.live_records = totals.live_records.checked_add(1).ok_or_else(|| {
                     StoreError::Schema(
@@ -3073,7 +2353,7 @@ fn accumulate_segment_inventory(
     family: ColumnFamily,
     key: &[u8],
     value: &[u8],
-) -> Result<Option<SegmentValueLocator>, StoreError> {
+) -> Result<SegmentValueLocator, StoreError> {
     validate_segment_key(family, key)?;
     match SegmentValueLocator::decode(value).map_err(segment_store_error)? {
         Some(locator) => {
@@ -3101,21 +2381,12 @@ fn accumulate_segment_inventory(
                 .ok_or_else(|| {
                     StoreError::Schema("segment inventory locator bytes overflow".to_owned())
                 })?;
-            Ok(Some(locator))
+            Ok(locator)
         }
-        None => {
-            inventory.inline_records =
-                inventory.inline_records.checked_add(1).ok_or_else(|| {
-                    StoreError::Schema("segment inventory record count overflow".to_owned())
-                })?;
-            inventory.inline_bytes = inventory
-                .inline_bytes
-                .checked_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
-                .ok_or_else(|| {
-                    StoreError::Schema("segment inventory inline bytes overflow".to_owned())
-                })?;
-            Ok(None)
-        }
+        None => Err(StoreError::Schema(format!(
+            "{} contains an inline payload; current storage requires segment locators and a clean reindex",
+            family.name()
+        ))),
     }
 }
 
@@ -3198,7 +2469,11 @@ fn commit_rocks_store_handle(
 }
 
 fn segment_store_error(error: SegmentError) -> StoreError {
-    StoreError::Backend(format!("segment archive failed: {error}"))
+    if error == SegmentError::MissingValueLocator {
+        StoreError::Schema("inline payload is not supported; current storage requires segment locators and a clean reindex".to_owned())
+    } else {
+        StoreError::Backend(format!("segment archive failed: {error}"))
+    }
 }
 
 fn segmented_kind(family: ColumnFamily) -> Option<SegmentKind> {
@@ -3221,7 +2496,6 @@ fn resolve_segmented_value(
     archive
         .resolve(kind, key, &raw)
         .map_err(segment_store_error)
-        .map(|resolved| resolved.unwrap_or(raw))
 }
 
 fn commit_archived_store_handle(
@@ -3548,7 +2822,7 @@ impl StoreHandleBatch {
         match self {
             Self::Memory(batch) => {
                 for (key, value) in &batch.operations {
-                    let Some(value) = value else {
+                    let Some(value) = &value.value else {
                         continue;
                     };
                     visit_archive_payload(key.family, &key.key, value, visitor)?;
@@ -3556,7 +2830,7 @@ impl StoreHandleBatch {
             }
             Self::Rocks(batch) => {
                 for (key, value) in &batch.operations {
-                    let Some(value) = value else {
+                    let Some(value) = &value.value else {
                         continue;
                     };
                     visit_archive_payload(key.family, &key.key, value, visitor)?;
@@ -3574,7 +2848,7 @@ impl StoreHandleBatch {
         match self {
             Self::Memory(batch) => {
                 for (key, value) in &mut batch.operations {
-                    let Some(value) = value else {
+                    let Some(value) = &mut value.value else {
                         continue;
                     };
                     collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
@@ -3582,7 +2856,7 @@ impl StoreHandleBatch {
             }
             Self::Rocks(batch) => {
                 for (key, value) in &mut batch.operations {
-                    let Some(value) = value else {
+                    let Some(value) = &mut value.value else {
                         continue;
                     };
                     collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
@@ -3606,7 +2880,7 @@ impl StoreHandleBatch {
         match self {
             Self::Memory(batch) => {
                 for (key, value) in &mut batch.operations {
-                    let Some(value) = value else {
+                    let Some(value) = &mut value.value else {
                         continue;
                     };
                     replace_archive_payload(key.family, value, &mut locators)?;
@@ -3614,7 +2888,7 @@ impl StoreHandleBatch {
             }
             Self::Rocks(batch) => {
                 for (key, value) in &mut batch.operations {
-                    let Some(value) = value else {
+                    let Some(value) = &mut value.value else {
                         continue;
                     };
                     replace_archive_payload(key.family, value, &mut locators)?;
@@ -3650,7 +2924,7 @@ fn visit_archive_payload(
 fn collect_archive_payload(
     family: ColumnFamily,
     key: &[u8],
-    value: &mut Vec<u8>,
+    value: &mut SharedBytes,
     payloads: &mut Vec<segment::ArchivePayload>,
 ) -> Result<(), StoreError> {
     let Some(kind) = segmented_kind(family) else {
@@ -3672,14 +2946,14 @@ fn collect_archive_payload(
     payloads.push(segment::ArchivePayload {
         kind,
         key,
-        payload: std::mem::take(value),
+        payload: std::mem::replace(value, SharedBytes::from(Vec::new())).into_vec(),
     });
     Ok(())
 }
 
 fn replace_archive_payload<'a>(
     family: ColumnFamily,
-    value: &mut Vec<u8>,
+    value: &mut SharedBytes,
     locators: &mut impl Iterator<Item = &'a SegmentValueLocator>,
 ) -> Result<(), StoreError> {
     if segmented_kind(family).is_none()
@@ -3692,11 +2966,18 @@ fn replace_archive_payload<'a>(
     let locator = locators.next().ok_or_else(|| {
         StoreError::Backend("segment archive produced too few value locators".to_owned())
     })?;
-    *value = locator.encode();
+    *value = SharedBytes::from(locator.encode());
     Ok(())
 }
 
 impl WriteBatch for StoreHandleBatch {
+    fn reserve_operations(&mut self, additional: usize) {
+        match self {
+            Self::Memory(batch) => batch.reserve_operations(additional),
+            Self::Rocks(batch) => batch.reserve_operations(additional),
+        }
+    }
+
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.put(family, key, value),
@@ -3708,6 +2989,58 @@ impl WriteBatch for StoreHandleBatch {
         match self {
             Self::Memory(batch) => batch.delete(family, key),
             Self::Rocks(batch) => batch.delete(family, key),
+        }
+    }
+    fn put_shared(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+    ) -> Result<(), StoreError> {
+        self.put_shared_accounted(family, key, value, 0)
+    }
+    fn put_shared_accounted(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+        charge: u64,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(batch) => batch.put_shared_accounted(family, key, value, charge),
+            Self::Rocks(batch) => batch.put_shared_accounted(family, key, value, charge),
+        }
+    }
+    fn delete_with_charge(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        charge: u64,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(batch) => batch.delete_with_charge(family, key, charge),
+            Self::Rocks(batch) => batch.delete_with_charge(family, key, charge),
+        }
+    }
+}
+
+impl AccountedWriteBatch for StoreHandleBatch {
+    fn operation_charge(&self, family: ColumnFamily, key: &[u8]) -> u64 {
+        match self {
+            Self::Memory(batch) => batch.operation_charge(family, key),
+            Self::Rocks(batch) => batch.operation_charge(family, key),
+        }
+    }
+    fn checkpoint_retained_charge(&self) -> u64 {
+        match self {
+            Self::Memory(batch) => batch.checkpoint_retained_charge(),
+            Self::Rocks(batch) => batch.checkpoint_retained_charge(),
+        }
+    }
+    fn checkpoint_replacement_charge(&self, family: ColumnFamily, key: &[u8]) -> u64 {
+        match self {
+            Self::Memory(batch) => batch.checkpoint_replacement_charge(family, key),
+            Self::Rocks(batch) => batch.checkpoint_replacement_charge(family, key),
         }
     }
 }
@@ -3813,7 +3146,8 @@ fn apply_memory_changes(
     let change_count = changes.len();
     let mut gc_candidates = Vec::with_capacity(change_count);
 
-    for (key, value) in changes {
+    for (key, operation) in changes {
+        let value = operation.value.map(SharedBytes::into_vec);
         if oldest_snapshot.is_none() {
             match value {
                 Some(value) => {
@@ -3918,7 +3252,7 @@ impl ReadSnapshot for MemorySnapshot {
                 break;
             }
             if let Some(value) = memory_value_at(history, self.generation) {
-                entries.push((key.key.clone(), value.clone()));
+                entries.push((key.key.to_vec(), value.clone()));
             }
         }
         Ok(entries)
@@ -4060,16 +3394,6 @@ fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Opt
     }
 }
 
-type BatchOperation = Option<Vec<u8>>;
-// A batch is last-write-wins and contains at most one operation per physical
-// key before publication. The RocksDB backend consumes this map into one WAL
-// transaction, while the memory backend installs every unique key at one
-// common generation. Hashing avoids a second comparison-tree update in the hot
-// staging path without changing externally observable ordering.
-type BatchOperations = HashMap<StoreKey, BatchOperation>;
-type BatchCheckpointEntry = (StoreKey, Option<BatchOperation>);
-type BatchCheckpoint = Vec<BatchCheckpointEntry>;
-
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBatch {
     operations: BatchOperations,
@@ -4087,26 +3411,74 @@ impl MemoryBatch {
 }
 
 impl WriteBatch for MemoryBatch {
+    fn reserve_operations(&mut self, additional: usize) {
+        self.operations.reserve(additional);
+    }
+
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.put_shared_accounted(family, key, SharedBytes::from(value), 0)
+    }
+    fn put_shared(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+    ) -> Result<(), StoreError> {
+        self.put_shared_accounted(family, key, value, 0)
+    }
+    fn put_shared_accounted(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: SharedBytes,
+        charge: u64,
+    ) -> Result<(), StoreError> {
         authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
             StoreKey::new(family, key),
-            Some(value.to_vec()),
+            BatchOperation::new(Some(value), charge),
         );
         Ok(())
     }
-
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
+        self.delete_with_charge(family, key, 0)
+    }
+    fn delete_with_charge(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        charge: u64,
+    ) -> Result<(), StoreError> {
         authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
             StoreKey::new(family, key),
-            None,
+            BatchOperation::new(None, charge),
         );
         Ok(())
+    }
+}
+impl AccountedWriteBatch for MemoryBatch {
+    fn operation_charge(&self, family: ColumnFamily, key: &[u8]) -> u64 {
+        crate::batch_data::get_batch_operation(&self.operations, family, key)
+            .map_or(0, |operation| operation.charge)
+    }
+    fn checkpoint_retained_charge(&self) -> u64 {
+        self.checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.retained_charge)
+    }
+    fn checkpoint_replacement_charge(&self, family: ColumnFamily, key: &[u8]) -> u64 {
+        if self.checkpoint.is_none() {
+            return 0;
+        }
+        batch_data::checkpoint_entry_charge(
+            key,
+            crate::batch_data::get_batch_operation(&self.operations, family, key),
+        )
     }
 }
 
@@ -4116,85 +3488,12 @@ impl CheckpointWriteBatch for MemoryBatch {
     }
 
     fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
-        commit_batch_checkpoint(&mut self.checkpoint)
+        commit_batch_checkpoint(&mut self.operations, &mut self.checkpoint)
     }
 
     fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
         rollback_batch_checkpoint(&mut self.operations, &mut self.checkpoint)
     }
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct StoreKey {
-    family: ColumnFamily,
-    key: Vec<u8>,
-}
-
-impl StoreKey {
-    fn new(family: ColumnFamily, key: &[u8]) -> Self {
-        Self {
-            family,
-            key: key.to_vec(),
-        }
-    }
-}
-
-fn replace_batch_operation(
-    operations: &mut BatchOperations,
-    checkpoint: &mut Option<BatchCheckpoint>,
-    key: StoreKey,
-    value: BatchOperation,
-) {
-    if checkpoint.is_none() {
-        operations.insert(key, value);
-        return;
-    }
-    let previous = operations.insert(key.clone(), value);
-    checkpoint
-        .as_mut()
-        .expect("checkpoint presence checked above")
-        .push((key, previous));
-}
-
-fn begin_batch_checkpoint(checkpoint: &mut Option<BatchCheckpoint>) -> Result<(), StoreError> {
-    if checkpoint.is_some() {
-        return Err(StoreError::Backend(
-            "write batch checkpoint is already active".to_owned(),
-        ));
-    }
-    *checkpoint = Some(Vec::new());
-    Ok(())
-}
-
-fn commit_batch_checkpoint(checkpoint: &mut Option<BatchCheckpoint>) -> Result<(), StoreError> {
-    if checkpoint.take().is_none() {
-        return Err(StoreError::Backend(
-            "write batch checkpoint is not active".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn rollback_batch_checkpoint(
-    operations: &mut BatchOperations,
-    checkpoint: &mut Option<BatchCheckpoint>,
-) -> Result<(), StoreError> {
-    let Some(mut journal) = checkpoint.take() else {
-        return Err(StoreError::Backend(
-            "write batch checkpoint is not active".to_owned(),
-        ));
-    };
-    while let Some((key, previous)) = journal.pop() {
-        match previous {
-            Some(previous) => {
-                operations.insert(key, previous);
-            }
-            None => {
-                operations.remove(&key);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4395,8 +3694,9 @@ mod tests {
         assert_eq!(
             batch
                 .operations
-                .get(&StoreKey::new(ColumnFamily::Meta, b"shared")),
-            Some(&Some(b"final".to_vec()))
+                .get(&StoreKey::new(ColumnFamily::Meta, b"shared"))
+                .and_then(|operation| operation.value.as_deref()),
+            Some(b"final".as_slice())
         );
     }
 
@@ -5074,7 +4374,7 @@ mod tests {
             .into_materialized_inner()
             .expect("materialize deferred operations");
         assert_eq!(inner.operations.len(), 2);
-        assert!(overlay.changes.borrow().is_empty());
+        assert_eq!(overlay.memory_usage().operations, 0);
         drop(overlay);
         store.commit(inner).expect("commit materialized operations");
         let committed = store.snapshot().expect("materialized snapshot");
@@ -5237,75 +4537,6 @@ mod tests {
                 .get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())
                 .expect("airdrop field"),
             Some(vec![0; AIRDROP_FIELD_BYTES])
-        );
-    }
-
-    #[test]
-    fn initialize_schema_atomically_upgrades_the_mixed_index_layout() {
-        let store = MemoryStore::new();
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::SchemaVersion.as_bytes(),
-                &encode_u32(MIXED_INDEX_SCHEMA_VERSION),
-            )
-            .expect("legacy schema");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::StorageProfile.as_bytes(),
-                MIXED_INDEX_STORAGE_PROFILE,
-            )
-            .expect("legacy profile");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeRoot.as_bytes(),
-                &[1; 32],
-            )
-            .expect("working root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeCommitRoot.as_bytes(),
-                &[2; 32],
-            )
-            .expect("commit root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::AirdropField.as_bytes(),
-                &[3; AIRDROP_FIELD_BYTES],
-            )
-            .expect("airdrop field");
-        store.commit(batch).expect("seed mixed-index schema");
-
-        initialize_schema(&store).expect("upgrade compatible placement schema");
-        let snapshot = store.snapshot().expect("upgraded snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
-                .expect("schema"),
-            Some(encode_u32(SCHEMA_VERSION).to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
-                .expect("profile"),
-            Some(STORAGE_PROFILE.to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
-                .expect("working root"),
-            Some(vec![1; 32])
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MIXED_INDEX_FALLBACK_REQUIRED_KEY)
-                .expect("fallback marker"),
-            Some(vec![1])
         );
     }
 
@@ -5606,28 +4837,48 @@ mod tests {
     }
 
     #[test]
-    fn initialize_schema_rejects_version_drift() {
-        let store = MemoryStore::new();
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::SchemaVersion.as_bytes(),
-                &encode_u32(SCHEMA_VERSION.saturating_sub(1)),
-            )
-            .expect("schema");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::StorageProfile.as_bytes(),
-                STORAGE_PROFILE,
-            )
-            .expect("profile");
-        store.commit(batch).expect("commit");
-        assert!(matches!(
-            initialize_schema(&store),
-            Err(StoreError::Schema(message)) if message.contains("clean reindex")
-        ));
+    fn initialize_schema_rejects_obsolete_profiles_without_mutation() {
+        for (schema, profile) in [
+            (16, b"hsrd-mining-v12".as_slice()),
+            (17, b"hsrd-mining-v13".as_slice()),
+            (18, b"hsrd-mining-v14".as_slice()),
+            (19, b"hsrd-mining-v15".as_slice()),
+            (20, b"hsrd-mining-v15".as_slice()),
+            (21, b"hsrd-rocks-fresh-v1".as_slice()),
+        ] {
+            let store = MemoryStore::new();
+            initialize_schema(&store).expect("initialize fixture");
+            let mut batch = store.batch();
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::SchemaVersion.as_bytes(),
+                    &encode_u32(schema),
+                )
+                .expect("old schema");
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::StorageProfile.as_bytes(),
+                    profile,
+                )
+                .expect("old profile");
+            store.commit(batch).expect("seed old markers");
+            let before = store
+                .snapshot()
+                .expect("before")
+                .scan_prefix(ColumnFamily::Meta, b"")
+                .expect("metadata");
+            assert!(
+                matches!(initialize_schema(&store), Err(StoreError::Schema(message)) if message.contains("clean reindex"))
+            );
+            let after = store
+                .snapshot()
+                .expect("after")
+                .scan_prefix(ColumnFamily::Meta, b"")
+                .expect("metadata");
+            assert_eq!(after, before);
+        }
     }
 
     #[test]
@@ -6281,7 +5532,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_compaction_default_page_traverses_a_near_max_inline_undo() {
+    fn segment_compaction_rejects_a_near_max_inline_undo() {
         const NEAR_MAX_BLOCK_UNDO_BYTES: usize = 32_000_000;
         const UNDO_KEY_BYTES: usize = 32;
         let nonce = std::time::SystemTime::now()
@@ -6314,16 +5565,13 @@ mod tests {
             scan_page_bytes: exact_page_bytes,
             ..SegmentCompactionLimits::default()
         };
-        let plan = archived
-            .plan_segment_archive_compaction_with_execution_limits(
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
                 one_record_limits,
                 test_segment_compaction_execution_limits(),
-            )
-            .expect("plan through one near-maximum inline undo at the exact page bound");
-        assert_eq!(plan.live_records, 0);
-        assert_eq!(plan.live_frame_bytes, 0);
-        assert_eq!(plan.scan_page_records, 1);
-        assert_eq!(plan.scan_page_bytes, exact_page_bytes);
+            ),
+            Err(StoreError::Schema(message)) if message.contains("inline payload")
+        ));
         assert!(matches!(
             archived.plan_segment_archive_compaction_with_execution_limits(
                 SegmentCompactionLimits {
@@ -6598,137 +5846,38 @@ mod tests {
     }
 
     #[test]
-    fn inline_archive_migration_is_bounded_idempotent_and_transparent() {
+    fn archived_store_rejects_inline_payloads_without_rewriting_them() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
+            .expect("time")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-inline-archive-migration-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
+        let directory =
+            std::env::temp_dir().join(format!("hsrd-reject-inline-{}-{nonce}", std::process::id()));
         let raw = StoreHandle::memory();
-        let records = [
-            (ColumnFamily::Blocks, [0x11; 32], b"first block".as_slice()),
-            (ColumnFamily::Blocks, [0x12; 32], b"second block".as_slice()),
-            (ColumnFamily::Undo, [0x21; 32], b"first undo".as_slice()),
-        ];
+        let key = [0x41; 32];
         let mut batch = raw.batch();
-        for (family, key, value) in &records {
-            batch.put(*family, key, value).expect("stage inline value");
-        }
-        raw.commit(batch).expect("commit inline values");
+        batch
+            .put(ColumnFamily::Blocks, &key, b"obsolete inline payload")
+            .expect("seed inline");
+        raw.commit(batch).expect("commit inline");
         let archived = raw
             .clone()
             .with_segment_archive(directory.clone())
             .expect("attach archive");
-
-        let before = archived
-            .segment_archive_inventory()
-            .expect("pre-migration inventory");
-        assert_eq!(before.blocks.inline_records, 2);
-        assert_eq!(before.undo.inline_records, 1);
-        assert_eq!(before.blocks.archived_records, 0);
-        assert_eq!(before.undo.archived_records, 0);
-
-        let report = archived
-            .migrate_inline_segment_payloads(1)
-            .expect("migrate inline values");
-        assert_eq!(report.migrated_records, 3);
-        assert_eq!(report.commits, 3);
-        let after = archived
-            .segment_archive_inventory()
-            .expect("post-migration inventory");
-        assert_eq!(after.blocks.inline_records, 0);
-        assert_eq!(after.undo.inline_records, 0);
-        assert_eq!(after.blocks.archived_records, 2);
-        assert_eq!(after.undo.archived_records, 1);
-        for (family, key, value) in records {
-            let stored = raw
-                .snapshot()
+        assert!(
+            matches!(archived.snapshot().expect("snapshot").get(ColumnFamily::Blocks, &key), Err(StoreError::Schema(message)) if message.contains("inline payload"))
+        );
+        assert!(
+            matches!(archived.segment_archive_inventory(), Err(StoreError::Schema(message)) if message.contains("inline payload"))
+        );
+        assert_eq!(
+            raw.snapshot()
                 .expect("raw snapshot")
-                .get(family, &key)
-                .expect("raw value")
-                .expect("raw locator");
-            assert!(SegmentValueLocator::decode(&stored)
-                .expect("decode locator")
-                .is_some());
-            assert_eq!(
-                archived
-                    .snapshot()
-                    .expect("archived snapshot")
-                    .get(family, &key)
-                    .expect("resolved value"),
-                Some(value.to_vec())
-            );
-        }
-        assert_eq!(
-            archived
-                .migrate_inline_segment_payloads(2)
-                .expect("repeat migration"),
-            SegmentMigrationReport::default()
+                .get(ColumnFamily::Blocks, &key)
+                .expect("raw read"),
+            Some(b"obsolete inline payload".to_vec())
         );
-        assert!(archived.migrate_inline_segment_payloads(0).is_err());
-        assert!(archived
-            .migrate_inline_segment_payloads(SEGMENT_MIGRATION_MAX_BATCH_RECORDS + 1)
-            .is_err());
         drop(archived);
-        std::fs::remove_dir_all(directory).expect("remove archive fixture");
-    }
-
-    #[test]
-    fn inline_archive_migration_pages_through_a_dense_hash_prefix() {
-        const RECORDS: u16 = 257;
-        const BATCH_RECORDS: usize = 17;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-inline-archive-dense-prefix-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        let raw = StoreHandle::memory();
-        let mut batch = raw.batch();
-        for index in 0..RECORDS {
-            let mut key = [0x5a; 32];
-            key[1..3].copy_from_slice(&index.to_be_bytes());
-            batch
-                .put(ColumnFamily::Blocks, &key, &index.to_be_bytes())
-                .expect("stage dense-prefix value");
-        }
-        raw.commit(batch).expect("commit dense-prefix values");
-        let archived = raw
-            .with_segment_archive(directory.clone())
-            .expect("attach archive");
-        let report = archived
-            .migrate_inline_segment_payloads(BATCH_RECORDS)
-            .expect("migrate dense prefix");
-        assert_eq!(report.migrated_records, u64::from(RECORDS));
-        assert_eq!(
-            report.commits,
-            u64::from(RECORDS).div_ceil(BATCH_RECORDS as u64)
-        );
-        let inventory = archived
-            .segment_archive_inventory()
-            .expect("dense-prefix inventory");
-        assert_eq!(inventory.blocks.inline_records, 0);
-        assert_eq!(inventory.blocks.archived_records, u64::from(RECORDS));
-        for index in [0, RECORDS / 2, RECORDS - 1] {
-            let mut key = [0x5a; 32];
-            key[1..3].copy_from_slice(&index.to_be_bytes());
-            assert_eq!(
-                archived
-                    .snapshot()
-                    .expect("snapshot")
-                    .get(ColumnFamily::Blocks, &key)
-                    .expect("resolved value"),
-                Some(index.to_be_bytes().to_vec())
-            );
-        }
-        drop(archived);
-        std::fs::remove_dir_all(directory).expect("remove dense-prefix fixture");
+        std::fs::remove_dir_all(directory).expect("remove fixture");
     }
 }

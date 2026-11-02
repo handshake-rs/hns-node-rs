@@ -405,12 +405,18 @@ On restart and every supervisor tick, the connector compares the active tip
 with the highest contiguous stored canonical body. Direct progress advances in
 atomic slices of at most 288 blocks, subject to the configured bound and
 staged-effect budget. A best-work fork is disconnected and connected atomically
-once its bounded replacement prefix exceeds active chainwork. A reorganization
-may use the full configured bound to preserve the single-commit invariant.
+through the first replacement block whose cumulative work strictly exceeds
+the old active tip. Equal work is insufficient. Stored descendants beyond that
+prefix remain available for subsequent direct replay slices; they do not share
+the branch switch's resource budget. The required replacement prefix may use
+the full configured bound to preserve the single-commit invariant.
 Shutdown therefore returns between direct slices but
 waits for an already staged reorganization commit. Deep replacements that
 cannot exceed the active tip within the configured batch fail closed and
-require an operator-selected larger bound.
+require an operator-selected larger block-count bound. The atomic branch
+switch still has a fixed 256 MiB staged-effect ceiling: if the required prefix
+itself exceeds it, activation fails without committing a partial branch switch
+or marking the stored blocks invalid.
 
 Candidate-derived contextual failures carry the exact failing block back out of
 the staged reorganization. That root and every known descendant are durably
@@ -422,8 +428,8 @@ not guess a peer attribution for delayed contextual failures.
 
 ## Restart and checkpoint semantics
 
-A versioned sync checkpoint (retained by the current schema 21/profile
-`hsrd-rocks-fresh-v1`) contains:
+A versioned sync checkpoint (retained by the current schema 22/profile
+`hsrd-rocks-current-v2`) contains:
 
 - monotonically increasing sequence;
 - stage;

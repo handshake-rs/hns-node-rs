@@ -1162,14 +1162,12 @@ struct PublicationQueueIndex {
 }
 
 impl PublicationQueueIndex {
-    fn migrated(count: u64, total_bytes: u64) -> Result<Self> {
-        let index = Self {
+    const fn empty() -> Self {
+        Self {
             revision: 1,
-            count,
-            total_bytes,
-        };
-        index.validate(MAX_PENDING_PUBLICATIONS)?;
-        Ok(index)
+            count: 0,
+            total_bytes: 0,
+        }
     }
 
     fn validate(self, maximum: usize) -> Result<()> {
@@ -1372,7 +1370,6 @@ fn publication_codec_invariant(error: hns_primitives::PrimitiveError) -> anyhow:
 #[derive(Debug)]
 struct PublicationQueueInventory {
     index: PublicationQueueIndex,
-    persisted_index: bool,
     #[cfg(test)]
     pages: usize,
 }
@@ -2210,11 +2207,9 @@ impl NodeService {
         Ok(admission)
     }
 
-    /// Verify or migrate the complete durable publication queue before a
-    /// [`super::NodeRuntime`] starts accepting commands. This deliberately
-    /// executes before the canonical actor exists: startup owns the service,
-    /// enumeration is paginated and resource-bounded, and only the final
-    /// versioned index installation is an atomic point mutation.
+    /// Initialize a new empty queue, then authenticate its durable index and
+    /// all records before the canonical runtime starts accepting commands.
+    /// A populated queue without its index is corrupt and is never repaired.
     pub(crate) fn mining_engine_initialize_publication_queue(&mut self) -> Result<()> {
         if !self.config.mining_engine.enabled {
             return Ok(());
@@ -2222,26 +2217,8 @@ impl NodeService {
         self.state.ensure_storage_operational()?;
         let maximum = self.config.mining_engine.maximum_pending_publications;
         let result = (|| {
-            let inventory = enumerate_publication_queue(&self.state.store, maximum)?;
-            if inventory.persisted_index {
-                return Ok(());
-            }
-            install_publication_queue_index(&self.state.store, inventory.index, maximum)?;
-            let installed =
-                load_publication_queue_index(&self.state.store, maximum)?.ok_or_else(|| {
-                    publication_queue_invariant(
-                        "publication queue index is missing after acknowledged migration",
-                        1,
-                        0,
-                    )
-                })?;
-            if installed != inventory.index {
-                return Err(publication_queue_invariant(
-                    "publication queue index changed after acknowledged migration",
-                    inventory.index.revision,
-                    installed.revision,
-                ));
-            }
+            initialize_empty_publication_queue(&self.state.store, maximum)?;
+            enumerate_publication_queue(&self.state.store, maximum)?;
             Ok(())
         })();
         self.mining_engine_finish_publication_queue_mutation(result)
@@ -2384,15 +2361,6 @@ impl NodeService {
             })?;
         self.revoke_runtime_authority();
         Ok(())
-    }
-
-    fn mining_engine_install_publication_queue_index(
-        &mut self,
-        prepared: PublicationQueueIndex,
-    ) -> Result<()> {
-        let maximum = self.config.mining_engine.maximum_pending_publications;
-        let result = install_publication_queue_index(&self.state.store, prepared, maximum);
-        self.mining_engine_finish_publication_queue_mutation(result)
     }
 
     /// Recover the cancellation/crash window between durable intent staging and
@@ -2949,53 +2917,6 @@ impl NodeReadHandle {
         }
     }
 
-    /// Enumerate and authenticate the complete bounded publication queue on a
-    /// blocking collection worker. The immutable store snapshot is additionally
-    /// bound to one published writer generation, so migration cannot install an
-    /// index prepared across a concurrent canonical mutation.
-    async fn mining_engine_enumerate_publication_queue_for_migration(
-        &self,
-    ) -> Result<(super::CanonicalEpoch, PublicationQueueInventory)> {
-        self.ensure_storage_operational()?;
-        let maximum = self.config().mining_engine.maximum_pending_publications;
-        let read = self.clone();
-        let permit = Arc::clone(&self.collection_concurrency)
-            .try_acquire_owned()
-            .map_err(|_| anyhow::anyhow!("mining publication-read concurrency is saturated"))?;
-        let worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            read.with_stable_epoch_read(|store, _headers| {
-                enumerate_publication_queue(store, maximum)
-            })
-        });
-        let result = await_publication_blocking_worker(
-            "mining publication migration scan",
-            PUBLICATION_QUEUE_SCAN_ASYNC_MAX_ELAPSED,
-            worker,
-        )
-        .await;
-        self.ensure_storage_operational()?;
-        match result {
-            Ok(inventory) => Ok(inventory),
-            Err(error) => {
-                if let Some(invariant) = error
-                    .downcast_ref::<PublicationQueueInvariantError>()
-                    .cloned()
-                {
-                    if let Err(fence_error) = self
-                        .mining_engine_fence_publication_queue_invariant(invariant.clone())
-                        .await
-                    {
-                        return Err(anyhow::anyhow!(
-                            "publication queue invariant failed: {invariant}; durable safety fencing also failed: {fence_error}"
-                        ));
-                    }
-                }
-                Err(error)
-            }
-        }
-    }
-
     /// Authenticate the complete bounded publication queue from its own
     /// immutable storage snapshot. This deliberately does not bind unrelated
     /// canonical publication sequence traffic to the audit result.
@@ -3038,12 +2959,12 @@ impl NodeReadHandle {
         }
     }
 
-    /// Install the versioned count/revision index only from a fully enumerated
-    /// immutable snapshot. A competing canonical command invalidates the exact
-    /// epoch and causes a bounded re-enumeration rather than committing stale
-    /// counts.
+    /// Runtime queue indexes must already exist; only startup initializes a
+    /// genuinely empty queue before any concurrent command is accepted.
     async fn mining_engine_ensure_publication_queue_index(&self) -> Result<()> {
-        const MAX_MIGRATION_ATTEMPTS: usize = 3;
+        if !self.config().mining_engine.enabled {
+            anyhow::bail!("Mining engine is disabled");
+        }
         if self
             .mining_engine_publication_queue_index()
             .await?
@@ -3051,41 +2972,14 @@ impl NodeReadHandle {
         {
             return Ok(());
         }
-        for _attempt in 0..MAX_MIGRATION_ATTEMPTS {
-            let (epoch, inventory) = self
-                .mining_engine_enumerate_publication_queue_for_migration()
-                .await?;
-            if inventory.persisted_index {
-                return Ok(());
-            }
-            let runtime = self
-                .runtime
-                .upgrade()
-                .ok_or_else(|| anyhow::Error::new(CanonicalWriterError::Stopped))?;
-            let writer = CanonicalStateWriter { inner: runtime };
-            let prepared = inventory.index;
-            match writer
-                .execute_at(
-                    epoch,
-                    "initialize mining publication queue index",
-                    move |node| node.mining_engine_install_publication_queue_index(prepared),
-                )
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if matches!(
-                        error.downcast_ref::<CanonicalWriterError>(),
-                        Some(CanonicalWriterError::StaleEpoch { .. } | CanonicalWriterError::Busy)
-                    ) =>
-                {
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(anyhow::Error::new(CanonicalWriterError::Busy))
-            .context("publication queue migration could not capture a stable writer generation")
+        let invariant = PublicationQueueInvariantError {
+            detail: "publication queue index disappeared after runtime initialization".to_owned(),
+            limit: 1,
+            actual: 0,
+        };
+        self.mining_engine_fence_publication_queue_invariant(invariant.clone())
+            .await?;
+        Err(anyhow::Error::new(invariant))
     }
 
     async fn mining_engine_fence_publication_queue_invariant(
@@ -3301,17 +3195,6 @@ impl CanonicalStateWriter {
             // traversal boundary, then re-read its index to establish a
             // linearization point after that audit.
             let audit = read.mining_engine_audit_publication_queue().await?;
-            if !audit.persisted_index {
-                let invariant = PublicationQueueInvariantError {
-                    detail: "publication queue index disappeared before completed-cycle audit"
-                        .to_owned(),
-                    limit: 1,
-                    actual: 0,
-                };
-                read.mining_engine_fence_publication_queue_invariant(invariant.clone())
-                    .await?;
-                return Err(anyhow::Error::new(invariant));
-            }
             let Some(post_audit_index) = read.mining_engine_publication_queue_index().await? else {
                 let invariant = PublicationQueueInvariantError {
                     detail: "publication queue index disappeared after completed-cycle audit"
@@ -3507,24 +3390,32 @@ fn require_publication_queue_index<T: ReadSnapshot>(
     })
 }
 
-fn install_publication_queue_index(
-    store: &StoreHandle,
-    prepared: PublicationQueueIndex,
-    maximum: usize,
-) -> Result<()> {
-    prepared.validate(maximum)?;
+fn initialize_empty_publication_queue(store: &StoreHandle, maximum: usize) -> Result<()> {
+    let empty = PublicationQueueIndex::empty();
+    empty.validate(maximum)?;
     let snapshot = store
         .snapshot()
-        .context("failed to open publication index installation snapshot")?;
-    if let Some(existing) = load_publication_queue_index_from(&snapshot, maximum)? {
-        if existing != prepared {
-            return Err(publication_queue_invariant(
-                "publication queue index changed during migration",
-                prepared.revision,
-                existing.revision,
-            ));
-        }
+        .context("failed to open publication initialization snapshot")?;
+    if load_publication_queue_index_from(&snapshot, maximum)?.is_some() {
         return Ok(());
+    }
+    let probe = snapshot
+        .scan_prefix_page(
+            ColumnFamily::Snapshots,
+            PUBLICATION_KEY_PREFIX,
+            None,
+            PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: PREFIX_SCAN_MAX_BYTES,
+            },
+        )
+        .context("failed to inspect uninitialized publication queue")?;
+    if !probe.entries.is_empty() || probe.continuation.is_some() {
+        return Err(publication_queue_invariant(
+            "populated publication queue has no index; a clean reindex is required",
+            0,
+            1,
+        ));
     }
     drop(snapshot);
     let mut batch = store.batch();
@@ -3532,10 +3423,10 @@ fn install_publication_queue_index(
         .put(
             ColumnFamily::Snapshots,
             PUBLICATION_QUEUE_INDEX_KEY,
-            &prepared.encode(),
+            &empty.encode(),
         )
-        .context("failed to stage publication queue index migration")?;
-    commit_publication_queue_batch(store, batch, "publication queue index migration")
+        .context("failed to initialize empty publication queue")?;
+    commit_publication_queue_batch(store, batch, "empty publication queue initialization")
 }
 
 fn stage_publication_intent(
@@ -4003,7 +3894,6 @@ fn publication_retry_cycle_is_complete(
         && !page.forced_wrap
         && !page.audit_restarted
         && !interleaved_rebase
-        && audit.persisted_index
         && audit.index == final_index
         && post_audit_index == audit.index
 }
@@ -4032,7 +3922,10 @@ fn enumerate_publication_queue(
     let expected_index = encoded_index_before
         .as_deref()
         .map(|encoded| PublicationQueueIndex::decode(encoded, maximum))
-        .transpose()?;
+        .transpose()?
+        .ok_or_else(|| {
+            publication_queue_invariant("publication queue has no durable index", 1, 0)
+        })?;
 
     let mut record_count = 0u64;
     let mut total_bytes = 0u64;
@@ -4129,9 +4022,14 @@ fn enumerate_publication_queue(
             None => break,
         }
     }
-    let computed = PublicationQueueIndex::migrated(record_count, total_bytes)?;
+    let computed = PublicationQueueIndex {
+        revision: expected_index.revision,
+        count: record_count,
+        total_bytes,
+    };
     computed.validate(maximum)?;
-    if let Some(expected) = expected_index {
+    {
+        let expected = expected_index;
         if expected.count != computed.count {
             return Err(publication_queue_invariant(
                 "publication queue index count does not match enumerated contents",
@@ -4158,8 +4056,7 @@ fn enumerate_publication_queue(
         ));
     }
     Ok(PublicationQueueInventory {
-        index: expected_index.unwrap_or(computed),
-        persisted_index: encoded_index_before.is_some(),
+        index: expected_index,
         #[cfg(test)]
         pages,
     })
@@ -4315,24 +4212,16 @@ mod tests {
         intent
     }
 
-    fn put_legacy_publication(store: &StoreHandle, intent: &SolvedBlockPublicationIntent) {
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                &intent.storage_key(),
-                &intent.encode(),
-            )
-            .expect("stage legacy publication intent");
-        store
-            .commit(batch)
-            .expect("commit legacy publication intent");
+    fn put_test_publication(store: &StoreHandle, intent: &SolvedBlockPublicationIntent) {
+        initialize_empty_publication_queue(store, MAX_PENDING_PUBLICATIONS)
+            .expect("initialize current queue");
+        stage_publication_intent(store, intent, MAX_PENDING_PUBLICATIONS)
+            .expect("stage indexed publication");
     }
 
     fn initialize_test_publication_index(store: &StoreHandle, maximum: usize) {
-        let inventory = enumerate_publication_queue(store, maximum).expect("verify legacy queue");
-        install_publication_queue_index(store, inventory.index, maximum)
-            .expect("install publication queue index");
+        initialize_empty_publication_queue(store, maximum).expect("initialize queue");
+        enumerate_publication_queue(store, maximum).expect("verify current queue");
     }
 
     fn restart_mining_node(node: NodeService) -> (NodeService, StoreHandle) {
@@ -4369,13 +4258,9 @@ mod tests {
     fn empty_publication_queue_round_trips_through_schema_store() {
         let store = StoreHandle::memory();
         initialize_schema(&store).expect("schema");
+        initialize_empty_publication_queue(&store, 1).expect("initialize queue");
         let inventory = enumerate_publication_queue(&store, 1).expect("publication queue");
-        assert_eq!(
-            inventory.index,
-            PublicationQueueIndex::migrated(0, 0).unwrap()
-        );
-        assert!(!inventory.persisted_index);
-        install_publication_queue_index(&store, inventory.index, 1).expect("install queue index");
+        assert_eq!(inventory.index, PublicationQueueIndex::empty());
         let page = read_publication_queue_page(&store, 1, MiningPublicationRetryCursor::default())
             .expect("empty publication page");
         assert!(page.intents.is_empty());
@@ -4387,6 +4272,7 @@ mod tests {
     fn publication_queue_rejects_invalid_limits_and_corrupt_records() {
         let store = StoreHandle::memory();
         initialize_schema(&store).expect("schema");
+        initialize_empty_publication_queue(&store, 1).expect("initialize queue");
         let mut batch = store.batch();
         let mut key = PUBLICATION_KEY_PREFIX.to_vec();
         key.extend_from_slice(&[0x11; 32]);
@@ -4439,46 +4325,38 @@ mod tests {
     }
 
     #[test]
-    fn startup_migrates_legacy_publications_once_and_restart_revalidates_index() {
+    fn startup_rejects_unindexed_publications_without_repair() {
         let mut node = NodeService::new(mining_test_config());
-        node.connect_block(NodeBlockImport::from_peer(canonical_regtest_genesis(), 0))
-            .expect("connect canonical regtest genesis");
         let intent = synthetic_publication_intent(0x21, 21, 1, 8);
-        put_legacy_publication(&node.state().store, &intent);
-        assert!(load_publication_queue_index(
-            &node.state().store,
-            DEFAULT_MAX_PENDING_PUBLICATIONS
-        )
-        .expect("missing legacy index")
-        .is_none());
-
-        node.mining_engine_initialize_publication_queue()
-            .expect("migrate legacy publication queue");
-        let migrated =
-            load_publication_queue_index(&node.state().store, DEFAULT_MAX_PENDING_PUBLICATIONS)
-                .expect("migrated index")
-                .expect("installed index");
-        assert_eq!(migrated.revision, 1);
-        assert_eq!(migrated.count, 1);
-
-        let (mut restarted, store) = restart_mining_node(node);
-        restarted
+        let store = node.state().store.clone();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                &intent.storage_key(),
+                &intent.encode(),
+            )
+            .expect("seed obsolete intent");
+        batch
+            .delete(ColumnFamily::Snapshots, PUBLICATION_QUEUE_INDEX_KEY)
+            .expect("remove index");
+        store.commit(batch).expect("commit unindexed fixture");
+        let error = node
             .mining_engine_initialize_publication_queue()
-            .expect("revalidate publication queue on restart");
-        assert_eq!(
+            .expect_err("unindexed queue is rejected");
+        assert!(error.to_string().contains("no index"), "{error:#}");
+        assert!(
             load_publication_queue_index(&store, DEFAULT_MAX_PENDING_PUBLICATIONS)
-                .expect("restart index"),
-            Some(migrated)
+                .expect("index read")
+                .is_none()
         );
         assert_eq!(
-            read_publication_queue_page(
-                &store,
-                DEFAULT_MAX_PENDING_PUBLICATIONS,
-                MiningPublicationRetryCursor::default(),
-            )
-            .expect("restart publication page")
-            .intents,
-            vec![intent]
+            store
+                .snapshot()
+                .expect("snapshot")
+                .get(ColumnFamily::Snapshots, &intent.storage_key())
+                .expect("intent read"),
+            Some(intent.encode())
         );
     }
 
@@ -4596,7 +4474,7 @@ mod tests {
         let store = StoreHandle::memory();
         initialize_schema(&store).expect("schema");
         for tag in 1u8..=17 {
-            put_legacy_publication(
+            put_test_publication(
                 &store,
                 &synthetic_publication_intent(tag, u64::from(tag), 1, 8),
             );
@@ -4637,14 +4515,12 @@ mod tests {
                 intent.raw_block.len() >= MAX_BLOCK_WEIGHT - 250_000,
                 "large publication fixture is not near the legal block ceiling"
             );
-            put_legacy_publication(&store, &intent);
+            put_test_publication(&store, &intent);
         }
         let inventory = enumerate_publication_queue(&store, RECORDS)
             .expect("stream near-maximum publication queue");
         assert_eq!(inventory.index.count, RECORDS as u64);
         assert!(inventory.pages >= 2);
-        install_publication_queue_index(&store, inventory.index, RECORDS)
-            .expect("install large queue index");
 
         let first =
             read_publication_queue_page(&store, RECORDS, MiningPublicationRetryCursor::default())
@@ -4664,7 +4540,7 @@ mod tests {
         let store = StoreHandle::memory();
         initialize_schema(&store).expect("schema");
         for tag in 0x20u8..0x29 {
-            put_legacy_publication(
+            put_test_publication(
                 &store,
                 &synthetic_publication_intent(tag, u64::from(tag), 1, 8),
             );
@@ -4714,7 +4590,7 @@ mod tests {
         let mut intents = Vec::new();
         for tag in 0x30u8..0x3b {
             let intent = synthetic_publication_intent(tag, u64::from(tag), 1, 8);
-            put_legacy_publication(&store, &intent);
+            put_test_publication(&store, &intent);
             intents.push(intent);
         }
         initialize_test_publication_index(&store, intents.len());
@@ -4763,7 +4639,7 @@ mod tests {
         for tag in 0x70u8..0x79 {
             let intent = synthetic_publication_intent(tag, u64::from(tag), 1, 8);
             live.insert(intent.block_hash);
-            put_legacy_publication(&store, &intent);
+            put_test_publication(&store, &intent);
         }
         initialize_test_publication_index(&store, MAXIMUM);
         let first =
@@ -4817,7 +4693,7 @@ mod tests {
         for tag in 0x90u8..0xa1 {
             let intent = synthetic_publication_intent(tag, u64::from(tag), 1, 8);
             live.insert(intent.block_hash);
-            put_legacy_publication(&store, &intent);
+            put_test_publication(&store, &intent);
         }
         initialize_test_publication_index(&store, MAXIMUM);
         let maximum_pages = publication_retry_page_budget(MAXIMUM).expect("page budget");
@@ -4930,7 +4806,7 @@ mod tests {
         for tag in 0x50u8..0x61 {
             let intent = synthetic_publication_intent(tag, u64::from(tag), 1, 8);
             target.insert(intent.block_hash);
-            put_legacy_publication(&store, &intent);
+            put_test_publication(&store, &intent);
         }
         initialize_test_publication_index(&store, target.len());
 
@@ -4978,7 +4854,7 @@ mod tests {
         let store = StoreHandle::memory();
         initialize_schema(&store).expect("schema");
         for tag in 0x40u8..0x51 {
-            put_legacy_publication(
+            put_test_publication(
                 &store,
                 &synthetic_publication_intent(tag, u64::from(tag), 1, 8),
             );
@@ -5093,6 +4969,31 @@ mod tests {
             "insert/delete around the cursor starved a live publication"
         );
         assert!(!observed.contains(&deleted_hash));
+    }
+
+    #[tokio::test]
+    async fn disabled_mining_does_not_fence_an_uninitialized_queue() {
+        let node = NodeService::new(crate::NodeConfig {
+            network: Network::Regtest,
+            ..crate::NodeConfig::default()
+        });
+        let store = node.state().store.clone();
+        let runtime = crate::NodeRuntime::spawn(node, 4).expect("runtime");
+        let error = runtime
+            .read()
+            .mining_engine_ensure_publication_queue_index()
+            .await
+            .expect_err("mining disabled");
+        assert!(error.to_string().contains("disabled"));
+        assert!(crate::inspect_production_safety_fence(&store)
+            .expect("fence inspection")
+            .is_none());
+        assert!(
+            load_publication_queue_index(&store, DEFAULT_MAX_PENDING_PUBLICATIONS)
+                .expect("index inspection")
+                .is_none()
+        );
+        runtime.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

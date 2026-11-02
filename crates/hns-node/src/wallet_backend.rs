@@ -396,7 +396,7 @@ pub struct TrackedContractRetirementContext {
     /// Active registration, when present.
     pub registration: Option<ContractRegistration>,
     /// Durable lifecycle revision, when a marker exists. Revision presence is
-    /// not an eligibility claim: `LegacyUnknown` markers still fail closed.
+    /// not an eligibility claim: the authoritative observation is checked at retirement.
     pub lifecycle_revision: Option<u64>,
     /// Durable chain generation captured with the lifecycle.
     pub chain_epoch: u64,
@@ -569,7 +569,7 @@ pub struct TransactionInclusion {
     /// Active-chain block height.
     pub height: Height,
     /// Exact zero-based block transaction position when retained block bytes
-    /// make it derivable. Pruned legacy transaction-index rows do not persist
+    /// make it derivable. Pruned transaction-index rows do not persist
     /// this ordinal, so callers must never substitute a fabricated value.
     pub transaction_position: Option<u32>,
     /// Number of confirmations at the atomically read tip.
@@ -1765,7 +1765,7 @@ impl WalletBackend {
     /// no retained transaction orphans; accepted ordinary transactions and
     /// airdrop outputs are scanned for exact funding. After the internal stable
     /// scan, any intervening canonical writer command rejects compare-and-
-    /// commit. Completed or legacy registrations are not eligible for this
+    /// commit. Confirmed registrations are not eligible for this
     /// narrow lifecycle operation.
     pub async fn retire_never_confirmed_tracked_contract(
         &self,
@@ -4570,9 +4570,7 @@ fn wallet_index_error(error: IndexError) -> WalletBackendError {
         }
         IndexError::ContractRollbackRequired => WalletBackendError::ContractRollbackRequired,
         IndexError::ContractRetired => WalletBackendError::InvalidContract,
-        IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
-            WalletBackendError::ContractNotRetirable
-        }
+        IndexError::ContractConfirmed => WalletBackendError::ContractNotRetirable,
         IndexError::StaleContractLifecycle { expected, actual } => {
             WalletBackendError::StaleContractLifecycle {
                 expected,
@@ -4610,9 +4608,7 @@ fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
             }
             IndexError::ContractRollbackRequired => WalletBackendError::ContractRollbackRequired,
             IndexError::ContractRetired => WalletBackendError::InvalidContract,
-            IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
-                WalletBackendError::ContractNotRetirable
-            }
+            IndexError::ContractConfirmed => WalletBackendError::ContractNotRetirable,
             IndexError::StaleContractLifecycle { expected, actual } => {
                 WalletBackendError::StaleContractLifecycle {
                     expected: *expected,
