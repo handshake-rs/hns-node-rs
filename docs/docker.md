@@ -1,7 +1,7 @@
 # Docker and GHCR
 
 The repository's checked-in Compose file still defaults to the older v0.3.4
-canary images below. The latest documented node release is v0.3.14; use
+canary images below. The latest documented node release is v0.3.15; use
 reviewed release digests for a current deployment. Release workflows publish
 multi-platform OCI images for `linux/amd64` (x86_64) and `linux/arm64`
 (AArch64):
@@ -27,6 +27,10 @@ canary. The image defaults to an outbound-only, pruned mainnet node. It does
 not enable mining, publish RPC, or accept inbound P2P connections by default.
 
 ## Run with Compose
+
+Version 0.3.15 requires schema 22 and a fresh data directory or volume.
+Keep an earlier data root with its matching binary for recovery; do not attach
+the new image to a schema 21 or older volume. See [storage rollout](storage-rollout.md).
 
 Start the default node and DNS sidecar with durable named-volume storage:
 

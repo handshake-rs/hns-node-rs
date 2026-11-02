@@ -17,9 +17,9 @@ default.
 
 ## Current compatibility
 
-- Cargo source version: `0.3.14`, including the read-only name-offer board
-  endpoint described in the [changelog](CHANGELOG.md)
-- Latest release: [`v0.3.14`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.14),
+- Cargo source version: `0.3.15`, including bounded native-sync staging and
+  the schema 22 storage changes described in the [changelog](CHANGELOG.md)
+- Latest release: [`v0.3.15`](https://github.com/handshake-rs/hns-node-rs/releases/tag/v0.3.15),
   with Linux ARM64 and AMD64 native `hsrd` archives, an offline relinking source
   bundle, build provenance, and SHA-256 checksums
 - Rust toolchain: `1.97.1`

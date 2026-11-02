@@ -4,7 +4,7 @@ All notable changes to the standalone node are recorded here. Release entries
 describe source identity; they do not by themselves establish production
 qualification or authorize deployment.
 
-## Unreleased
+## 0.3.15 - 2026-11-01
 
 - Update both workspace and fuzz lockfiles to `libz-sys 1.1.31` and
   `zstd-sys 2.1.2+zstd.1.5.7`, addressing RUSTSEC-2026-0418 (build-script
